@@ -7,40 +7,37 @@ final class NonActivatingBarPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Isolated observable model for the 1.5pt bottom countdown hairline so app icons never re-render on timer ticks.
+@MainActor
+final class SecondaryBarCountdownModel: ObservableObject {
+    @Published var progress: Double = 1.0
+}
+
 @MainActor
 final class SecondaryBarController: ObservableObject {
     static let shared = SecondaryBarController()
 
     @Published private(set) var isVisible: Bool = false
-    /// Countdown progress from 1.0 (full time remaining) down to 0.0 (auto-hide).
-    @Published private(set) var countdownProgress: Double = 1.0
-    @Published var isHoveringBar: Bool = false {
-        didSet {
-            if isHoveringBar {
-                // Pause & reset timer while user's mouse is inside the bar
-                lastInteractionDate = Date()
-                countdownProgress = 1.0
-            } else {
-                lastInteractionDate = Date()
-            }
-        }
-    }
-    @Published var hoveredAppName: String? = nil
-    @Published var hoveredItemID: String? = nil
-    @Published var hoveredUtilityID: String? = nil
+    let countdown = SecondaryBarCountdownModel()
 
     private var panel: NonActivatingBarPanel?
-    private var hostingView: NSHostingView<SecondaryBarView>?
     private var autoHideTimer: Timer?
     private var outsideClickMonitor: Any?
+    private var localRightClickMonitor: Any?
     private var lastInteractionDate: Date = Date()
+
+    /// Layout constants matching `SecondaryBarView` single-row metrics
+    static let panelHeight: CGFloat = 38.0
+    static let iconSlotSize: CGFloat = 28.0
+    static let iconSpacing: CGFloat = 3.0
+    static let trailingChromeWidth: CGFloat = 52.0
 
     private init() {
         setupPanel()
     }
 
     private func setupPanel() {
-        let initialRect = NSRect(x: 0, y: 0, width: 520, height: 64)
+        let initialRect = NSRect(x: 0, y: 0, width: 320, height: Self.panelHeight)
         let p = NonActivatingBarPanel(
             contentRect: initialRect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -55,20 +52,20 @@ final class SecondaryBarController: ObservableObject {
         p.isOpaque = false
         p.hasShadow = true
         p.hidesOnDeactivate = false
+        p.animationBehavior = .none
 
         let rootView = SecondaryBarView(
             barController: self,
             menuController: MenuBarController.shared
         )
         let host = NSHostingView(rootView: rootView)
-        host.translatesAutoresizingMaskIntoConstraints = false
+        host.sizingOptions = []
         p.contentView = host
 
         self.panel = p
-        self.hostingView = host
     }
 
-    // MARK: - Toggle / Show / Hide
+    // MARK: - Instant Toggle / Show / Hide
 
     func toggle() {
         if isVisible {
@@ -79,86 +76,75 @@ final class SecondaryBarController: ObservableObject {
     }
 
     func show() {
-        guard let panel = panel, let hostingView = hostingView else { return }
-
-        // Refresh running apps so the bar always reflects live state
-        MenuBarController.shared.refreshRunningApps()
+        guard let panel = panel else { return }
 
         let screen = MenuBarScanner.screenContainingMouse()
-        let hiddenCount = max(MenuBarController.shared.secondaryBarApps.count, 1)
+        let targetFrame = calculateTargetFrame(on: screen)
 
-        // Calculate ideal columns & size so it sits sleekly right below the Menu Bar
-        let maxPerRow = min(max(Int((screen.frame.width - 140) / 42), 6), 14)
-        let columns = min(hiddenCount, maxPerRow)
-        let rows = Int(ceil(Double(hiddenCount) / Double(maxPerRow)))
-
-        // Let SwiftUI compute exact fitting size
-        hostingView.layoutSubtreeIfNeeded()
-        let fitting = hostingView.fittingSize
-        let computedWidth = max(fitting.width, CGFloat(columns) * 40 + 110)
-        let finalWidth = min(computedWidth, screen.frame.width - 28)
-        let finalHeight = max(fitting.height, rows > 1 ? 98 : 58)
-
-        // Compute Menu Bar height on this screen
-        let menuBarThickness = max(screen.frame.maxY - screen.visibleFrame.maxY, NSStatusBar.system.thickness, 28)
-        let targetY = screen.frame.maxY - menuBarThickness - finalHeight - 4
-
-        // Anchor below BarFlow's status item if it sits on this screen; otherwise align cleanly toward top-right of screen
-        var targetX: CGFloat
-        if let statusRect = MenuBarController.shared.mainStatusItemFrameAppKit(),
-           NSIntersectsRect(statusRect, screen.frame) {
-            targetX = statusRect.midX - (finalWidth * 0.65)
-        } else {
-            targetX = screen.frame.maxX - finalWidth - 18
-        }
-        // Clamp strictly within screen horizontal bounds
-        targetX = max(screen.frame.minX + 14, min(targetX, screen.frame.maxX - finalWidth - 14))
-
-        let startFrame = NSRect(x: targetX, y: targetY + 8, width: finalWidth, height: finalHeight)
-        let targetFrame = NSRect(x: targetX, y: targetY, width: finalWidth, height: finalHeight)
-
-        panel.setFrame(startFrame, display: true)
-        panel.alphaValue = 0.0
+        panel.setFrame(targetFrame, display: true)
+        panel.alphaValue = 1.0
         panel.orderFrontRegardless()
 
-        isVisible = true
-        hoveredAppName = nil
-        MenuBarController.shared.updateMainButtonAppearance(isSecondaryOpen: true)
-
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.16
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().setFrame(targetFrame, display: true)
-            panel.animator().alphaValue = 1.0
+        if !isVisible {
+            isVisible = true
+            MenuBarController.shared.updateMainButtonAppearance(isSecondaryOpen: true)
         }
 
         startAutoHideMonitoring()
         installOutsideClickMonitor()
+
+        // Non-blocking warm background refresh AFTER the bar is already visible on screen
+        MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false)
     }
 
     func hide() {
-        guard isVisible, let panel = panel else { return }
+        guard isVisible || (panel?.isVisible == true) else { return }
 
         stopAutoHideMonitoring()
         removeOutsideClickMonitor()
         isVisible = false
-        isHoveringBar = false
-        hoveredAppName = nil
         MenuBarController.shared.updateMainButtonAppearance(isSecondaryOpen: false)
+        panel?.orderOut(nil)
+    }
 
-        let endFrame = panel.frame.offsetBy(dx: 0, dy: 6)
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.13
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().setFrame(endFrame, display: false)
-            panel.animator().alphaValue = 0.0
-        }, completionHandler: { [weak self] in
-            Task { @MainActor in
-                if self?.isVisible == false {
-                    panel.orderOut(nil)
-                }
+    /// Adjusts width in-place at the top-right corner if the secondary app count changes while visible.
+    func repositionIfVisible() {
+        guard isVisible, let panel = panel else { return }
+        let screen = panel.screen ?? MenuBarScanner.screenContainingMouse()
+        let newFrame = calculateTargetFrame(on: screen)
+        if abs(panel.frame.width - newFrame.width) > 1 || abs(panel.frame.origin.x - newFrame.origin.x) > 1 {
+            panel.setFrame(newFrame, display: true)
+        }
+    }
+
+    // MARK: - Single-Row Top-Right Frame Calculation
+
+    private func calculateTargetFrame(on screen: NSScreen) -> NSRect {
+        let menuController = MenuBarController.shared
+        let idealWidth: CGFloat
+
+        if !menuController.isAccessibilityGranted {
+            idealWidth = 316.0
+        } else {
+            let count = menuController.secondaryBarApps.count
+            if count == 0 {
+                idealWidth = 236.0
+            } else {
+                let iconsWidth = CGFloat(count) * Self.iconSlotSize + CGFloat(max(count - 1, 0)) * Self.iconSpacing
+                idealWidth = iconsWidth + Self.trailingChromeWidth
             }
-        })
+        }
+
+        let maxAllowedWidth = max(160.0, screen.frame.width - 12.0)
+        let finalWidth = min(max(idealWidth, 86.0), maxAllowedWidth)
+        let finalHeight = Self.panelHeight
+
+        // Always anchor on the RIGHT side of the active screen, immediately underneath the native macOS Menu Bar
+        let menuBarThickness = MenuBarScanner.effectiveMenuBarThickness(for: screen)
+        let targetX = max(screen.frame.minX + 6.0, screen.frame.maxX - finalWidth - 6.0)
+        let targetY = screen.frame.maxY - menuBarThickness - finalHeight - 2.0
+
+        return NSRect(x: targetX, y: targetY, width: finalWidth, height: finalHeight)
     }
 
     // MARK: - Auto-Hide Countdown & Outside Click Monitors
@@ -166,15 +152,12 @@ final class SecondaryBarController: ObservableObject {
     private func startAutoHideMonitoring() {
         stopAutoHideMonitoring()
         lastInteractionDate = Date()
-        countdownProgress = 1.0
+        countdown.progress = 1.0
 
         let durationSeconds = Double(MenuBarController.shared.autoHideDuration.rawValue)
-        guard durationSeconds > 0 else {
-            countdownProgress = 1.0
-            return
-        }
+        guard durationSeconds > 0 else { return }
 
-        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] timer in
+        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] timer in
             Task { @MainActor in
                 guard let self = self, self.isVisible else {
                     timer.invalidate()
@@ -183,24 +166,31 @@ final class SecondaryBarController: ObservableObject {
 
                 let total = Double(MenuBarController.shared.autoHideDuration.rawValue)
                 guard total > 0 else {
-                    self.countdownProgress = 1.0
+                    if self.countdown.progress != 1.0 {
+                        self.countdown.progress = 1.0
+                    }
                     return
                 }
 
-                // Also check physical mouse rect so hover detection is 100% reliable even without key focus
-                if let p = self.panel, NSMouseInRect(NSEvent.mouseLocation, p.frame.insetBy(dx: -4, dy: -4), false) {
+                // Pause & reset timer whenever cursor hovers inside the bar
+                if let p = self.panel, NSMouseInRect(NSEvent.mouseLocation, p.frame.insetBy(dx: -3, dy: -3), false) {
                     self.lastInteractionDate = Date()
-                    self.countdownProgress = 1.0
+                    if self.countdown.progress != 1.0 {
+                        self.countdown.progress = 1.0
+                    }
                     return
                 }
 
                 let elapsed = Date().timeIntervalSince(self.lastInteractionDate)
-                let remaining = max(0.0, 1.0 - (elapsed / total))
-                self.countdownProgress = remaining
-
                 if elapsed >= total {
                     timer.invalidate()
                     self.hide()
+                    return
+                }
+
+                let remaining = max(0.0, 1.0 - (elapsed / total))
+                if abs(self.countdown.progress - remaining) >= 0.015 {
+                    self.countdown.progress = remaining
                 }
             }
         }
@@ -217,7 +207,6 @@ final class SecondaryBarController: ObservableObject {
             Task { @MainActor in
                 guard let self = self, self.isVisible, let panel = self.panel else { return }
                 let mouseLoc = NSEvent.mouseLocation
-                // Ignore clicks directly on BarFlow's main status item button (it handles its own toggle)
                 if let statusRect = MenuBarController.shared.mainStatusItemFrameAppKit(),
                    NSMouseInRect(mouseLoc, statusRect.insetBy(dx: -2, dy: -2), false) {
                     return
@@ -233,6 +222,10 @@ final class SecondaryBarController: ObservableObject {
         if let monitor = outsideClickMonitor {
             NSEvent.removeMonitor(monitor)
             outsideClickMonitor = nil
+        }
+        if let rightMonitor = localRightClickMonitor {
+            NSEvent.removeMonitor(rightMonitor)
+            localRightClickMonitor = nil
         }
     }
 }

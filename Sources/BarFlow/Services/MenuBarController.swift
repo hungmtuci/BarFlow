@@ -1,6 +1,6 @@
 import Foundation
 import AppKit
-import ApplicationServices
+@preconcurrency import ApplicationServices
 import CoreGraphics
 import Combine
 
@@ -10,13 +10,15 @@ final class MenuBarController: ObservableObject {
 
     // MARK: - Published State
 
-    /// All currently running menu bar applications discovered by the scanner.
+    /// All currently running menu bar applications discovered by the background scanner.
     @Published private(set) var allRunningApps: [MenuBarAppItem] = []
 
     /// IDs of applications chosen by the user to stay visible on the Main Menu Bar.
     @Published var selectedMainBarIDs: Set<String> {
         didSet {
-            saveSelection()
+            guard selectedMainBarIDs != oldValue else { return }
+            scheduleSaveSelection()
+            onSecondaryAppsChanged?()
         }
     }
 
@@ -56,11 +58,9 @@ final class MenuBarController: ObservableObject {
     /// Human-readable status banner message for UI feedback.
     @Published var statusMessage: String = ""
 
-    /// UI state for AppSelectionView (avoids SwiftUIMacros @State dependency under CommandLineTools).
+    /// Lightweight UI filter state for AppSelectionView (avoids SwiftUIMacros @State dependency).
     @Published var searchText: String = ""
     @Published var filterModeRaw: String = "all"
-    @Published var hoveredPreviewID: String? = nil
-    @Published var hoveredRowID: String? = nil
 
     /// Whether Accessibility permission is currently granted.
     @Published private(set) var isAccessibilityGranted: Bool = AXIsProcessTrusted()
@@ -82,6 +82,7 @@ final class MenuBarController: ObservableObject {
     var onToggleSecondaryBarRequested: (() -> Void)?
     var onHideSecondaryBarRequested: (() -> Void)?
     var onOpenSelectionWindowRequested: (() -> Void)?
+    var onSecondaryAppsChanged: (() -> Void)?
 
     // MARK: - Internal Properties
 
@@ -94,6 +95,11 @@ final class MenuBarController: ObservableObject {
         static let hideFromDock = "BarFlow.HideFromDock"
     }
 
+    private let interactionQueue = DispatchQueue(
+        label: "com.hunglx.BarFlow.interaction",
+        qos: .userInteractive
+    )
+
     private var mainStatusItem: NSStatusItem?
     private var spacerItems: [NSStatusItem] = []
     private let spacerCount = 36
@@ -102,9 +108,13 @@ final class MenuBarController: ObservableObject {
     private var areSpacersCurrentlyExpanded: Bool = false
     private var isTemporarilyRevealedForClick: Bool = false
     private var isMenuCurrentlyTracking: Bool = false
-    private var rehideMonitorTimer: Timer?
-    private var refreshTimer: Timer?
+    private var isScanningInBackground: Bool = false
     private var isPerformingHIDSequence: Bool = false
+
+    private var rehideMonitorTimer: Timer?
+    private var backgroundMonitorTimer: Timer?
+    private var lastBackgroundScanTime: CFAbsoluteTime = 0
+    private var pendingSaveWorkItem: DispatchWorkItem?
 
     private init() {
         let savedArray = UserDefaults.standard.stringArray(forKey: Keys.selectedIDs) ?? []
@@ -146,33 +156,45 @@ final class MenuBarController: ObservableObject {
         setupStatusItems()
         observeMenuTrackingNotifications()
         observeWorkspaceNotifications()
-        refreshRunningApps(initializeDefaultsIfNeeded: true)
 
-        // Apply spacer state after initial scan settles
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        // Initial non-blocking background scan
+        refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             self?.applySpacersVisibilityState()
         }
 
-        // Periodic lightweight refresh (fast 1.2s while waiting for Accessibility grant, 4.0s once granted)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        // Ultra-lightweight monitor:
+        // - Checks AXIsProcessTrusted() (0.01ms) every 2s so granting permission takes effect immediately
+        // - Once trusted, only runs a 11ms warm background scan every 10s without blocking MainActor
+        backgroundMonitorTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
                 let trusted = AXIsProcessTrusted()
                 let changedTrust = (trusted != self.isAccessibilityGranted)
-                self.isAccessibilityGranted = trusted
                 if changedTrust {
+                    self.isAccessibilityGranted = trusted
                     self.applySpacersVisibilityState()
+                    if trusted {
+                        self.refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
+                    }
+                    return
                 }
-                if trusted && !self.isPerformingHIDSequence && !self.isArrangingMenuBar {
-                    self.refreshRunningApps(initializeDefaultsIfNeeded: changedTrust)
+
+                guard trusted, !self.isPerformingHIDSequence, !self.isArrangingMenuBar else { return }
+                let now = CFAbsoluteTimeGetCurrent()
+                if (now - self.lastBackgroundScanTime) >= 10.0 {
+                    self.refreshRunningAppsAsync(forceFullScan: false, initializeDefaultsIfNeeded: false)
                 }
             }
         }
     }
 
     func prepareForTermination() {
-        refreshTimer?.invalidate()
+        backgroundMonitorTimer?.invalidate()
         rehideMonitorTimer?.invalidate()
+        pendingSaveWorkItem?.perform()
+        pendingSaveWorkItem = nil
         // Always collapse spacers on quit so all hidden icons reappear cleanly on the user's Menu Bar
         for spacer in spacerItems {
             spacer.isVisible = false
@@ -189,7 +211,6 @@ final class MenuBarController: ObservableObject {
     private func setupStatusItems() {
         guard mainStatusItem == nil else { return }
 
-        // 1. Create Main Toggle Status Item FIRST so it sits to the RIGHT of all spacers
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.autosaveName = "BarFlow.MainToggle"
         if let button = item.button {
@@ -202,9 +223,8 @@ final class MenuBarController: ObservableObject {
         }
         self.mainStatusItem = item
 
-        // 2. Create pool of compact invisible spacers to the LEFT of MainToggle
-        // Using multiple 44pt spacers avoids macOS 27 MenuBarAgent discarding oversized single 10,000pt items.
         var createdSpacers: [NSStatusItem] = []
+        createdSpacers.reserveCapacity(spacerCount)
         for idx in 0..<spacerCount {
             let spacer = NSStatusBar.system.statusItem(withLength: 0)
             spacer.autosaveName = "BarFlow.Spacer.\(idx)"
@@ -234,14 +254,12 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    /// Returns the CG-coordinate frame of BarFlow's main status item if currently available.
     func mainStatusItemFrameCG() -> CGRect? {
         guard let win = mainStatusItem?.button?.window else { return nil }
         let rect = MenuBarScanner.appKitToCGRect(win.frame)
         return rect.width > 0 ? rect : nil
     }
 
-    /// Returns the AppKit frame of BarFlow's main status item for anchoring the Secondary Bar right below it.
     func mainStatusItemFrameAppKit() -> NSRect? {
         guard let win = mainStatusItem?.button?.window, win.frame.width > 0 else { return nil }
         return win.frame
@@ -375,31 +393,47 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    // MARK: - Scanning & Selection Management
+    // MARK: - Non-Blocking Scanning & Instant Selection Management
 
-    func refreshRunningApps(initializeDefaultsIfNeeded: Bool = false) {
-        isAccessibilityGranted = AXIsProcessTrusted()
-        guard isAccessibilityGranted else { return }
+    func refreshRunningAppsAsync(forceFullScan: Bool = false, initializeDefaultsIfNeeded: Bool = false) {
+        let trusted = AXIsProcessTrusted()
+        if isAccessibilityGranted != trusted {
+            isAccessibilityGranted = trusted
+        }
+        guard trusted, !isScanningInBackground else { return }
 
-        let snapshot = MenuBarScanner.shared.scanMenuBar(ownMainToggleFrameCG: mainStatusItemFrameCG())
-        self.allRunningApps = snapshot.apps
+        isScanningInBackground = true
+        lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
 
-        let hasInitialized = UserDefaults.standard.bool(forKey: Keys.initialized)
-        if initializeDefaultsIfNeeded && !hasInitialized && !snapshot.apps.isEmpty {
-            // Pre-select the rightmost ~6 apps (plus system items) so the user immediately has a clean Main Bar
-            // and a populated Secondary Bar (Ctrl+B), ready to customize!
-            var initialIDs = Set<String>()
-            var nonSystemCount = 0
-            for app in snapshot.apps {
-                if app.isSystemItem {
-                    initialIDs.insert(app.id)
-                } else if nonSystemCount < 5 {
-                    initialIDs.insert(app.id)
-                    nonSystemCount += 1
-                }
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let scannedApps = await MenuBarScanner.shared.scanMenuBarAsync(forceFullScan: forceFullScan)
+            self.isScanningInBackground = false
+
+            let oldSecondaryCount = self.secondaryBarApps.count
+            if self.allRunningApps != scannedApps {
+                self.allRunningApps = scannedApps
             }
-            self.selectedMainBarIDs = initialIDs
-            UserDefaults.standard.set(true, forKey: Keys.initialized)
+
+            let hasInitialized = UserDefaults.standard.bool(forKey: Keys.initialized)
+            if initializeDefaultsIfNeeded && !hasInitialized && !scannedApps.isEmpty {
+                var initialIDs = Set<String>()
+                var nonSystemCount = 0
+                for app in scannedApps {
+                    if app.isSystemItem {
+                        initialIDs.insert(app.id)
+                    } else if nonSystemCount < 5 {
+                        initialIDs.insert(app.id)
+                        nonSystemCount += 1
+                    }
+                }
+                self.selectedMainBarIDs = initialIDs
+                UserDefaults.standard.set(true, forKey: Keys.initialized)
+            }
+
+            if self.secondaryBarApps.count != oldSecondaryCount {
+                self.onSecondaryAppsChanged?()
+            }
         }
     }
 
@@ -417,9 +451,13 @@ final class MenuBarController: ObservableObject {
 
     func setAppSelection(_ item: MenuBarAppItem, visibleOnMainBar: Bool) {
         if visibleOnMainBar {
-            selectedMainBarIDs.insert(item.id)
+            if !selectedMainBarIDs.contains(item.id) {
+                selectedMainBarIDs.insert(item.id)
+            }
         } else {
-            selectedMainBarIDs.remove(item.id)
+            if selectedMainBarIDs.contains(item.id) {
+                selectedMainBarIDs.remove(item.id)
+            }
         }
     }
 
@@ -431,15 +469,19 @@ final class MenuBarController: ObservableObject {
         selectedMainBarIDs = Set(allRunningApps.filter(\.isSystemItem).map(\.id))
     }
 
-    private func saveSelection() {
-        UserDefaults.standard.set(Array(selectedMainBarIDs), forKey: Keys.selectedIDs)
-        UserDefaults.standard.set(true, forKey: Keys.initialized)
+    private func scheduleSaveSelection() {
+        pendingSaveWorkItem?.cancel()
+        let snapshot = Array(selectedMainBarIDs)
+        let work = DispatchWorkItem {
+            UserDefaults.standard.set(snapshot, forKey: Keys.selectedIDs)
+            UserDefaults.standard.set(true, forKey: Keys.initialized)
+        }
+        pendingSaveWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     // MARK: - Physical Menu Bar Reordering (⌘-Drag across BarFlow Divider)
 
-    /// Physically moves Checked apps to the RIGHT of BarFlow's icon (visible on Main Menu Bar)
-    /// and Unchecked apps to the LEFT of BarFlow's spacers (hidden from Main Menu Bar).
     func arrangeMenuBarAccordingToSelection() async {
         guard AXIsProcessTrusted() else {
             MenuBarScanner.shared.promptForAccessibilityPermission()
@@ -458,91 +500,99 @@ final class MenuBarController: ObservableObject {
             if isMainBarHidingEnabled {
                 setSpacersExpanded(true)
             }
-            refreshRunningApps()
+            refreshRunningAppsAsync(forceFullScan: true)
         }
 
-        // 1. Collapse spacers first so maximum items get real on-screen slots on the widest display
         let wasExpanded = areSpacersCurrentlyExpanded
         if wasExpanded {
             setSpacersExpanded(false)
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            try? await Task.sleep(nanoseconds: 280_000_000)
         }
 
-        guard let targetDisplayID = MenuBarScanner.widestDisplayID() else {
+        guard let targetDisplay = MenuBarScanner.widestDisplayGeometry() else {
             statusMessage = "Không tìm thấy màn hình để sắp xếp."
             return
         }
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let appsSnapshot = allRunningApps
+        let idByPID: [pid_t: MenuBarAppItem] = Dictionary(
+            uniqueKeysWithValues: appsSnapshot.map { ($0.pid, $0) }
+        )
         var movedCount = 0
 
-        // Perform up to 28 individual ⌘-drag operations so items settle cleanly one by one
-        for _ in 0..<28 {
-            let (slotsByDisplay, _) = MenuBarScanner.shared.readHostedSlotsByDisplay(
-                ownPID: ownPID,
-                ownMainToggleFrameCG: mainStatusItemFrameCG()
-            )
-            guard let slots = slotsByDisplay[targetDisplayID], !slots.isEmpty else { break }
+        for _ in 0..<24 {
+            let ownFrame = mainStatusItemFrameCG()
+            let slots = await withCheckedContinuation { continuation in
+                interactionQueue.async {
+                    let live = MenuBarScanner.shared.readLiveSlotsForArrangement(
+                        apps: appsSnapshot,
+                        ownPID: ownPID,
+                        ownMainToggleFrameCG: ownFrame,
+                        on: targetDisplay
+                    )
+                    continuation.resume(returning: live)
+                }
+            }
 
-            // Locate BarFlow's own divider bounds on this display
-            let ownSlots = slots.filter { $0.sourcePID == ownPID }
-            guard let mainToggleSlot = ownSlots.first(where: { $0.identifier == "BarFlow.MainToggle" }) ?? ownSlots.last else {
+            guard let mainToggleSlot = slots.first(where: { $0.sourcePID == ownPID }) else {
                 break
             }
-            let leftmostOwnMinX = ownSlots.map(\.frame.minX).min() ?? mainToggleSlot.frame.minX
-            let rightmostOwnMaxX = mainToggleSlot.frame.maxX
+            let barFlowMinX = mainToggleSlot.frame.minX
+            let barFlowMaxX = mainToggleSlot.frame.maxX
 
-            // Refresh PID -> ID map
-            let idByPID: [pid_t: MenuBarAppItem] = Dictionary(
-                uniqueKeysWithValues: allRunningApps.map { ($0.pid, $0) }
-            )
-
-            // Case A: Find a SELECTED app sitting to the LEFT of BarFlow -> move it to the RIGHT of MainToggle
+            // Case A: Selected app sitting to the LEFT of BarFlow -> move it to the RIGHT of BarFlow
             if let wrongLeftSlot = slots.first(where: { slot in
                 guard slot.sourcePID > 0, slot.sourcePID != ownPID,
-                      slot.frame.maxX <= leftmostOwnMinX + 2,
+                      slot.frame.maxX <= barFlowMinX + 2,
                       let item = idByPID[slot.sourcePID], item.isMovable else { return false }
                 return selectedMainBarIDs.contains(item.id)
             }) {
-                let targetPoint = CGPoint(x: min(rightmostOwnMaxX + 14, wrongLeftSlot.hostWindowFrame.maxX - 24), y: mainToggleSlot.frame.midY)
+                let targetPoint = CGPoint(
+                    x: min(barFlowMaxX + 16, wrongLeftSlot.hostWindowFrame.maxX - 24),
+                    y: mainToggleSlot.frame.midY
+                )
                 await performCommandDrag(from: wrongLeftSlot.center, to: targetPoint)
                 movedCount += 1
-                try? await Task.sleep(nanoseconds: 220_000_000)
+                try? await Task.sleep(nanoseconds: 180_000_000)
                 continue
             }
 
-            // Case B: Find an UNSELECTED app sitting to the RIGHT of MainToggle -> move it to the LEFT of BarFlow
+            // Case B: Unselected app sitting to the RIGHT of BarFlow -> move it to the LEFT of BarFlow
             if let wrongRightSlot = slots.first(where: { slot in
                 guard slot.sourcePID > 0, slot.sourcePID != ownPID,
-                      slot.frame.minX >= rightmostOwnMaxX - 2,
+                      slot.frame.minX >= barFlowMaxX - 2,
                       let item = idByPID[slot.sourcePID], item.isMovable else { return false }
                 return !selectedMainBarIDs.contains(item.id)
             }) {
-                let targetPoint = CGPoint(x: max(leftmostOwnMinX - 14, wrongRightSlot.hostWindowFrame.minX + 400), y: mainToggleSlot.frame.midY)
+                let targetPoint = CGPoint(
+                    x: max(barFlowMinX - 18, wrongRightSlot.hostWindowFrame.minX + 360),
+                    y: mainToggleSlot.frame.midY
+                )
                 await performCommandDrag(from: wrongRightSlot.center, to: targetPoint)
                 movedCount += 1
-                try? await Task.sleep(nanoseconds: 220_000_000)
+                try? await Task.sleep(nanoseconds: 180_000_000)
                 continue
             }
 
-            // All visible slots are on the correct side of BarFlow!
             break
         }
 
         if isMainBarHidingEnabled {
             setSpacersExpanded(true)
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000)
         }
 
         statusMessage = movedCount > 0
-            ? "Đã sắp xếp xong \(movedCount) biểu tượng và ẩn các app còn lại xuống Ctrl + B!"
-            : "Menu Bar chính đã khớp danh sách chọn lọc!"
+            ? "Đã sắp xếp xong \(movedCount) biểu tượng trên Menu Bar chính!"
+            : "Bạn có thể giữ phím ⌘ (Command) kéo biểu tượng sang trái icon ••• để ẩn vật lý, hoặc bấm Ctrl + B để thao tác ngay."
     }
 
-    // MARK: - Clicking & Interacting with Hidden Apps from `Ctrl + B` Secondary Bar
+    // MARK: - Instant App Activation from `Ctrl + B` Secondary Bar
 
-    /// Invoked when the user clicks (or right-clicks) an app inside the floating `Ctrl + B` Secondary Bar.
+    /// Invoked when the user clicks (or right-clicks) an app icon inside the floating `Ctrl + B` Secondary Bar.
     func activateAppFromSecondaryBar(_ item: MenuBarAppItem, rightClick: Bool = false) {
+        // 1. Dismiss the floating Secondary Bar immediately (0ms, no animation delay)
         onHideSecondaryBarRequested?()
 
         Task { @MainActor in
@@ -554,102 +604,114 @@ final class MenuBarController: ObservableObject {
         guard !isPerformingHIDSequence else { return }
         isPerformingHIDSequence = true
 
-        let mouseScreen = MenuBarScanner.screenContainingMouse()
-        let targetDisplayID = MenuBarScanner.displayID(for: mouseScreen) ?? MenuBarScanner.widestDisplayID() ?? CGMainDisplayID()
-
-        // Capture existing windows of target PID so we can detect any newly opened popover/panel
+        let displays = MenuBarScanner.captureDisplayGeometries()
         let windowsBefore = currentOnScreenWindows(for: item.pid)
-
-        // 1. Check if item ALREADY has a visible slot on the mouse display
-        var liveSlot = MenuBarScanner.shared.findSlot(
-            forPID: item.pid,
-            on: targetDisplayID,
-            ownMainToggleFrameCG: mainStatusItemFrameCG()
-        )
-
         var collapsedSpacersTemporarily = false
-        var expandedSystemChevron = false
 
-        // 2. If hidden behind our spacers, temporarily collapse spacers so it gets a real on-bar slot
-        if liveSlot == nil && areSpacersCurrentlyExpanded {
-            isTemporarilyRevealedForClick = true
-            collapsedSpacersTemporarily = true
-            setSpacersExpanded(false)
-
-            for _ in 0..<8 {
-                try? await Task.sleep(nanoseconds: 55_000_000)
-                if let found = MenuBarScanner.shared.findSlot(
-                    forPID: item.pid,
-                    on: targetDisplayID,
-                    ownMainToggleFrameCG: mainStatusItemFrameCG()
-                ) {
-                    liveSlot = found
-                    break
+        // 2. Only collapse spacers if they are currently expanded AND this item is actually hidden off-bar
+        if areSpacersCurrentlyExpanded {
+            let ownFrame = mainStatusItemFrameCG()
+            let alreadyVisibleRightOfSpacer: Bool = {
+                guard item.isCurrentlyOnBar, let itemFrame = item.slotFrame else { return false }
+                if let own = ownFrame, itemFrame.DisplayIntersects(own) {
+                    return itemFrame.minX > own.minX
                 }
+                return MenuBarScanner.isFrameVisiblyOnMenuBar(itemFrame, displays: displays)
+            }()
+
+            if !alreadyVisibleRightOfSpacer {
+                isTemporarilyRevealedForClick = true
+                collapsedSpacersTemporarily = true
+                setSpacersExpanded(false)
+                // Give MenuBarAgent ~75ms to restore the item's on-bar slot so its menu/popover anchors cleanly
+                try? await Task.sleep(nanoseconds: 75_000_000)
             }
         }
 
-        // 3. If still in macOS 27's native `«` overflow on a narrow display, click the `«` chevron to reveal slots
-        if liveSlot == nil {
-            let ownPID = ProcessInfo.processInfo.processIdentifier
-            let (_, chevrons) = MenuBarScanner.shared.readHostedSlotsByDisplay(
-                ownPID: ownPID,
-                ownMainToggleFrameCG: mainStatusItemFrameCG()
-            )
-            if let chevronRect = chevrons[targetDisplayID] {
-                expandedSystemChevron = true
-                await postHIDClick(
-                    at: CGPoint(x: chevronRect.midX, y: chevronRect.midY),
-                    button: .left,
-                    restoreCursor: false
-                )
-                for _ in 0..<8 {
-                    try? await Task.sleep(nanoseconds: 55_000_000)
-                    if let found = MenuBarScanner.shared.findSlot(
-                        forPID: item.pid,
-                        on: targetDisplayID,
-                        ownMainToggleFrameCG: mainStatusItemFrameCG()
-                    ) {
-                        liveSlot = found
-                        break
+        // 3. Trigger the status item directly on the high-priority background interactionQueue (0ms MainActor block!)
+        let targetPID = item.pid
+        let fallbackAX = item.axElement
+        let savedCursor = currentMouseCGLocation()
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            interactionQueue.async { [weak self] in
+                defer { continuation.resume() }
+
+                let live = MenuBarScanner.shared.liveStatusElement(for: targetPID, timeout: 0.18)
+                guard let axEl = live?.element ?? fallbackAX else {
+                    if let app = NSRunningApplication(processIdentifier: targetPID) {
+                        app.activate()
+                    }
+                    return
+                }
+
+                AXUIElementSetMessagingTimeout(axEl, 0.18)
+
+                if rightClick {
+                    // Check if status item exposes a dedicated right-click / context menu AX action
+                    var actionsRef: CFArray?
+                    let actions: [String] = (AXUIElementCopyActionNames(axEl, &actionsRef) == .success)
+                        ? ((actionsRef as? [String]) ?? [])
+                        : []
+
+                    if let menuAction = actions.first(where: { $0 == "AXShowMenu" || $0 == "AXSecondaryMenu" }) {
+                        _ = AXUIElementPerformAction(axEl, menuAction as CFString)
+                        return
+                    }
+
+                    if let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
+                        self?.postWarpedHIDClickSync(
+                            at: CGPoint(x: rect.midX, y: rect.midY),
+                            button: .right,
+                            savedCursor: savedCursor
+                        )
+                        return
+                    }
+
+                    _ = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
+                    return
+                }
+
+                // Left-click: Direct Accessibility `AXPress`
+                // Empirical behavior on macOS 14–27:
+                // - Returns `.success` (0) for NSPopover / NSPanel / MenuBarExtra(.window) apps (Itsycal, Maccy, Claude, Caffeine, etc.)
+                // - Returns `.cannotComplete` (-25204) when NSMenu opens and enters NSEventTrackingRunLoopMode (QuickFolder, Moom, OpenKey, Yoink, etc.)
+                // NEVER call runningApp.activate() on -25204, as stealing focus closes the open NSMenu!
+                let err = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
+                if err == .success || err == .cannotComplete {
+                    return
+                }
+
+                // Fallback 1: Custom NSView inside NSStatusItem with a child AXButton
+                var childrenRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                   let children = childrenRef as? [AXUIElement],
+                   let childButton = children.first {
+                    AXUIElementSetMessagingTimeout(childButton, 0.18)
+                    let childErr = AXUIElementPerformAction(childButton, kAXPressAction as CFString)
+                    if childErr == .success || childErr == .cannotComplete {
+                        return
                     }
                 }
-            }
-        }
 
-        // 4. Also check widest display if still nil
-        if liveSlot == nil, let widest = MenuBarScanner.widestDisplayID(), widest != targetDisplayID {
-            liveSlot = MenuBarScanner.shared.findSlot(
-                forPID: item.pid,
-                on: widest,
-                ownMainToggleFrameCG: mainStatusItemFrameCG()
-            )
-        }
-
-        // 5. Perform the actual click on the status item!
-        if let slot = liveSlot {
-            await postHIDClick(
-                at: slot.center,
-                button: rightClick ? .right : .left,
-                restoreCursor: !expandedSystemChevron
-            )
-        } else if !rightClick, let axEl = item.axElement ?? MenuBarScanner.shared.readExtrasMenuBarChildren(for: item.pid).first {
-            // Direct Accessibility AXPress fallback
-            let err = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
-            if err != .success {
-                if let runningApp = NSRunningApplication(processIdentifier: item.pid) {
-                    runningApp.activate()
+                // Fallback 2: Legacy warped HID click or app activation
+                if let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
+                    self?.postWarpedHIDClickSync(
+                        at: CGPoint(x: rect.midX, y: rect.midY),
+                        button: .left,
+                        savedCursor: savedCursor
+                    )
+                } else if let app = NSRunningApplication(processIdentifier: targetPID) {
+                    app.activate()
                 }
             }
-        } else if let runningApp = NSRunningApplication(processIdentifier: item.pid) {
-            runningApp.activate()
         }
 
         isPerformingHIDSequence = false
 
-        // 6. Schedule smart auto-rehide once the target app's menu or popover closes!
+        // 4. Re-expand spacers cleanly once the user closes the opened NSMenu or NSPopover/NSPanel
         if collapsedSpacersTemporarily {
-            try? await Task.sleep(nanoseconds: 280_000_000)
+            try? await Task.sleep(nanoseconds: 220_000_000)
             scheduleSmartRehide(targetPID: item.pid, baselineWindows: windowsBefore)
         }
     }
@@ -682,13 +744,16 @@ final class MenuBarController: ObservableObject {
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 800_000_000)
-                self?.refreshRunningApps()
+                MenuBarScanner.shared.handleAppLaunched()
+                try? await Task.sleep(nanoseconds: 900_000_000)
+                self?.refreshRunningAppsAsync(forceFullScan: true)
             }
         }
-        ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+        ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let terminatedPID = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier ?? 0
             Task { @MainActor in
-                self?.refreshRunningApps()
+                MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
+                self?.refreshRunningAppsAsync(forceFullScan: false)
             }
         }
     }
@@ -704,15 +769,13 @@ final class MenuBarController: ObservableObject {
                     return
                 }
 
-                // Wait while an NSMenu is still open
-                if self.isMenuCurrentlyTracking && Date().timeIntervalSince(startedAt) < 25 {
+                if self.isMenuCurrentlyTracking && Date().timeIntervalSince(startedAt) < 30 {
                     return
                 }
 
-                // Wait while the target app still has a newly opened popover/panel onscreen
                 let currentWins = self.currentOnScreenWindows(for: targetPID)
                 let newPopupWindows = currentWins.subtracting(baselineWindows)
-                if !newPopupWindows.isEmpty && Date().timeIntervalSince(startedAt) < 25 {
+                if !newPopupWindows.isEmpty && Date().timeIntervalSince(startedAt) < 30 {
                     return
                 }
 
@@ -743,9 +806,9 @@ final class MenuBarController: ObservableObject {
         return result
     }
 
-    // MARK: - Low-Level Quartz HID Click & Command-Drag Helpers
+    // MARK: - Low-Level Quartz HID Helpers
 
-    private func configureNonSuppressingEventSources() -> CGEventSource? {
+    nonisolated private func configureNonSuppressingEventSources() -> CGEventSource? {
         let allMask: CGEventFilterMask = [
             .permitLocalMouseEvents,
             .permitLocalKeyboardEvents,
@@ -769,10 +832,12 @@ final class MenuBarController: ObservableObject {
         return CGPoint(x: nsLoc.x, y: primaryHeight - nsLoc.y)
     }
 
-    private func postHIDClick(at point: CGPoint, button: CGMouseButton, restoreCursor: Bool) async {
-        let savedCursor = currentMouseCGLocation()
+    nonisolated private func postWarpedHIDClickSync(
+        at point: CGPoint,
+        button: CGMouseButton,
+        savedCursor: CGPoint
+    ) {
         guard let src = configureNonSuppressingEventSources() else { return }
-
         let downType: CGEventType = (button == .right) ? .rightMouseDown : .leftMouseDown
         let upType: CGEventType = (button == .right) ? .rightMouseUp : .leftMouseUp
 
@@ -785,16 +850,16 @@ final class MenuBarController: ObservableObject {
 
         CGDisplayHideCursor(CGMainDisplayID())
         defer {
-            if restoreCursor {
-                CGWarpMouseCursorPosition(savedCursor)
-            }
+            CGWarpMouseCursorPosition(savedCursor)
             CGDisplayShowCursor(CGMainDisplayID())
         }
 
+        CGWarpMouseCursorPosition(point)
+        usleep(14_000)
         down.post(tap: .cghidEventTap)
-        try? await Task.sleep(nanoseconds: 45_000_000)
+        usleep(28_000)
         up.post(tap: .cghidEventTap)
-        try? await Task.sleep(nanoseconds: 45_000_000)
+        usleep(20_000)
     }
 
     private func performCommandDrag(from start: CGPoint, to end: CGPoint) async {
@@ -812,31 +877,34 @@ final class MenuBarController: ObservableObject {
             return ev
         }
 
-        var sequence: [CGEvent] = []
-        if let down = makeDragEvent(.leftMouseDown, at: start) {
-            sequence.append(down)
-        }
-        let steps = 12
-        for step in 1...steps {
-            let t = CGFloat(step) / CGFloat(steps)
-            let p = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
-            if let drag = makeDragEvent(.leftMouseDragged, at: p) {
-                sequence.append(drag)
-            }
-        }
-        if let up = makeDragEvent(.leftMouseUp, at: end) {
-            sequence.append(up)
-        }
-
         CGDisplayHideCursor(CGMainDisplayID())
         defer {
             CGWarpMouseCursorPosition(savedCursor)
             CGDisplayShowCursor(CGMainDisplayID())
         }
 
-        for ev in sequence {
-            ev.post(tap: .cghidEventTap)
-            try? await Task.sleep(nanoseconds: 28_000_000)
+        CGWarpMouseCursorPosition(start)
+        try? await Task.sleep(nanoseconds: 18_000_000)
+        makeDragEvent(.leftMouseDown, at: start)?.post(tap: .cghidEventTap)
+        try? await Task.sleep(nanoseconds: 25_000_000)
+
+        let steps = 10
+        for step in 1...steps {
+            let t = CGFloat(step) / CGFloat(steps)
+            let p = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
+            CGWarpMouseCursorPosition(p)
+            makeDragEvent(.leftMouseDragged, at: p)?.post(tap: .cghidEventTap)
+            try? await Task.sleep(nanoseconds: 22_000_000)
         }
+
+        CGWarpMouseCursorPosition(end)
+        makeDragEvent(.leftMouseUp, at: end)?.post(tap: .cghidEventTap)
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+}
+
+private extension CGRect {
+    func DisplayIntersects(_ other: CGRect) -> Bool {
+        abs(self.midY - other.midY) <= 40
     }
 }

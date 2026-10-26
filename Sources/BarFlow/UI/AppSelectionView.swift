@@ -91,7 +91,7 @@ struct AppSelectionView: View {
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.12), in: Capsule())
                 }
-                Text("Chọn lọc ứng dụng giữ lại trên Menu Bar chính • Các ứng dụng còn lại hiển thị ngay dưới Menu Bar khi bấm Ctrl + B")
+                Text("Chọn lọc ứng dụng giữ lại trên Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải dưới Menu Bar khi bấm Ctrl + B")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -101,7 +101,7 @@ struct AppSelectionView: View {
 
             HStack(spacing: 8) {
                 Button {
-                    menuController.refreshRunningApps()
+                    menuController.refreshRunningAppsAsync(forceFullScan: true)
                 } label: {
                     Label("Làm mới", systemImage: "arrow.clockwise")
                         .font(.system(size: 12.5, weight: .medium))
@@ -135,7 +135,7 @@ struct AppSelectionView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(menuController.isArrangingMenuBar)
-                .help("Tự động sắp xếp các icon đã chọn sang bên phải và ẩn các icon còn lại trên Menu Bar chính")
+                .help("Sắp xếp các icon đã chọn sang bên phải và ẩn các icon còn lại trên Menu Bar chính")
             }
         }
         .padding(.horizontal, 20)
@@ -153,7 +153,7 @@ struct AppSelectionView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Cần cấp quyền Trợ năng (Accessibility) để quản lý Menu Bar")
                     .font(.system(size: 13, weight: .semibold))
-                Text("BarFlow dùng Accessibility API của macOS để đọc danh sách ứng dụng đang chạy trên Menu Bar và kích hoạt menu khi bấm từ thanh phụ Ctrl + B.")
+                Text("Nếu vừa cập nhật BarFlow, hãy tắt rồi bật lại công tắc BarFlow trong System Settings → Privacy & Security → Accessibility.")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
             }
@@ -161,7 +161,7 @@ struct AppSelectionView: View {
             Spacer()
 
             Button("Cấp quyền ngay") {
-                MenuBarScanner.shared.promptForAccessibilityPermission()
+                MenuBarScanner.shared.promptForAccessibilityPermission(openSystemSettings: true)
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
@@ -171,43 +171,39 @@ struct AppSelectionView: View {
         .background(Color.orange.opacity(0.10))
     }
 
-    // MARK: - 3. Live Dual-Bar Visual Preview (Bartender Style)
+    // MARK: - 3. Live Dual-Bar Visual Preview
 
     private var liveZonesPreviewSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let mainApps = menuController.mainBarApps
+        let secApps = menuController.secondaryBarApps
+
+        return VStack(alignment: .leading, spacing: 10) {
             // Zone A: Main Menu Bar Preview
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    Label("Giữ trên Menu Bar chính (\(menuController.mainBarApps.count))", systemImage: "pin.fill")
+                    Label("Giữ trên Menu Bar chính (\(mainApps.count))", systemImage: "pin.fill")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
                     Spacer()
-                    Text("Click vào icon bất kỳ để chuyển nhanh xuống thanh phụ Ctrl + B")
+                    Text("Click vào icon bất kỳ để chuyển xuống thanh phụ Ctrl + B")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        if menuController.mainBarApps.isEmpty {
+                        if mainApps.isEmpty {
                             Text("Chưa chọn ứng dụng nào — chỉ còn biểu tượng BarFlow trên Menu Bar chính")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(menuController.mainBarApps) { item in
-                                let chipKey = "main:\(item.id)"
+                            ForEach(mainApps) { item in
                                 PreviewChipButton(
                                     item: item,
                                     isPinnedMain: true,
-                                    isHovered: menuController.hoveredPreviewID == chipKey,
-                                    onHover: { inside in
-                                        menuController.hoveredPreviewID = inside ? chipKey : (menuController.hoveredPreviewID == chipKey ? nil : menuController.hoveredPreviewID)
-                                    },
                                     action: {
-                                        withAnimation(.easeInOut(duration: 0.15)) {
-                                            menuController.toggleAppSelection(item)
-                                        }
+                                        menuController.toggleAppSelection(item)
                                     }
                                 )
                             }
@@ -229,7 +225,7 @@ struct AppSelectionView: View {
             // Zone B: Secondary Bar (Ctrl + B) Preview
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
-                    Label("Hiện ở thanh phụ dưới Menu Bar khi bấm Ctrl + B (\(menuController.secondaryBarApps.count))", systemImage: "menubar.arrow.down.rectangle")
+                    Label("Hiện 1 dòng bên phải dưới Menu Bar khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.blue)
                     Spacer()
@@ -240,25 +236,18 @@ struct AppSelectionView: View {
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        if menuController.secondaryBarApps.isEmpty {
+                        if secApps.isEmpty {
                             Text("Không có ứng dụng ẩn — bỏ chọn bớt ứng dụng bên dưới để đưa vào thanh Ctrl + B")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(menuController.secondaryBarApps) { item in
-                                let chipKey = "sec:\(item.id)"
+                            ForEach(secApps) { item in
                                 PreviewChipButton(
                                     item: item,
                                     isPinnedMain: false,
-                                    isHovered: menuController.hoveredPreviewID == chipKey,
-                                    onHover: { inside in
-                                        menuController.hoveredPreviewID = inside ? chipKey : (menuController.hoveredPreviewID == chipKey ? nil : menuController.hoveredPreviewID)
-                                    },
                                     action: {
-                                        withAnimation(.easeInOut(duration: 0.15)) {
-                                            menuController.toggleAppSelection(item)
-                                        }
+                                        menuController.toggleAppSelection(item)
                                     }
                                 )
                             }
@@ -351,9 +340,10 @@ struct AppSelectionView: View {
     // MARK: - 5. Running Menu Bar Apps List
 
     private var appListSection: some View {
-        ScrollView {
-            LazyVStack(spacing: 6) {
-                if filteredApps.isEmpty {
+        let apps = filteredApps
+        return ScrollView {
+            LazyVStack(spacing: 5) {
+                if apps.isEmpty {
                     VStack(spacing: 10) {
                         Image(systemName: "menubar.rectangle")
                             .font(.system(size: 32))
@@ -367,18 +357,15 @@ struct AppSelectionView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 48)
                 } else {
-                    ForEach(filteredApps) { item in
+                    ForEach(apps) { item in
                         AppSelectionRow(
                             item: item,
-                            isSelectedOnMainBar: menuController.isSelectedForMainBar(item),
-                            isHovered: menuController.hoveredRowID == item.id,
-                            onHover: { inside in
-                                menuController.hoveredRowID = inside ? item.id : (menuController.hoveredRowID == item.id ? nil : menuController.hoveredRowID)
-                            },
+                            isSelectedOnMainBar: menuController.selectedMainBarIDs.contains(item.id),
                             onToggle: { newValue in
-                                withAnimation(.easeInOut(duration: 0.14)) {
-                                    menuController.setAppSelection(item, visibleOnMainBar: newValue)
-                                }
+                                menuController.setAppSelection(item, visibleOnMainBar: newValue)
+                            },
+                            onRowTap: {
+                                menuController.toggleAppSelection(item)
                             },
                             onTestTrigger: {
                                 menuController.activateAppFromSecondaryBar(item, rightClick: false)
@@ -388,7 +375,7 @@ struct AppSelectionView: View {
                 }
             }
             .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.vertical, 10)
         }
     }
 
@@ -433,14 +420,14 @@ struct AppSelectionView: View {
     }
 }
 
-// MARK: - Supporting Row & Chip Views
+// MARK: - Supporting Row & Chip Views (Zero Parent Hover Churn)
 
 private struct PreviewChipButton: View {
     let item: MenuBarAppItem
     let isPinnedMain: Bool
-    let isHovered: Bool
-    let onHover: (Bool) -> Void
     let action: () -> Void
+
+    @StateObject private var hover = LocalHoverBox()
 
     var body: some View {
         Button(action: action) {
@@ -458,7 +445,7 @@ private struct PreviewChipButton: View {
             .padding(.vertical, 4)
             .background(
                 Capsule()
-                    .fill(isHovered
+                    .fill(hover.isHovered
                           ? (isPinnedMain ? Color.red.opacity(0.14) : Color.green.opacity(0.16))
                           : Color(nsColor: .windowBackgroundColor))
             )
@@ -468,7 +455,11 @@ private struct PreviewChipButton: View {
             )
         }
         .buttonStyle(.plain)
-        .onHover { onHover($0) }
+        .onHover { inside in
+            if hover.isHovered != inside {
+                hover.isHovered = inside
+            }
+        }
         .help(isPinnedMain ? "Click để chuyển \(item.appName) xuống thanh phụ Ctrl + B" : "Click để đưa \(item.appName) lên Menu Bar chính")
     }
 }
@@ -476,70 +467,77 @@ private struct PreviewChipButton: View {
 private struct AppSelectionRow: View {
     let item: MenuBarAppItem
     let isSelectedOnMainBar: Bool
-    let isHovered: Bool
-    let onHover: (Bool) -> Void
     let onToggle: (Bool) -> Void
+    let onRowTap: () -> Void
     let onTestTrigger: () -> Void
+
+    @StateObject private var hover = LocalHoverBox()
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(nsImage: item.appIcon)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 30, height: 30)
+            HStack(spacing: 12) {
+                Image(nsImage: item.appIcon)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 28, height: 28)
 
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(item.appName)
-                        .font(.system(size: 13.5, weight: .semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(item.appName)
+                            .font(.system(size: 13.5, weight: .semibold))
 
-                    if !item.statusTitle.isEmpty {
-                        Text(item.statusTitle)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.blue)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Color.blue.opacity(0.10), in: Capsule())
+                        if !item.statusTitle.isEmpty {
+                            Text(item.statusTitle)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.blue)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Color.blue.opacity(0.10), in: Capsule())
+                        }
+
+                        if item.isSystemItem {
+                            Text("Hệ thống")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.secondary.opacity(0.12), in: Capsule())
+                        }
                     }
 
-                    if item.isSystemItem {
-                        Text("Hệ thống")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.12), in: Capsule())
-                    }
-                }
-
-                HStack(spacing: 8) {
                     if let bundle = item.bundleIdentifier {
                         Text(bundle)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
                 }
+
+                Spacer(minLength: 8)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                onRowTap()
             }
 
-            Spacer()
-
-            Button {
-                onTestTrigger()
-            } label: {
-                Label("Thao tác thử", systemImage: "cursorarrow.click")
+            Button(action: onTestTrigger) {
+                Label("Mở menu", systemImage: "cursorarrow.click")
                     .font(.system(size: 11.5))
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .opacity(isHovered ? 1.0 : 0.65)
-            .help("Kích hoạt ngay menu của \(item.appName)")
+            .opacity(hover.isHovered ? 1.0 : 0.72)
+            .help("Mở ngay menu của \(item.appName)")
 
             HStack(spacing: 8) {
                 Text(isSelectedOnMainBar ? "Menu Bar chính" : "Thanh phụ ⌃B")
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(isSelectedOnMainBar ? .green : .blue)
                     .frame(width: 96, alignment: .trailing)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        onRowTap()
+                    }
 
                 Toggle("", isOn: Binding(
                     get: { isSelectedOnMainBar },
@@ -551,18 +549,22 @@ private struct AppSelectionRow: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isHovered ? Color.primary.opacity(0.05) : Color.primary.opacity(0.025))
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(hover.isHovered ? Color.primary.opacity(0.05) : Color.primary.opacity(0.025))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(
-                    isSelectedOnMainBar ? Color.green.opacity(0.24) : Color.primary.opacity(0.06),
+                    isSelectedOnMainBar ? Color.green.opacity(0.26) : Color.primary.opacity(0.06),
                     lineWidth: 1
                 )
         )
-        .onHover { onHover($0) }
+        .onHover { inside in
+            if hover.isHovered != inside {
+                hover.isHovered = inside
+            }
+        }
     }
 }

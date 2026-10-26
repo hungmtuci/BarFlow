@@ -12,26 +12,24 @@ struct MenuBarAppItem: Identifiable, Equatable {
     let appName: String
     /// Bundle identifier if available.
     let bundleIdentifier: String?
-    /// Native application icon.
+    /// Pre-scaled crisp application icon (`32x32` pt @2x) for zero-lag SwiftUI rendering.
     let appIcon: NSImage
-    /// Optional live monochrome/cropped glyph captured from the menu bar strip.
-    var menuBarSnapshot: NSImage?
     /// Live text/status title exposed by the status item (e.g. "Mon, 26 Oct" for Itsycal).
     var statusTitle: String
     /// Accessibility description if provided by the status item.
     var statusDescription: String
-    /// Current screen-space frame (CoreGraphics top-left origin) on the primary/reference display, if laid out.
+    /// Current screen-space frame (CoreGraphics top-left origin), if available.
     var slotFrame: CGRect?
     /// Whether this item currently has an active visible slot on the menu bar (not pushed into overflow).
     var isCurrentlyOnBar: Bool
-    /// Underlying Accessibility element inside `AXExtrasMenuBar` for direct `AXPress` fallback.
+    /// Underlying Accessibility element inside `AXExtrasMenuBar` for direct `AXPress` invocation.
     let axElement: AXUIElement?
     /// Whether this item belongs to macOS system services (Clock, Control Center, Siri, Input Source).
     let isSystemItem: Bool
     /// Whether macOS allows moving/hiding this item via Command-drag.
     let isMovable: Bool
 
-    /// Effective X coordinate for sorting right-to-left or left-to-right on the menu bar.
+    /// Effective X coordinate for sorting right-to-left on the menu bar.
     var sortX: CGFloat {
         slotFrame?.minX ?? -99999
     }
@@ -39,9 +37,9 @@ struct MenuBarAppItem: Identifiable, Equatable {
     static func == (lhs: MenuBarAppItem, rhs: MenuBarAppItem) -> Bool {
         lhs.id == rhs.id &&
         lhs.pid == rhs.pid &&
+        lhs.appName == rhs.appName &&
         lhs.statusTitle == rhs.statusTitle &&
-        lhs.isCurrentlyOnBar == rhs.isCurrentlyOnBar &&
-        lhs.slotFrame == rhs.slotFrame
+        lhs.isCurrentlyOnBar == rhs.isCurrentlyOnBar
     }
 }
 

@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -128,7 +128,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -191,7 +191,7 @@ ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
 rm -rf "$DMG_STAGING"
 
 echo "==> [6/6] Đồng bộ $ROOT_APP_BUNDLE..."
-if [ "$ROOT_WORKSPACE_DIR" != "$PROJECT_DIR" ] && [ -d "$ROOT_WORKSPACE_DIR/QuickFolder" ]; then
+if [ "$ROOT_WORKSPACE_DIR" != "$PROJECT_DIR" ] && [ -d "$ROOT_WORKSPACE_DIR/BarFlow.app" -o -d "$ROOT_WORKSPACE_DIR/Sources" ]; then
     rm -rf "$ROOT_APP_BUNDLE"
     cp -R "$APP_BUNDLE" "$ROOT_APP_BUNDLE"
     xattr -cr "$ROOT_APP_BUNDLE" 2>/dev/null || true
