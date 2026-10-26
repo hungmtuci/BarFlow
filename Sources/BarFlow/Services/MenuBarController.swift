@@ -19,14 +19,21 @@ final class MenuBarController: ObservableObject {
             guard selectedMainBarIDs != oldValue else { return }
             scheduleSaveSelection()
             onSecondaryAppsChanged?()
+            if !allRunningApps.isEmpty {
+                scheduleNativeMenuBarSync(delay: 0.60)
+            }
         }
     }
 
-    /// Whether BarFlow actively hides unselected apps from the Main Menu Bar using its spacer divider.
+    /// Whether BarFlow actively hides unselected apps from the Main Menu Bar.
     @Published var isMainBarHidingEnabled: Bool {
         didSet {
+            guard isMainBarHidingEnabled != oldValue else { return }
             UserDefaults.standard.set(isMainBarHidingEnabled, forKey: Keys.hidingEnabled)
             applySpacersVisibilityState()
+            if !allRunningApps.isEmpty {
+                scheduleNativeMenuBarSync(delay: 0.35)
+            }
         }
     }
 
@@ -113,6 +120,12 @@ final class MenuBarController: ObservableObject {
 
     private var rehideMonitorTimer: Timer?
     private var backgroundMonitorTimer: Timer?
+    private var nativeSyncDebounceWorkItem: DispatchWorkItem?
+    private var deferredReloadTimer: Timer?
+    private var isExecutingNativeSync: Bool = false
+    private var hasQueuedFollowUpNativeSync: Bool = false
+    private var hasPerformedStartupVisibilitySync: Bool = false
+    private var knownDiscoveredAppIDs = Set<String>()
     private var lastBackgroundScanTime: CFAbsoluteTime = 0
     private var pendingSaveWorkItem: DispatchWorkItem?
 
@@ -193,13 +206,18 @@ final class MenuBarController: ObservableObject {
     func prepareForTermination() {
         backgroundMonitorTimer?.invalidate()
         rehideMonitorTimer?.invalidate()
+        nativeSyncDebounceWorkItem?.cancel()
+        nativeSyncDebounceWorkItem = nil
+        deferredReloadTimer?.invalidate()
+        deferredReloadTimer = nil
         pendingSaveWorkItem?.perform()
         pendingSaveWorkItem = nil
-        // Always collapse spacers on quit so all hidden icons reappear cleanly on the user's Menu Bar
+        // Always collapse legacy spacers and restore native MenuBarAgent visibility on quit
         for spacer in spacerItems {
             spacer.isVisible = false
             spacer.length = 0
         }
+        MenuBarVisibilityEngine.shared.restoreAllSynchronouslyOnQuit()
     }
 
     func applyDockPolicy() {
@@ -222,6 +240,13 @@ final class MenuBarController: ObservableObject {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         self.mainStatusItem = item
+
+        // On macOS 26/27 (`MenuBarAgent`), BarFlow hides unselected items natively without spacer bloat
+        // (avoiding macOS's `«` overflow chevron and notch crowding). Legacy spacers are only created on macOS 14/15.
+        guard !MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else {
+            self.spacerItems = []
+            return
+        }
 
         var createdSpacers: [NSStatusItem] = []
         createdSpacers.reserveCapacity(spacerCount)
@@ -372,6 +397,7 @@ final class MenuBarController: ObservableObject {
     // MARK: - Spacer Expansion & Collapsing
 
     private func applySpacersVisibilityState() {
+        guard !MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
         if isMainBarHidingEnabled && isAccessibilityGranted && !isTemporarilyRevealedForClick {
             setSpacersExpanded(true)
         } else {
@@ -411,6 +437,11 @@ final class MenuBarController: ObservableObject {
             self.isScanningInBackground = false
 
             let oldSecondaryCount = self.secondaryBarApps.count
+            let discoveredIDs = Set(scannedApps.map(\.id))
+            let newUnselectedLaunched = !self.knownDiscoveredAppIDs.isEmpty &&
+                discoveredIDs.subtracting(self.knownDiscoveredAppIDs).contains(where: { !self.selectedMainBarIDs.contains($0) })
+            self.knownDiscoveredAppIDs.formUnion(discoveredIDs)
+
             if self.allRunningApps != scannedApps {
                 self.allRunningApps = scannedApps
             }
@@ -427,8 +458,16 @@ final class MenuBarController: ObservableObject {
                         nonSystemCount += 1
                     }
                 }
+                self.hasPerformedStartupVisibilitySync = true
                 self.selectedMainBarIDs = initialIDs
                 UserDefaults.standard.set(true, forKey: Keys.initialized)
+            } else if !self.hasPerformedStartupVisibilitySync && !scannedApps.isEmpty {
+                self.hasPerformedStartupVisibilitySync = true
+                if self.isMainBarHidingEnabled {
+                    self.scheduleNativeMenuBarSync(delay: 0.40)
+                }
+            } else if newUnselectedLaunched && self.isMainBarHidingEnabled {
+                self.scheduleNativeMenuBarSync(delay: 0.75)
             }
 
             if self.secondaryBarApps.count != oldSecondaryCount {
@@ -484,7 +523,99 @@ final class MenuBarController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
-    // MARK: - Physical Menu Bar Reordering (⌘-Drag across BarFlow Divider)
+    // MARK: - Native MenuBarAgent Visibility Sync (macOS 26/27+) & Legacy ⌘-Drag Fallback
+
+    private func scheduleNativeMenuBarSync(delay: TimeInterval) {
+        guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
+        nativeSyncDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                await self?.executeNativeMenuBarSync()
+            }
+        }
+        nativeSyncDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func executeNativeMenuBarSync() async {
+        guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
+        guard AXIsProcessTrusted(), !allRunningApps.isEmpty else { return }
+
+        if isExecutingNativeSync {
+            hasQueuedFollowUpNativeSync = true
+            return
+        }
+
+        isExecutingNativeSync = true
+        isArrangingMenuBar = true
+        deferredReloadTimer?.invalidate()
+        deferredReloadTimer = nil
+
+        let appsSnapshot = allRunningApps
+        let selectedSnapshot = selectedMainBarIDs
+        let hidingSnapshot = isMainBarHidingEnabled
+
+        let outcome = await MenuBarVisibilityEngine.shared.syncMenuBarState(
+            allApps: appsSnapshot,
+            selectedMainBarIDs: selectedSnapshot,
+            hidingEnabled: hidingSnapshot
+        )
+
+        isExecutingNativeSync = false
+
+        if hasQueuedFollowUpNativeSync {
+            hasQueuedFollowUpNativeSync = false
+            await executeNativeMenuBarSync()
+            return
+        }
+
+        if let waitSec = outcome.deferredReloadDelay {
+            let secs = max(1, Int(ceil(waitSec)))
+            statusMessage = "Đang đồng bộ Menu Bar chính (cập nhật sau ~\(secs) giây để tránh trễ hệ thống)..."
+            scheduleDeferredMenuBarAgentReload(after: waitSec + 0.12, hiddenCount: outcome.hiddenCount)
+            return
+        }
+
+        isArrangingMenuBar = false
+        if outcome.didModifyPreferences {
+            if hidingSnapshot {
+                statusMessage = outcome.hiddenCount > 0
+                    ? "Đã ẩn \(outcome.hiddenCount) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
+                    : "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
+            } else {
+                statusMessage = "Đã tạm tắt ẩn — toàn bộ ứng dụng đang hiện trên Menu Bar chính."
+            }
+            // Refresh live slot statuses cleanly once MenuBarAgent finishes respawning (~1.0s)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) { [weak self] in
+                self?.refreshRunningAppsAsync(forceFullScan: false)
+            }
+        }
+    }
+
+    private func scheduleDeferredMenuBarAgentReload(after delay: TimeInterval, hiddenCount: Int) {
+        deferredReloadTimer?.invalidate()
+        deferredReloadTimer = Timer.scheduledTimer(withTimeInterval: max(0.2, delay), repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                if let stillRemaining = await MenuBarVisibilityEngine.shared.performDeferredReloadIfReady() {
+                    self.scheduleDeferredMenuBarAgentReload(after: stillRemaining + 0.15, hiddenCount: hiddenCount)
+                    return
+                }
+                self.isArrangingMenuBar = false
+                if self.isMainBarHidingEnabled {
+                    let countNow = self.secondaryBarApps.count
+                    self.statusMessage = countNow > 0
+                        ? "Đã ẩn \(countNow) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
+                        : "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
+                } else {
+                    self.statusMessage = "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) { [weak self] in
+                    self?.refreshRunningAppsAsync(forceFullScan: false)
+                }
+            }
+        }
+    }
 
     func arrangeMenuBarAccordingToSelection() async {
         guard AXIsProcessTrusted() else {
@@ -492,6 +623,22 @@ final class MenuBarController: ObservableObject {
             statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) để sắp xếp Menu Bar."
             return
         }
+
+        // Fast native path for macOS 26/27+ (`MenuBarAgent`)
+        if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture {
+            nativeSyncDebounceWorkItem?.cancel()
+            nativeSyncDebounceWorkItem = nil
+            statusMessage = "Đang áp dụng danh sách chọn lọc lên Menu Bar chính..."
+            await executeNativeMenuBarSync()
+            if !isArrangingMenuBar && statusMessage == "Đang áp dụng danh sách chọn lọc lên Menu Bar chính..." {
+                let countNow = secondaryBarApps.count
+                statusMessage = (isMainBarHidingEnabled && countNow > 0)
+                    ? "Menu Bar chính đã khớp — đang ẩn \(countNow) ứng dụng trong thanh Ctrl + B!"
+                    : "Menu Bar chính đã khớp danh sách chọn lọc!"
+            }
+            return
+        }
+
         guard !isArrangingMenuBar, !isPerformingHIDSequence else { return }
 
         isArrangingMenuBar = true
@@ -650,14 +797,22 @@ final class MenuBarController: ObservableObject {
 
     private func performHiddenAppInteraction(_ item: MenuBarAppItem, rightClick: Bool) async {
         guard !isPerformingHIDSequence else { return }
+
+        // Handle hidden macOS System Modules (`Spotlight`, `Wi-Fi`, `Battery`, `Screen Mirroring`, `Input Menu`, etc.) instantaneously
+        if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture &&
+            (item.pid == 0 || (item.isSystemItem && !item.isCurrentlyOnBar)) {
+            MenuBarVisibilityEngine.shared.triggerHiddenSystemItem(item, rightClick: rightClick)
+            return
+        }
+
         isPerformingHIDSequence = true
 
         let displays = MenuBarScanner.captureDisplayGeometries()
         let windowsBefore = currentOnScreenWindows(for: item.pid)
         var collapsedSpacersTemporarily = false
 
-        // 2. Only collapse spacers if they are currently expanded AND this item is actually hidden off-bar
-        if areSpacersCurrentlyExpanded {
+        // 2. Legacy macOS 14/15 spacer collapse (skipped on macOS 26/27 where `AXPress` opens menus at top-right directly while hidden!)
+        if !MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture && areSpacersCurrentlyExpanded {
             let ownFrame = mainStatusItemFrameCG()
             let alreadyVisibleRightOfSpacer: Bool = {
                 guard item.isCurrentlyOnBar, let itemFrame = item.slotFrame else { return false }
@@ -794,7 +949,9 @@ final class MenuBarController: ObservableObject {
 
     private func observeWorkspaceNotifications() {
         let ws = NSWorkspace.shared.notificationCenter
-        ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+        ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let launchedBundle = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+            guard launchedBundle != "com.apple.MenuBarAgent" else { return }
             Task { @MainActor in
                 MenuBarScanner.shared.handleAppLaunched()
                 try? await Task.sleep(nanoseconds: 900_000_000)
@@ -802,7 +959,9 @@ final class MenuBarController: ObservableObject {
             }
         }
         ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            let terminatedPID = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier ?? 0
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.bundleIdentifier != "com.apple.MenuBarAgent" else { return }
+            let terminatedPID = app?.processIdentifier ?? 0
             Task { @MainActor in
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
                 self?.refreshRunningAppsAsync(forceFullScan: false)

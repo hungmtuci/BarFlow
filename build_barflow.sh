@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.2.0"
+VERSION="1.3.0"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -96,15 +96,20 @@ for (px, name) in sizes {
 SWIFT_ICON
 
 echo "==> [3/6] Đang đóng gói $APP_NAME.app..."
-rm -rf "$APP_BUNDLE"
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+STAGE_ROOT="$(mktemp -d /tmp/BarFlowBuildStage.XXXXXX)"
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+STAGE_APP="$STAGE_ROOT/$APP_NAME.app"
+STAGE_CONTENTS="$STAGE_APP/Contents"
+STAGE_MACOS="$STAGE_CONTENTS/MacOS"
+STAGE_RESOURCES="$STAGE_CONTENTS/Resources"
+mkdir -p "$STAGE_MACOS" "$STAGE_RESOURCES"
 
-cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
-chmod +x "$MACOS_DIR/$APP_NAME"
+cp -X "$BIN_PATH" "$STAGE_MACOS/$APP_NAME"
+chmod +x "$STAGE_MACOS/$APP_NAME"
 
-iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns" || true
+iconutil -c icns "$ICONSET_DIR" -o "$STAGE_RESOURCES/AppIcon.icns" || true
 
-cat > "$CONTENTS_DIR/Info.plist" <<EOF
+cat > "$STAGE_CONTENTS/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -128,7 +133,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -138,18 +143,21 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
 EOF
 
 echo "==> [4/6] Đang ký số (Ad-hoc Codesign)..."
-xattr -cr "$APP_BUNDLE" 2>/dev/null || true
-codesign --force --deep --sign - "$APP_BUNDLE"
+xattr -cr "$STAGE_APP" 2>/dev/null || true
+codesign --force --deep --sign - "$STAGE_APP"
+codesign --verify --deep --strict "$STAGE_APP"
+
+rm -rf "$APP_BUNDLE"
+ditto --noextattr "$STAGE_APP" "$APP_BUNDLE"
 
 echo "==> [5/6] Đang tạo bộ cài đặt .DMG và .ZIP tại thư mục dist/..."
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-DMG_STAGING="$PROJECT_DIR/.build/dmg_staging"
-rm -rf "$DMG_STAGING"
+DMG_STAGING="$STAGE_ROOT/dmg_staging"
 mkdir -p "$DMG_STAGING"
 
-cp -R "$APP_BUNDLE" "$DMG_STAGING/$APP_NAME.app"
+ditto --noextattr "$STAGE_APP" "$DMG_STAGING/$APP_NAME.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 cat > "$DMG_STAGING/Cai_Dat_BarFlow.command" << 'INSTALLER_EOF'
@@ -165,7 +173,7 @@ echo "===================================================="
 
 pkill -f BarFlow 2>/dev/null || true
 rm -rf "$APP_DST"
-cp -R "$APP_SRC" "$APP_DST"
+ditto --noextattr "$APP_SRC" "$APP_DST"
 
 # Gỡ cờ cách ly Gatekeeper (Quarantine) và làm mới quyền Accessibility khi nâng cấp phiên bản
 xattr -cr "$APP_DST" 2>/dev/null || true
@@ -188,15 +196,12 @@ hdiutil create -volname "${APP_NAME} Installer" \
     "$DMG_PATH" >/dev/null
 
 ZIP_PATH="$DIST_DIR/${APP_NAME}-v${VERSION}-macOS.zip"
-ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
-rm -rf "$DMG_STAGING"
+ditto -c -k --norsrc --noextattr --keepParent "$STAGE_APP" "$ZIP_PATH"
 
 echo "==> [6/6] Đồng bộ $ROOT_APP_BUNDLE..."
 if [ "$ROOT_WORKSPACE_DIR" != "$PROJECT_DIR" ] && [ -d "$ROOT_WORKSPACE_DIR/BarFlow.app" -o -d "$ROOT_WORKSPACE_DIR/Sources" ]; then
     rm -rf "$ROOT_APP_BUNDLE"
-    cp -R "$APP_BUNDLE" "$ROOT_APP_BUNDLE"
-    xattr -cr "$ROOT_APP_BUNDLE" 2>/dev/null || true
-    codesign --force --deep --sign - "$ROOT_APP_BUNDLE"
+    ditto --noextattr "$STAGE_APP" "$ROOT_APP_BUNDLE"
 fi
 
 echo "==> Hoàn tất!"

@@ -92,7 +92,7 @@ struct AppSelectionView: View {
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.12), in: Capsule())
                 }
-                Text("Chọn ứng dụng giữ trên Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải khi bấm Ctrl + B")
+                Text("Tự động ẩn thực sự khỏi Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải khi bấm Ctrl + B")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -129,15 +129,15 @@ struct AppSelectionView: View {
                             ProgressView()
                                 .controlSize(.small)
                         } else {
-                            Image(systemName: "wand.and.stars")
+                            Image(systemName: "checkmark.circle.fill")
                         }
-                        Text(menuController.isArrangingMenuBar ? "Đang sắp xếp..." : "Áp dụng lên Menu Bar")
+                        Text(menuController.isArrangingMenuBar ? "Đang đồng bộ..." : "Áp dụng ngay")
                             .font(.system(size: 12.5, weight: .semibold))
                     }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(menuController.isArrangingMenuBar)
-                .help("Sắp xếp các icon đã chọn sang bên phải và ẩn các icon còn lại trên Menu Bar chính")
+                .help("Đồng bộ ngay lập tức việc ẩn/hiện ứng dụng trên Menu Bar chính")
             }
             .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)

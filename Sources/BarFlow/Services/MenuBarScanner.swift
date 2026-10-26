@@ -263,7 +263,8 @@ final class MenuBarScanner: @unchecked Sendable {
                         for: proc,
                         rawChildren: rawChildren,
                         displays: displays,
-                        symbolIcons: symbolIcons
+                        symbolIcons: symbolIcons,
+                        agentSlotElementsByPID: agentSlotElementsByPID
                     )
                     resultLock.lock()
                     newlyPositivePIDs.insert(proc.pid)
@@ -277,7 +278,8 @@ final class MenuBarScanner: @unchecked Sendable {
                             for: proc,
                             rawChildren: fallbackElements,
                             displays: displays,
-                            symbolIcons: symbolIcons
+                            symbolIcons: symbolIcons,
+                            agentSlotElementsByPID: agentSlotElementsByPID
                         )
                         if !built.isEmpty {
                             resultLock.lock()
@@ -309,7 +311,8 @@ final class MenuBarScanner: @unchecked Sendable {
                     for: proc,
                     rawChildren: rawChildren,
                     displays: displays,
-                    symbolIcons: symbolIcons
+                    symbolIcons: symbolIcons,
+                    agentSlotElementsByPID: agentSlotElementsByPID
                 )
                 newlyPositivePIDs.insert(proc.pid)
                 discovered.append(contentsOf: built)
@@ -319,7 +322,8 @@ final class MenuBarScanner: @unchecked Sendable {
                         for: proc,
                         rawChildren: fallbackElements,
                         displays: displays,
-                        symbolIcons: symbolIcons
+                        symbolIcons: symbolIcons,
+                        agentSlotElementsByPID: agentSlotElementsByPID
                     )
                     if !built.isEmpty {
                         newlyPositivePIDs.insert(proc.pid)
@@ -334,13 +338,46 @@ final class MenuBarScanner: @unchecked Sendable {
                         for: proc,
                         rawChildren: fallbackElements,
                         displays: displays,
-                        symbolIcons: symbolIcons
+                        symbolIcons: symbolIcons,
+                        agentSlotElementsByPID: agentSlotElementsByPID
                     )
                     if !built.isEmpty {
                         newlyPositivePIDs.insert(proc.pid)
                         discovered.append(contentsOf: built)
                     }
                 }
+            }
+        }
+
+        // Merge any System Menu Extras currently hidden by BarFlow so they remain visible & clickable in `Ctrl + B`!
+        let persistedHiddenSys = MenuBarVisibilityEngine.shared.persistedHiddenSystemItems()
+        for persisted in persistedHiddenSys {
+            let alreadyPresent = discovered.contains { existing in
+                if existing.id == persisted.id { return true }
+                if let pa = persisted.axIdentifier, !pa.isEmpty, existing.axIdentifier == pa { return true }
+                if existing.appName == persisted.appName && existing.isSystemItem { return true }
+                return false
+            }
+            if !alreadyPresent {
+                let icon = symbolIcons[persisted.symbolKey] ?? symbolIcons["default"] ?? fallbackDefaultIcon
+                discovered.append(
+                    MenuBarAppItem(
+                        id: persisted.id,
+                        pid: 0,
+                        appName: persisted.appName,
+                        bundleIdentifier: persisted.bundleIdentifier,
+                        axIdentifier: persisted.axIdentifier,
+                        axChildIndex: 0,
+                        appIcon: icon,
+                        statusTitle: "",
+                        statusDescription: persisted.appName,
+                        slotFrame: nil,
+                        isCurrentlyOnBar: false,
+                        axElement: nil,
+                        isSystemItem: true,
+                        isMovable: true
+                    )
+                )
             }
         }
 
@@ -386,7 +423,8 @@ final class MenuBarScanner: @unchecked Sendable {
         for proc: CandidateProcess,
         rawChildren: [AXUIElement],
         displays: [DisplayGeometry],
-        symbolIcons: [String: NSImage]
+        symbolIcons: [String: NSImage],
+        agentSlotElementsByPID: [pid_t: [AXUIElement]]
     ) -> [MenuBarAppItem] {
         guard !rawChildren.isEmpty else { return [] }
 
@@ -443,12 +481,15 @@ final class MenuBarScanner: @unchecked Sendable {
         var items: [MenuBarAppItem] = []
         items.reserveCapacity(rawChildren.count)
 
+        let hasMenuBarAgentSlots = !agentSlotElementsByPID.isEmpty
+        let isPIDHostedInAgent = !hasMenuBarAgentSlots || (agentSlotElementsByPID[proc.pid] != nil)
+
         for (idx, rawChild) in rawChildren.enumerated() {
             let playable = unwrapPlayableMenuBarElement(rawChild, timeout: 0.25)
             let (axTitle, axDesc, innerFrame) = readAXMetadata(playable, timeout: 0.25)
             let axFrame = innerFrame ?? readAXFrame(rawChild)
             let axID = readAXString(playable, kAXIdentifierAttribute as CFString)
-            let isOnBar = Self.isFrameVisiblyOnMenuBar(axFrame, displays: displays)
+            let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(axFrame, displays: displays)
 
             let baseAppName = Self.friendlyAppName(
                 bundleID: proc.bundleID,
@@ -661,6 +702,33 @@ final class MenuBarScanner: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// Triggers the always-present Control Center (`com.apple.menuextra.controlcenter`) icon on the active screen (`< 5ms`).
+    @MainActor
+    func pressControlCenterMenuExtra() -> Bool {
+        if let disp = Self.displayGeometryContainingMouse(),
+           let match = findMenuBarAgentSystemExtra(identifier: "com.apple.menuextra.controlcenter", on: disp, timeout: 0.20) {
+            AXUIElementSetMessagingTimeout(match.element, 0.20)
+            let err = AXUIElementPerformAction(match.element, kAXPressAction as CFString)
+            if err == .success || err == .cannotComplete {
+                return true
+            }
+        }
+        guard let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first else {
+            return false
+        }
+        let children = readExtrasMenuBarChildren(for: agent.processIdentifier, timeout: 0.20)
+        for raw in children {
+            let playable = unwrapPlayableMenuBarElement(raw, timeout: 0.20)
+            let id = readAXString(playable, kAXIdentifierAttribute as CFString) ?? ""
+            if id == "com.apple.menuextra.controlcenter" || id.lowercased().contains("bento") {
+                AXUIElementSetMessagingTimeout(playable, 0.20)
+                let err = AXUIElementPerformAction(playable, kAXPressAction as CFString)
+                return err == .success || err == .cannotComplete
+            }
+        }
+        return false
     }
 
     func readExtrasMenuBarChildren(for pid: pid_t, timeout: Float = 0.20) -> [AXUIElement] {
@@ -891,6 +959,7 @@ final class MenuBarScanner: @unchecked Sendable {
             ("user", "person.crop.circle"),
             ("siri", "mic.circle.fill"),
             ("spotlight", "magnifyingglass"),
+            ("keyboard", "keyboard"),
             ("default", "menubar.rectangle")
         ]
         var map: [String: NSImage] = [:]
