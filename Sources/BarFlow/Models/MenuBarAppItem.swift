@@ -2,16 +2,20 @@ import Foundation
 import AppKit
 import ApplicationServices
 
-/// Represents a running application (or system module) that currently has a status item on the macOS Menu Bar.
+/// Represents a running application (or individual status item / system extra) on the macOS Menu Bar.
 struct MenuBarAppItem: Identifiable, Equatable {
-    /// Stable identifier (bundle identifier when available, otherwise process name).
+    /// Stable unique identifier across scans and app launches.
     let id: String
-    /// Process identifier of the owning application.
+    /// Process identifier of the owning application or container agent.
     let pid: pid_t
-    /// Human-readable display name of the application.
+    /// Human-readable display name of the application or status item.
     let appName: String
     /// Bundle identifier if available.
     let bundleIdentifier: String?
+    /// Accessibility identifier of this specific status item (e.g. `com.apple.menuextra.wifi` or multi-item ID).
+    let axIdentifier: String?
+    /// Index of this status item within its owning process's `AXExtrasMenuBar` children.
+    let axChildIndex: Int
     /// Pre-scaled crisp application icon (`32x32` pt @2x) for zero-lag SwiftUI rendering.
     let appIcon: NSImage
     /// Live text/status title exposed by the status item (e.g. "Mon, 26 Oct" for Itsycal).
@@ -22,9 +26,9 @@ struct MenuBarAppItem: Identifiable, Equatable {
     var slotFrame: CGRect?
     /// Whether this item currently has an active visible slot on the menu bar (not pushed into overflow).
     var isCurrentlyOnBar: Bool
-    /// Underlying Accessibility element inside `AXExtrasMenuBar` for direct `AXPress` invocation.
+    /// Underlying Accessibility element for direct `AXPress` invocation.
     let axElement: AXUIElement?
-    /// Whether this item belongs to macOS system services (Clock, Control Center, Siri, Input Source).
+    /// Whether this item belongs to macOS system services (Wi-Fi, Battery, Spotlight, Input Source, etc.).
     let isSystemItem: Bool
     /// Whether macOS allows moving/hiding this item via Command-drag.
     let isMovable: Bool

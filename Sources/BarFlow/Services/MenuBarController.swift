@@ -465,6 +465,10 @@ final class MenuBarController: ObservableObject {
         selectedMainBarIDs = Set(allRunningApps.map(\.id))
     }
 
+    func moveAllToSecondaryBar() {
+        selectedMainBarIDs = []
+    }
+
     func deselectAllNonSystemForMainBar() {
         selectedMainBarIDs = Set(allRunningApps.filter(\.isSystemItem).map(\.id))
     }
@@ -516,10 +520,12 @@ final class MenuBarController: ObservableObject {
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let appsSnapshot = allRunningApps
-        let idByPID: [pid_t: MenuBarAppItem] = Dictionary(
-            uniqueKeysWithValues: appsSnapshot.map { ($0.pid, $0) }
+        let itemByID: [String: MenuBarAppItem] = Dictionary(
+            appsSnapshot.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         var movedCount = 0
+        var dragBlockedBySystem = false
 
         for _ in 0..<24 {
             let ownFrame = mainStatusItemFrameCG()
@@ -545,34 +551,72 @@ final class MenuBarController: ObservableObject {
             if let wrongLeftSlot = slots.first(where: { slot in
                 guard slot.sourcePID > 0, slot.sourcePID != ownPID,
                       slot.frame.maxX <= barFlowMinX + 2,
-                      let item = idByPID[slot.sourcePID], item.isMovable else { return false }
+                      let slotItemID = slot.itemID,
+                      let item = itemByID[slotItemID], item.isMovable else { return false }
                 return selectedMainBarIDs.contains(item.id)
-            }) {
+            }), let movedID = wrongLeftSlot.itemID, let movedItem = itemByID[movedID] {
+                let beforeX = wrongLeftSlot.frame.minX
                 let targetPoint = CGPoint(
                     x: min(barFlowMaxX + 16, wrongLeftSlot.hostWindowFrame.maxX - 24),
                     y: mainToggleSlot.frame.midY
                 )
                 await performCommandDrag(from: wrongLeftSlot.center, to: targetPoint)
-                movedCount += 1
                 try? await Task.sleep(nanoseconds: 180_000_000)
-                continue
+
+                let afterFrame = await withCheckedContinuation { continuation in
+                    interactionQueue.async {
+                        continuation.resume(
+                            returning: MenuBarScanner.shared.liveStatusElement(
+                                for: movedItem,
+                                preferredDisplay: targetDisplay,
+                                timeout: 0.18
+                            )?.frame
+                        )
+                    }
+                }
+                if let afterX = afterFrame?.minX, abs(afterX - beforeX) > 4 {
+                    movedCount += 1
+                    continue
+                } else {
+                    dragBlockedBySystem = true
+                    break
+                }
             }
 
             // Case B: Unselected app sitting to the RIGHT of BarFlow -> move it to the LEFT of BarFlow
             if let wrongRightSlot = slots.first(where: { slot in
                 guard slot.sourcePID > 0, slot.sourcePID != ownPID,
                       slot.frame.minX >= barFlowMaxX - 2,
-                      let item = idByPID[slot.sourcePID], item.isMovable else { return false }
+                      let slotItemID = slot.itemID,
+                      let item = itemByID[slotItemID], item.isMovable else { return false }
                 return !selectedMainBarIDs.contains(item.id)
-            }) {
+            }), let movedID = wrongRightSlot.itemID, let movedItem = itemByID[movedID] {
+                let beforeX = wrongRightSlot.frame.minX
                 let targetPoint = CGPoint(
                     x: max(barFlowMinX - 18, wrongRightSlot.hostWindowFrame.minX + 360),
                     y: mainToggleSlot.frame.midY
                 )
                 await performCommandDrag(from: wrongRightSlot.center, to: targetPoint)
-                movedCount += 1
                 try? await Task.sleep(nanoseconds: 180_000_000)
-                continue
+
+                let afterFrame = await withCheckedContinuation { continuation in
+                    interactionQueue.async {
+                        continuation.resume(
+                            returning: MenuBarScanner.shared.liveStatusElement(
+                                for: movedItem,
+                                preferredDisplay: targetDisplay,
+                                timeout: 0.18
+                            )?.frame
+                        )
+                    }
+                }
+                if let afterX = afterFrame?.minX, abs(afterX - beforeX) > 4 {
+                    movedCount += 1
+                    continue
+                } else {
+                    dragBlockedBySystem = true
+                    break
+                }
             }
 
             break
@@ -583,9 +627,13 @@ final class MenuBarController: ObservableObject {
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
 
-        statusMessage = movedCount > 0
-            ? "Đã sắp xếp xong \(movedCount) biểu tượng trên Menu Bar chính!"
-            : "Bạn có thể giữ phím ⌘ (Command) kéo biểu tượng sang trái icon ••• để ẩn vật lý, hoặc bấm Ctrl + B để thao tác ngay."
+        if movedCount > 0 {
+            statusMessage = "Đã sắp xếp xong \(movedCount) biểu tượng trên Menu Bar chính!"
+        } else if dragBlockedBySystem {
+            statusMessage = "Đã cập nhật thanh Ctrl + B! Trên macOS mới, hãy giữ phím ⌘ kéo biểu tượng ••• sang bên phải các app muốn ẩn 1 lần để ẩn khỏi thanh trên."
+        } else {
+            statusMessage = "Menu Bar chính đã khớp danh sách chọn lọc!"
+        }
     }
 
     // MARK: - Instant App Activation from `Ctrl + B` Secondary Bar
@@ -630,15 +678,19 @@ final class MenuBarController: ObservableObject {
 
         // 3. Trigger the status item directly on the high-priority background interactionQueue (0ms MainActor block!)
         let targetPID = item.pid
-        let fallbackAX = item.axElement
+        let mouseDisplay = MenuBarScanner.displayGeometryContainingMouse()
         let savedCursor = currentMouseCGLocation()
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             interactionQueue.async { [weak self] in
                 defer { continuation.resume() }
 
-                let live = MenuBarScanner.shared.liveStatusElement(for: targetPID, timeout: 0.18)
-                guard let axEl = live?.element ?? fallbackAX else {
+                let live = MenuBarScanner.shared.liveStatusElement(
+                    for: item,
+                    preferredDisplay: mouseDisplay,
+                    timeout: 0.22
+                )
+                guard let axEl = live?.element ?? item.axElement else {
                     if let app = NSRunningApplication(processIdentifier: targetPID) {
                         app.activate()
                     }

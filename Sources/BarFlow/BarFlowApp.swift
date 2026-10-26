@@ -163,7 +163,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             win.titlebarAppearsTransparent = false
             win.isReleasedWhenClosed = false
             win.delegate = self
-            win.setContentSize(NSSize(width: 780, height: 660))
+            win.setContentSize(NSSize(width: 850, height: 680))
             win.center()
             self.selectionWindow = win
         }

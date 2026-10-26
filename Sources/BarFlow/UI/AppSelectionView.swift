@@ -32,7 +32,8 @@ struct AppSelectionView: View {
         return base.filter { item in
             item.appName.localizedCaseInsensitiveContains(trimmed) ||
             (item.bundleIdentifier?.localizedCaseInsensitiveContains(trimmed) ?? false) ||
-            item.statusTitle.localizedCaseInsensitiveContains(trimmed)
+            item.statusTitle.localizedCaseInsensitiveContains(trimmed) ||
+            item.statusDescription.localizedCaseInsensitiveContains(trimmed)
         }
     }
 
@@ -49,7 +50,7 @@ struct AppSelectionView: View {
             liveZonesPreviewSection
             Divider()
 
-            filterAndSearchToolbar
+            filterAndBulkActionToolbar
             Divider()
 
             appListSection
@@ -57,7 +58,7 @@ struct AppSelectionView: View {
 
             footerSettingsBar
         }
-        .frame(minWidth: 740, idealWidth: 780, minHeight: 620, idealHeight: 680)
+        .frame(minWidth: 780, idealWidth: 850, minHeight: 620, idealHeight: 690)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -91,13 +92,14 @@ struct AppSelectionView: View {
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.12), in: Capsule())
                 }
-                Text("Chọn lọc ứng dụng giữ lại trên Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải dưới Menu Bar khi bấm Ctrl + B")
+                Text("Chọn ứng dụng giữ trên Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải khi bấm Ctrl + B")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            .layoutPriority(0)
 
-            Spacer()
+            Spacer(minLength: 8)
 
             HStack(spacing: 8) {
                 Button {
@@ -107,7 +109,7 @@ struct AppSelectionView: View {
                         .font(.system(size: 12.5, weight: .medium))
                 }
                 .buttonStyle(.bordered)
-                .help("Quét lại danh sách ứng dụng đang chạy trên Menu Bar")
+                .help("Quét lại toàn bộ ứng dụng và tiện ích đang chạy trên Menu Bar")
 
                 Button {
                     barController.toggle()
@@ -122,7 +124,7 @@ struct AppSelectionView: View {
                         await menuController.arrangeMenuBarAccordingToSelection()
                     }
                 } label: {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
                         if menuController.isArrangingMenuBar {
                             ProgressView()
                                 .controlSize(.small)
@@ -137,6 +139,8 @@ struct AppSelectionView: View {
                 .disabled(menuController.isArrangingMenuBar)
                 .help("Sắp xếp các icon đã chọn sang bên phải và ẩn các icon còn lại trên Menu Bar chính")
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -151,7 +155,7 @@ struct AppSelectionView: View {
                 .foregroundStyle(.orange)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Cần cấp quyền Trợ năng (Accessibility) để quản lý Menu Bar")
+                Text("Cần cấp quyền Trợ năng (Accessibility) để đọc đầy đủ ứng dụng Menu Bar")
                     .font(.system(size: 13, weight: .semibold))
                 Text("Nếu vừa cập nhật BarFlow, hãy tắt rồi bật lại công tắc BarFlow trong System Settings → Privacy & Security → Accessibility.")
                     .font(.system(size: 11.5))
@@ -165,13 +169,14 @@ struct AppSelectionView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
+            .fixedSize()
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
         .background(Color.orange.opacity(0.10))
     }
 
-    // MARK: - 3. Live Dual-Bar Visual Preview
+    // MARK: - 3. Live Dual-Bar Visual Preview (With Direct Bulk Transfer Buttons)
 
     private var liveZonesPreviewSection: some View {
         let mainApps = menuController.mainBarApps
@@ -180,20 +185,34 @@ struct AppSelectionView: View {
         return VStack(alignment: .leading, spacing: 10) {
             // Zone A: Main Menu Bar Preview
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
+                HStack(spacing: 8) {
                     Label("Giữ trên Menu Bar chính (\(mainApps.count))", systemImage: "pin.fill")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
+
                     Spacer()
-                    Text("Click vào icon bất kỳ để chuyển xuống thanh phụ Ctrl + B")
+
+                    Text("Click icon để chuyển lẻ")
                         .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
+
+                    Button {
+                        menuController.moveAllToSecondaryBar()
+                    } label: {
+                        Label("Chuyển toàn bộ xuống phụ", systemImage: "arrow.down.circle.fill")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.blue)
+                    .disabled(mainApps.isEmpty)
+                    .help("Đưa toàn bộ ứng dụng đang ở Menu Bar chính xuống thanh phụ Ctrl + B")
                 }
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if mainApps.isEmpty {
-                            Text("Chưa chọn ứng dụng nào — chỉ còn biểu tượng BarFlow trên Menu Bar chính")
+                            Text("Đã chuyển toàn bộ xuống thanh phụ Ctrl + B — chỉ còn biểu tượng BarFlow trên Menu Bar chính")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
@@ -224,20 +243,34 @@ struct AppSelectionView: View {
 
             // Zone B: Secondary Bar (Ctrl + B) Preview
             VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Label("Hiện 1 dòng bên phải dưới Menu Bar khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
+                HStack(spacing: 8) {
+                    Label("Hiện ở thanh phụ bên phải dưới Menu Bar khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.blue)
+
                     Spacer()
-                    Text("Click vào icon bất kỳ để đưa lên Menu Bar chính")
+
+                    Text("Click icon để chuyển lẻ")
                         .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
+
+                    Button {
+                        menuController.selectAllForMainBar()
+                    } label: {
+                        Label("Chuyển toàn bộ lên chính", systemImage: "arrow.up.circle.fill")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.green)
+                    .disabled(secApps.isEmpty)
+                    .help("Đưa toàn bộ ứng dụng từ thanh phụ Ctrl + B lên lại Menu Bar chính")
                 }
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if secApps.isEmpty {
-                            Text("Không có ứng dụng ẩn — bỏ chọn bớt ứng dụng bên dưới để đưa vào thanh Ctrl + B")
+                            Text("Không có ứng dụng ẩn — bấm 'Chuyển toàn bộ xuống phụ' hoặc tắt công tắc bên dưới để đưa vào Ctrl + B")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
@@ -283,14 +316,14 @@ struct AppSelectionView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
     }
 
-    // MARK: - 4. Filter & Search Toolbar
+    // MARK: - 4. Filter, Search & Direct Bulk Transfer Toolbar
 
-    private var filterAndSearchToolbar: some View {
-        HStack(spacing: 12) {
+    private var filterAndBulkActionToolbar: some View {
+        HStack(spacing: 10) {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("Tìm ứng dụng đang chạy trên Menu Bar...", text: $menuController.searchText)
+                TextField("Tìm ứng dụng Menu Bar...", text: $menuController.searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12.5))
                 if !menuController.searchText.isEmpty {
@@ -305,7 +338,7 @@ struct AppSelectionView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .frame(maxWidth: 260)
+            .frame(minWidth: 170, maxWidth: 220)
             .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
 
             Picker("", selection: $menuController.filterModeRaw) {
@@ -315,23 +348,35 @@ struct AppSelectionView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(maxWidth: 340)
+            .frame(maxWidth: 320)
 
-            Spacer()
+            Spacer(minLength: 4)
 
-            Menu {
-                Button("Chọn tất cả lên Menu Bar chính") {
+            // Explicit 1-click Bulk Transfer Buttons requested by user
+            HStack(spacing: 6) {
+                Button {
+                    menuController.moveAllToSecondaryBar()
+                } label: {
+                    Label("Toàn bộ xuống phụ", systemImage: "arrow.down.to.line")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(menuController.mainBarApps.isEmpty)
+                .help("Chuyển toàn bộ ứng dụng xuống thanh phụ Ctrl + B")
+
+                Button {
                     menuController.selectAllForMainBar()
+                } label: {
+                    Label("Toàn bộ lên chính", systemImage: "arrow.up.to.line")
+                        .font(.system(size: 11.5, weight: .medium))
                 }
-                Button("Đưa tất cả app hãng thứ 3 xuống thanh phụ Ctrl + B") {
-                    menuController.deselectAllNonSystemForMainBar()
-                }
-            } label: {
-                Label("Chọn nhanh", systemImage: "checklist")
-                    .font(.system(size: 12))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(menuController.secondaryBarApps.isEmpty)
+                .help("Chuyển toàn bộ ứng dụng lên lại Menu Bar chính")
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+            .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 9)
@@ -382,20 +427,22 @@ struct AppSelectionView: View {
     // MARK: - 6. Bottom Settings Bar
 
     private var footerSettingsBar: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 14) {
             HStack(spacing: 6) {
                 Image(systemName: "timer")
                     .foregroundStyle(.secondary)
-                Text("Tự động ẩn thanh Ctrl + B:")
+                Text("Tự ẩn Ctrl + B:")
                     .font(.system(size: 12, weight: .medium))
+                    .fixedSize()
                 Picker("", selection: $menuController.autoHideDuration) {
                     ForEach(AutoHideDuration.allCases) { option in
                         Text(option.shortLabel == "Thủ công" ? "Không tự ẩn" : option.title).tag(option)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 125)
+                .frame(width: 115)
             }
+            .fixedSize(horizontal: true, vertical: false)
 
             Divider()
                 .frame(height: 18)
@@ -403,16 +450,19 @@ struct AppSelectionView: View {
             Toggle("Ẩn các app không chọn khỏi Menu Bar chính", isOn: $menuController.isMainBarHidingEnabled)
                 .toggleStyle(.checkbox)
                 .font(.system(size: 12))
+                .fixedSize(horizontal: true, vertical: false)
 
-            Spacer()
+            Spacer(minLength: 8)
 
             Toggle("Hiện khi mở app", isOn: $menuController.showSelectionOnLaunch)
                 .toggleStyle(.checkbox)
                 .font(.system(size: 12))
+                .fixedSize(horizontal: true, vertical: false)
 
             Toggle("Ẩn khỏi Dock", isOn: $menuController.hideFromDock)
                 .toggleStyle(.checkbox)
                 .font(.system(size: 12))
+                .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 11)
@@ -435,7 +485,8 @@ private struct PreviewChipButton: View {
                 Image(nsImage: item.appIcon)
                     .resizable()
                     .interpolation(.high)
-                    .frame(width: 18, height: 18)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 17, height: 17)
 
                 Text(item.appName)
                     .font(.system(size: 11.5, weight: .medium))

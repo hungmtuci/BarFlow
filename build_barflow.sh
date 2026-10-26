@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -128,7 +128,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -167,8 +167,9 @@ pkill -f BarFlow 2>/dev/null || true
 rm -rf "$APP_DST"
 cp -R "$APP_SRC" "$APP_DST"
 
-# Gỡ cờ cách ly Gatekeeper (Quarantine) khi chép sang máy mới
+# Gỡ cờ cách ly Gatekeeper (Quarantine) và làm mới quyền Accessibility khi nâng cấp phiên bản
 xattr -cr "$APP_DST" 2>/dev/null || true
+tccutil reset Accessibility com.hunglx.BarFlow 2>/dev/null || true
 
 echo "✓ Đã cài đặt thành công tại: $APP_DST"
 echo "✓ Đang khởi chạy BarFlow..."
