@@ -13,6 +13,8 @@ enum AppFilterMode: String, CaseIterable, Identifiable {
 struct AppSelectionView: View {
     @ObservedObject var menuController: MenuBarController
     @ObservedObject var barController: SecondaryBarController
+    @ObservedObject var hotKeyService: HotKeyService
+    @ObservedObject var updateService: UpdateCheckerService
 
     private var filterMode: AppFilterMode {
         AppFilterMode(rawValue: menuController.filterModeRaw) ?? .all
@@ -87,17 +89,36 @@ struct AppSelectionView: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 8) {
+                HStack(spacing: 7) {
                     Text("BarFlow")
                         .font(.system(size: 18, weight: .bold))
-                    Text("Ctrl + B")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(.blue)
-                        .padding(.horizontal, 7)
+
+                    Text("v\(updateService.currentVersion)")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.blue.opacity(0.12), in: Capsule())
+                        .background(Color.primary.opacity(0.07), in: Capsule())
+
+                    Button {
+                        hotKeyService.toggleRecording()
+                    } label: {
+                        Text(hotKeyService.isRecordingShortcut
+                             ? "Bấm phím mới..."
+                             : menuController.hotKeyBinding.readableDisplay)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.blue)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(
+                                (hotKeyService.isRecordingShortcut ? Color.orange : Color.blue).opacity(0.14),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Bấm để đổi phím tắt mở nhanh thanh ứng dụng phụ")
                 }
-                Text("Chọn lọc & kéo thả sắp xếp thứ tự Trái → Phải cho cả Menu Bar chính lẫn thanh phụ Ctrl + B")
+                Text("Chọn lọc & kéo thả sắp xếp thứ tự Trái → Phải cho cả Menu Bar chính lẫn thanh phụ \(menuController.hotKeyBinding.compactDisplay)")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -107,6 +128,18 @@ struct AppSelectionView: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 8) {
+                if case let .available(newVer, _, _) = updateService.state {
+                    Button {
+                        updateService.installAvailableUpdate()
+                    } label: {
+                        Label("Cập nhật v\(newVer)", systemImage: "arrow.down.circle.fill")
+                            .font(.system(size: 12.5, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .help("Tự động tải và cài đặt BarFlow v\(newVer) từ GitHub Releases")
+                }
+
                 Button {
                     menuController.refreshAndSyncManually()
                 } label: {
@@ -119,7 +152,8 @@ struct AppSelectionView: View {
                 Button {
                     barController.toggle()
                 } label: {
-                    Label(barController.isVisible ? "Ẩn thanh phụ (⌃B)" : "Hiện thử (⌃B)", systemImage: "menubar.arrow.down.rectangle")
+                    let shortcut = menuController.hotKeyBinding.compactDisplay
+                    Label(barController.isVisible ? "Ẩn thanh phụ (\(shortcut))" : "Hiện thử (\(shortcut))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12.5, weight: .medium))
                 }
                 .buttonStyle(.bordered)
@@ -330,10 +364,10 @@ struct AppSelectionView: View {
                 )
             }
 
-            // Zone B: Secondary Bar (Ctrl + B) Preview
+            // Zone B: Secondary Bar Preview
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Label("Thanh phụ bên phải khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
+                    Label("Thanh phụ bên phải khi bấm \(menuController.hotKeyBinding.readableDisplay) (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.blue)
 
@@ -453,7 +487,7 @@ struct AppSelectionView: View {
             Picker("", selection: $menuController.filterModeRaw) {
                 Text("Tất cả (\(menuController.stableAllApps.count))").tag(AppFilterMode.all.rawValue)
                 Text("Menu Bar chính (\(menuController.mainBarApps.count))").tag(AppFilterMode.mainBar.rawValue)
-                Text("Thanh phụ ⌃B (\(menuController.secondaryBarApps.count))").tag(AppFilterMode.secondaryBar.rawValue)
+                Text("Thanh phụ \(menuController.hotKeyBinding.compactDisplay) (\(menuController.secondaryBarApps.count))").tag(AppFilterMode.secondaryBar.rawValue)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -595,49 +629,175 @@ struct AppSelectionView: View {
         }
     }
 
-    // MARK: - 6. Bottom Settings Bar
+    // MARK: - 6. Bottom Settings Bar (Custom Hotkey, Hover/Scroll, Launch at Login & 1-Click Auto-Update)
 
     private var footerSettingsBar: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: 6) {
-                Image(systemName: "timer")
-                    .foregroundStyle(.secondary)
-                Text("Tự ẩn Ctrl + B:")
-                    .font(.system(size: 12, weight: .medium))
-                    .fixedSize()
-                Picker("", selection: $menuController.autoHideDuration) {
-                    ForEach(AutoHideDuration.allCases) { option in
-                        Text(option.shortLabel == "Thủ công" ? "Không tự ẩn" : option.title).tag(option)
+        VStack(spacing: 8) {
+            // Row 1: Shortcut Recorder + Auto-Hide + Hover Trigger + Update Checker
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "keyboard")
+                        .foregroundStyle(.secondary)
+                    Text("Phím tắt:")
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize()
+
+                    Button {
+                        hotKeyService.toggleRecording()
+                    } label: {
+                        Text(hotKeyService.isRecordingShortcut
+                             ? "Bấm tổ hợp phím... (Esc huỷ)"
+                             : menuController.hotKeyBinding.compactDisplay)
+                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.primary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(hotKeyService.isRecordingShortcut
+                                          ? Color.orange.opacity(0.16)
+                                          : Color.primary.opacity(0.08))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(
+                                        hotKeyService.isRecordingShortcut ? Color.orange : Color.primary.opacity(0.15),
+                                        lineWidth: 0.9
+                                    )
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Bấm vào đây rồi nhấn tổ hợp phím mới (cần kèm Ctrl / Option / Cmd, hoặc nhấn Delete để về mặc định Ctrl + B)")
+
+                    if !menuController.hotKeyBinding.isDefault && !hotKeyService.isRecordingShortcut {
+                        Button {
+                            menuController.hotKeyBinding = .defaultCtrlB
+                            menuController.statusMessage = "Đã khôi phục phím tắt mặc định Ctrl + B!"
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Khôi phục phím tắt mặc định Ctrl + B")
                     }
                 }
-                .labelsHidden()
-                .frame(width: 115)
+                .fixedSize(horizontal: true, vertical: false)
+
+                Divider()
+                    .frame(height: 16)
+
+                HStack(spacing: 6) {
+                    Image(systemName: "timer")
+                        .foregroundStyle(.secondary)
+                    Text("Tự ẩn:")
+                        .font(.system(size: 12, weight: .medium))
+                        .fixedSize()
+                    Picker("", selection: $menuController.autoHideDuration) {
+                        ForEach(AutoHideDuration.allCases) { option in
+                            Text(option.shortLabel == "Thủ công" ? "Không tự ẩn" : option.title).tag(option)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 110)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+
+                Divider()
+                    .frame(height: 16)
+
+                Toggle("Rê chuột vào ••• để mở", isOn: $menuController.hoverToOpenEnabled)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: true, vertical: false)
+                    .help("Tự động bung thanh phụ khi rê chuột dừng 0.2s trên nút ••• (ngoài ra luôn hỗ trợ cuộn chuột 2 ngón trên •••)")
+
+                Spacer(minLength: 6)
+
+                footerUpdateButton
             }
-            .fixedSize(horizontal: true, vertical: false)
 
             Divider()
-                .frame(height: 18)
+                .opacity(0.55)
 
-            Toggle("Ẩn các app không chọn khỏi Menu Bar chính", isOn: $menuController.isMainBarHidingEnabled)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 12))
-                .fixedSize(horizontal: true, vertical: false)
+            // Row 2: Main Bar Hiding + Launch at Login + Launch Window + Dock Visibility
+            HStack(spacing: 16) {
+                Toggle("Ẩn các app không chọn khỏi Menu Bar chính", isOn: $menuController.isMainBarHidingEnabled)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: true, vertical: false)
 
-            Spacer(minLength: 8)
+                Spacer(minLength: 8)
 
-            Toggle("Hiện khi mở app", isOn: $menuController.showSelectionOnLaunch)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 12))
-                .fixedSize(horizontal: true, vertical: false)
+                Toggle("Khởi động cùng macOS", isOn: $menuController.launchAtLogin)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize(horizontal: true, vertical: false)
+                    .help("Tự động chạy ngầm BarFlow ngay khi đăng nhập vào máy Mac")
 
-            Toggle("Ẩn khỏi Dock", isOn: $menuController.hideFromDock)
-                .toggleStyle(.checkbox)
-                .font(.system(size: 12))
-                .fixedSize(horizontal: true, vertical: false)
+                Toggle("Hiện khi mở app", isOn: $menuController.showSelectionOnLaunch)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: true, vertical: false)
+
+                Toggle("Ẩn khỏi Dock", isOn: $menuController.hideFromDock)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: true, vertical: false)
+            }
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 11)
+        .padding(.vertical, 10)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+    }
+
+    @ViewBuilder
+    private var footerUpdateButton: some View {
+        switch updateService.state {
+        case .checking:
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Đang kiểm tra...")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+            .fixedSize()
+
+        case .downloading(let ver), .installing(let ver):
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Đang cập nhật v\(ver)...")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.blue)
+            }
+            .fixedSize()
+
+        case .available(let ver, _, _):
+            Button {
+                updateService.installAvailableUpdate()
+            } label: {
+                Label("Cập nhật ngay v\(ver)", systemImage: "arrow.down.circle.fill")
+                    .font(.system(size: 11.5, weight: .semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(.green)
+            .fixedSize()
+
+        case .idle, .upToDate, .failed:
+            Button {
+                updateService.checkForUpdatesManually()
+            } label: {
+                Label("Kiểm tra cập nhật", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 11.5, weight: .medium))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+            .help("Kiểm tra và tự động cập nhật phiên bản mới nhất từ GitHub Releases")
+        }
     }
 }
 

@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.7.0"
+VERSION="1.8.0"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -133,7 +133,7 @@ cat > "$STAGE_CONTENTS/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

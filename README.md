@@ -26,6 +26,10 @@
   - Hiện tức thì (`< 5ms`) gọn đúng **1 dòng duy nhất** ở góc trên bên phải màn hình, sát ngay dưới thanh Menu Bar gốc (hỗ trợ đa màn hình & màn hình tai thỏ MacBook).
   - Không cướp tiêu điểm bàn phím (`NSPanel` non-activating) của ứng dụng bạn đang làm việc.
   - **Click chuột trái** vào biểu tượng để mở ngay cửa sổ popover / menu của ứng dụng đó **ngay bên dưới biểu tượng vừa bấm**; **Click chuột phải** để mở tức thì **Menu ứng dụng** (Cài đặt / Preferences, Mở thư mục Cloud, Khoá, **Thoát ứng dụng `⌘Q`**) ngay bên dưới biểu tượng; giữ **`⌥ Option + Click`** để mở tuỳ chọn nhanh của BarFlow.
+- **Tuỳ chỉnh phím tắt toàn cục, Mở bằng rê / cuộn chuột & Khởi động cùng macOS**:
+  - Cho phép **ghi nhận phím tắt mở thanh phụ tuỳ ý** ngay trong giao diện (mặc định `Ctrl + B`, có thể đổi sang `⌥ + Space`, `⌘ + ⇧ + B`... để tránh trùng `tmux`/Terminal).
+  - Hỗ trợ **cuộn chuột 2 ngón trên icon `•••`** để mở/đóng nhanh thanh phụ, kèm tuỳ chọn **rê chuột dừng nhẹ (`0.2s`) trên `•••` để tự mở**.
+  - Tích hợp **Khởi động cùng macOS** (`SMAppService.mainApp`) và **Cập nhật tự động 1 chạm trực tiếp từ GitHub Releases** (tự tải gói mới, thay thế `/Applications/BarFlow.app`, gỡ cờ Gatekeeper `xattr` và khởi động lại).
 - **Tự động ẩn thông minh & Toggle tức thì**:
   - Tự động ẩn sau khoảng thời gian tuỳ chỉnh (`3s`, `5s`, `8s`, `12s`, `20s`, hoặc thủ công), tự động **tạm dừng đếm ngược** khi con trỏ chuột đang rê bên trong thanh phụ.
   - Bấm lại **`Ctrl + B`** 1 lần nữa (hoặc phím `Esc`, hoặc click ra ngoài) để ẩn thanh phụ ngay lập tức.
@@ -34,18 +38,18 @@
 
 | Phím tắt / Thao tác | Chức năng |
 | :--- | :--- |
-| `Ctrl + B` (`⌃B`) | Hiện thanh ứng dụng phụ ngay dưới Menu Bar (bấm lại 1 lần để ẩn ngay) |
+| `Ctrl + B` (`⌃B`) *(hoặc phím tắt tự chọn)* | Hiện thanh ứng dụng phụ ngay dưới Menu Bar (bấm lại 1 lần để ẩn ngay) |
 | `Esc` | Đóng nhanh thanh ứng dụng phụ đang mở |
-| **Click trái** icon `•••` trên Menu Bar | Hiện / Ẩn thanh ứng dụng phụ (tương đương `Ctrl + B`) |
-| **Click phải** icon `•••` trên Menu Bar | Mở menu ngữ cảnh nhanh (Chọn lọc ứng dụng, Sắp xếp lại, Thoát) |
+| **Click trái / Cuộn chuột / Rê chuột** trên `•••` | Hiện / Ẩn nhanh thanh ứng dụng phụ không cần rời chuột |
+| **Click phải** icon `•••` trên Menu Bar | Mở menu ngữ cảnh nhanh (Chọn lọc ứng dụng, Khởi động cùng macOS, Kiểm tra cập nhật, Thoát) |
 
 ---
 
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.7.0.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.7.0-macOS.zip`**
+   - **`BarFlow-Installer-v1.8.0.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.8.0-macOS.zip`**
 2. Mở file `.dmg`:
    - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:

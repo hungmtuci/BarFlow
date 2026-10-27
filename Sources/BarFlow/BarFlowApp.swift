@@ -32,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             action: #selector(openSelectionFromMenu),
             keyEquivalent: ","
         ).target = self
+        appMenu.addItem(
+            withTitle: "Kiểm tra cập nhật...",
+            action: #selector(checkForUpdatesFromMenu),
+            keyEquivalent: ""
+        ).target = self
         appMenu.addItem(.separator())
         appMenu.addItem(
             withTitle: "Ẩn BarFlow",
@@ -72,6 +77,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func openSelectionFromMenu() {
         showSelectionWindow()
+    }
+
+    @objc private func checkForUpdatesFromMenu() {
+        showSelectionWindow()
+        UpdateCheckerService.shared.checkForUpdatesManually()
     }
 
     @objc private func quitFromMenu() {
@@ -123,9 +133,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hotKeys.isSecondaryBarVisible = {
             barController.isVisible
         }
-        hotKeys.registerHotKeys()
+        hotKeys.onShortcutRecorded = { newBinding in
+            menuController.hotKeyBinding = newBinding
+            menuController.statusMessage = "Đã đổi phím tắt mở thanh phụ sang \(newBinding.readableDisplay)!"
+        }
+        hotKeys.registerHotKeys(binding: menuController.hotKeyBinding)
 
         menuController.start()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            UpdateCheckerService.shared.checkSilentlyOnLaunchIfNeeded()
+        }
 
         if !AXIsProcessTrusted() {
             MenuBarScanner.shared.promptForAccessibilityPermission()
@@ -154,7 +172,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if selectionWindow == nil {
             let rootView = AppSelectionView(
                 menuController: MenuBarController.shared,
-                barController: SecondaryBarController.shared
+                barController: SecondaryBarController.shared,
+                hotKeyService: HotKeyService.shared,
+                updateService: UpdateCheckerService.shared
             )
             let hosting = NSHostingController(rootView: rootView)
             let win = NSWindow(contentViewController: hosting)

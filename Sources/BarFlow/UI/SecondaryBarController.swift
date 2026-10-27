@@ -27,6 +27,7 @@ final class SecondaryBarController: ObservableObject {
     private var outsideClickMonitor: Any?
     private var lastInteractionDate: Date = Date()
     private var lastWarmScanTimestamp: CFAbsoluteTime = 0
+    private var lastHoverOpenedTimestamp: CFAbsoluteTime = 0
 
     /// Tracks an active native `NSMenu` or repositioned app popover anchored underneath `Ctrl + B`.
     private(set) var isPresentingMirroredMenu: Bool = false
@@ -81,6 +82,25 @@ final class SecondaryBarController: ObservableObject {
         } else {
             show()
         }
+    }
+
+    /// Invoked on Left-Click of `•••`: ignores accidental immediate close if hover-to-open just revealed the bar `< 0.65s` ago.
+    func handleStatusIconToggleClick() {
+        if isVisible {
+            if (CFAbsoluteTimeGetCurrent() - lastHoverOpenedTimestamp) < 0.65 {
+                lastInteractionDate = Date()
+                return
+            }
+            hide()
+        } else {
+            show()
+        }
+    }
+
+    func showFromHover() {
+        guard !isVisible else { return }
+        lastHoverOpenedTimestamp = CFAbsoluteTimeGetCurrent()
+        show()
     }
 
     func show() {
@@ -263,8 +283,11 @@ final class SecondaryBarController: ObservableObject {
                     return
                 }
 
-                // 3. Pause & reset countdown whenever cursor hovers inside the bar
-                if let p = self.panel, NSMouseInRect(NSEvent.mouseLocation, p.frame.insetBy(dx: -4, dy: -4), false) {
+                // 3. Pause & reset countdown whenever cursor hovers inside the bar or over the ••• status icon
+                let mousePt = NSEvent.mouseLocation
+                let onPanel = (self.panel.map { NSMouseInRect(mousePt, $0.frame.insetBy(dx: -4, dy: -4), false) }) ?? false
+                let onStatusIcon = (MenuBarController.shared.mainStatusItemFrameAppKit().map { NSMouseInRect(mousePt, $0.insetBy(dx: -4, dy: -4), false) }) ?? false
+                if onPanel || onStatusIcon {
                     self.lastInteractionDate = Date()
                     if self.countdown.progress != 1.0 {
                         self.countdown.progress = 1.0

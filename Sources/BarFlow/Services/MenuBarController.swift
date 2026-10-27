@@ -4,6 +4,7 @@ import AppKit
 import CoreGraphics
 import Combine
 import Darwin
+import ServiceManagement
 
 /// Off-MainActor JSON state snapshot (`~/Library/Application Support/BarFlow/layout_state.json`)
 /// so toggling & reordering NEVER block `@MainActor` on `cfprefsd` / `NSUserDefaults` XPC!
@@ -17,6 +18,9 @@ private struct PersistedLayoutState: Codable, Sendable {
     var autoHideSeconds: Int = AutoHideDuration.fiveSeconds.rawValue
     var showSelectionOnLaunch: Bool = true
     var hideFromDock: Bool = false
+    var hotKeyBinding: HotKeyBinding? = nil
+    var hoverToOpenEnabled: Bool? = nil
+    var launchAtLogin: Bool? = nil
 }
 
 @MainActor
@@ -83,6 +87,34 @@ final class MenuBarController: ObservableObject {
             guard hideFromDock != oldValue else { return }
             scheduleSaveState()
             applyDockPolicy()
+        }
+    }
+
+    /// Customizable global keyboard shortcut to toggle the Secondary Bar (default: `Ctrl + B`).
+    @Published var hotKeyBinding: HotKeyBinding {
+        didSet {
+            guard hotKeyBinding != oldValue else { return }
+            scheduleSaveState()
+            HotKeyService.shared.updateBinding(hotKeyBinding)
+            refreshMainStatusItemToolTip()
+        }
+    }
+
+    /// Whether hovering the mouse over `•••` on the Menu Bar opens the Secondary Bar automatically.
+    @Published var hoverToOpenEnabled: Bool {
+        didSet {
+            guard hoverToOpenEnabled != oldValue else { return }
+            scheduleSaveState()
+            refreshMainStatusItemToolTip()
+        }
+    }
+
+    /// Whether BarFlow launches automatically when logging into macOS (`SMAppService.mainApp`).
+    @Published var launchAtLogin: Bool {
+        didSet {
+            guard launchAtLogin != oldValue, !isUpdatingLaunchAtLoginInternally else { return }
+            applyLaunchAtLoginChange()
+            scheduleSaveState()
         }
     }
 
@@ -164,6 +196,9 @@ final class MenuBarController: ObservableObject {
     private var pendingSaveWorkItem: DispatchWorkItem?
     private var dragEndWatchdogTimer: Timer?
     private var needsNativeSyncAfterDragEnd: Bool = false
+    private var isUpdatingLaunchAtLoginInternally: Bool = false
+    private var statusItemScrollMonitor: Any?
+    private var lastScrollTriggerTime: CFAbsoluteTime = 0
 
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -172,6 +207,8 @@ final class MenuBarController: ObservableObject {
         try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
         let fileURL = dirURL.appendingPathComponent("layout_state.json")
         self.stateFileURL = fileURL
+
+        let systemLaunchEnabled = (SMAppService.mainApp.status == .enabled)
 
         if let data = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode(PersistedLayoutState.self, from: data) {
@@ -184,6 +221,9 @@ final class MenuBarController: ObservableObject {
             self.autoHideDuration = AutoHideDuration(rawValue: decoded.autoHideSeconds) ?? .fiveSeconds
             self.showSelectionOnLaunch = decoded.showSelectionOnLaunch
             self.hideFromDock = decoded.hideFromDock
+            self.hotKeyBinding = decoded.hotKeyBinding ?? .defaultCtrlB
+            self.hoverToOpenEnabled = decoded.hoverToOpenEnabled ?? false
+            self.launchAtLogin = systemLaunchEnabled || (decoded.launchAtLogin ?? false)
         } else {
             // Seamless migration from v1.0–v1.4 UserDefaults
             let savedArray = UserDefaults.standard.stringArray(forKey: Keys.selectedIDs) ?? []
@@ -192,6 +232,9 @@ final class MenuBarController: ObservableObject {
             self.mainBarOrderIDs = savedArray
             self.secondaryBarOrderIDs = []
             self.allAppsOrderIDs = []
+            self.hotKeyBinding = .defaultCtrlB
+            self.hoverToOpenEnabled = false
+            self.launchAtLogin = systemLaunchEnabled
 
             if UserDefaults.standard.object(forKey: Keys.hidingEnabled) == nil {
                 self.isMainBarHidingEnabled = true
@@ -230,6 +273,7 @@ final class MenuBarController: ObservableObject {
     // MARK: - Lifecycle Setup
 
     func start() {
+        syncLaunchAtLoginStatusFromSystem()
         setupStatusItems()
         observeMenuTrackingNotifications()
         observeWorkspaceNotifications()
@@ -291,6 +335,10 @@ final class MenuBarController: ObservableObject {
         deferredReloadTimer = nil
         pendingSaveWorkItem?.cancel()
         pendingSaveWorkItem = nil
+        if let mon = statusItemScrollMonitor {
+            NSEvent.removeMonitor(mon)
+            statusItemScrollMonitor = nil
+        }
         let finalSnapshot = makePersistedSnapshot()
         let url = stateFileURL
         persistenceQueue.sync {
@@ -310,7 +358,45 @@ final class MenuBarController: ObservableObject {
         NSApp.setActivationPolicy(hideFromDock ? .accessory : .regular)
     }
 
-    // MARK: - Status Items (Main Toggle + Invisible Multi-Spacers)
+    // MARK: - Launch at Login (`SMAppService.mainApp`)
+
+    private func syncLaunchAtLoginStatusFromSystem() {
+        let currentStatus = SMAppService.mainApp.status
+        let actualEnabled = (currentStatus == .enabled)
+        if launchAtLogin != actualEnabled {
+            if launchAtLogin && currentStatus == .notRegistered {
+                try? SMAppService.mainApp.register()
+            }
+            let refreshed = (SMAppService.mainApp.status == .enabled)
+            isUpdatingLaunchAtLoginInternally = true
+            launchAtLogin = refreshed
+            isUpdatingLaunchAtLoginInternally = false
+        }
+    }
+
+    private func applyLaunchAtLoginChange() {
+        do {
+            if launchAtLogin {
+                try SMAppService.mainApp.register()
+                if SMAppService.mainApp.status == .requiresApproval {
+                    statusMessage = "Hãy bật cho phép BarFlow trong System Settings → General → Login Items."
+                    SMAppService.openSystemSettingsLoginItems()
+                } else {
+                    statusMessage = "Đã bật Tự động khởi động cùng macOS!"
+                }
+            } else {
+                try SMAppService.mainApp.unregister()
+                statusMessage = "Đã tắt Tự động khởi động cùng macOS."
+            }
+        } catch {
+            statusMessage = "Không thể cập nhật Khởi động cùng macOS: \(error.localizedDescription)"
+            isUpdatingLaunchAtLoginInternally = true
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+            isUpdatingLaunchAtLoginInternally = false
+        }
+    }
+
+    // MARK: - Status Items (Main Toggle + Hover/Scroll Triggers + Invisible Multi-Spacers)
 
     private func setupStatusItems() {
         guard mainStatusItem == nil else { return }
@@ -320,12 +406,17 @@ final class MenuBarController: ObservableObject {
         if let button = item.button {
             button.setAccessibilityIdentifier("BarFlow.MainToggle")
             updateMainButtonAppearance(isSecondaryOpen: false)
-            button.toolTip = "BarFlow — Bấm chuột trái (hoặc Ctrl+B) để hiện/ẩn các app còn lại • Chuột phải để mở tuỳ chọn"
             button.target = self
             button.action = #selector(handleMainStatusItemClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+
+            let hoverOverlay = StatusButtonHoverOverlayView(frame: button.bounds)
+            hoverOverlay.autoresizingMask = [.width, .height]
+            button.addSubview(hoverOverlay)
         }
         self.mainStatusItem = item
+        refreshMainStatusItemToolTip()
+        installStatusItemScrollMonitorIfNeeded()
 
         // On macOS 26/27 (`MenuBarAgent`), BarFlow hides unselected items natively without spacer bloat
         // (avoiding macOS's `«` overflow chevron and notch crowding). Legacy spacers are only created on macOS 14/15.
@@ -376,15 +467,49 @@ final class MenuBarController: ObservableObject {
         return win.frame
     }
 
+    func refreshMainStatusItemToolTip() {
+        guard let button = mainStatusItem?.button else { return }
+        let hoverNote = hoverToOpenEnabled ? " • Rê chuột / cuộn để mở nhanh" : " • Cuộn chuột để mở/đóng nhanh"
+        button.toolTip = "BarFlow — Click trái (hoặc \(hotKeyBinding.readableDisplay)) để hiện/ẩn thanh phụ\(hoverNote) • Click phải để mở tuỳ chọn"
+    }
+
+    private func installStatusItemScrollMonitorIfNeeded() {
+        guard statusItemScrollMonitor == nil else { return }
+        statusItemScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self = self,
+                  let btnWin = self.mainStatusItem?.button?.window,
+                  event.window === btnWin else {
+                return event
+            }
+            let now = CFAbsoluteTimeGetCurrent()
+            guard (now - self.lastScrollTriggerTime) >= 0.22 else { return event }
+
+            let dy = event.scrollingDeltaY
+            let dx = event.scrollingDeltaX
+            if dy < -1.2 || abs(dx) > 2.5 {
+                if !SecondaryBarController.shared.isVisible {
+                    self.lastScrollTriggerTime = now
+                    SecondaryBarController.shared.show()
+                }
+            } else if dy > 1.2 {
+                if SecondaryBarController.shared.isVisible {
+                    self.lastScrollTriggerTime = now
+                    SecondaryBarController.shared.hide()
+                }
+            }
+            return event
+        }
+    }
+
     @objc private func handleMainStatusItemClick(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else {
-            onToggleSecondaryBarRequested?()
+            SecondaryBarController.shared.handleStatusIconToggleClick()
             return
         }
         if event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
             showQuickContextMenu(from: sender)
         } else {
-            onToggleSecondaryBarRequested?()
+            SecondaryBarController.shared.handleStatusIconToggleClick()
         }
     }
 
@@ -397,18 +522,21 @@ final class MenuBarController: ObservableObject {
 
     private func showQuickContextMenu(from button: NSStatusBarButton) {
         let menu = NSMenu()
+        let ver = UpdateCheckerService.shared.currentVersion
 
-        let header = NSMenuItem(title: "BarFlow — Quản lý Menu Bar", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "BarFlow v\(ver) — Quản lý Menu Bar", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())
 
         let toggleBar = NSMenuItem(
-            title: "Hiện / Ẩn thanh ứng dụng phụ (Ctrl + B)",
+            title: "Hiện / Ẩn thanh ứng dụng phụ (\(hotKeyBinding.readableDisplay))",
             action: #selector(menuToggleSecondaryBar),
-            keyEquivalent: "b"
+            keyEquivalent: hotKeyBinding.menuKeyEquivalent
         )
-        toggleBar.keyEquivalentModifierMask = [.control]
+        if !hotKeyBinding.menuKeyEquivalent.isEmpty {
+            toggleBar.keyEquivalentModifierMask = hotKeyBinding.appKitModifierFlags
+        }
         toggleBar.target = self
         menu.addItem(toggleBar)
 
@@ -440,6 +568,44 @@ final class MenuBarController: ObservableObject {
         hidingToggle.state = isMainBarHidingEnabled ? .on : .off
         hidingToggle.target = self
         menu.addItem(hidingToggle)
+
+        let hoverToggle = NSMenuItem(
+            title: "Rê chuột vào ••• để mở thanh phụ",
+            action: #selector(menuToggleHoverToOpen),
+            keyEquivalent: ""
+        )
+        hoverToggle.state = hoverToOpenEnabled ? .on : .off
+        hoverToggle.target = self
+        menu.addItem(hoverToggle)
+
+        let loginToggle = NSMenuItem(
+            title: "Khởi động cùng macOS",
+            action: #selector(menuToggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        loginToggle.state = launchAtLogin ? .on : .off
+        loginToggle.target = self
+        menu.addItem(loginToggle)
+
+        menu.addItem(.separator())
+
+        if case let .available(newVer, _, _) = UpdateCheckerService.shared.state {
+            let installUpdate = NSMenuItem(
+                title: "Cập nhật ngay lên BarFlow v\(newVer)...",
+                action: #selector(menuInstallAvailableUpdate),
+                keyEquivalent: ""
+            )
+            installUpdate.target = self
+            menu.addItem(installUpdate)
+        } else {
+            let checkUpdate = NSMenuItem(
+                title: "Kiểm tra cập nhật...",
+                action: #selector(menuCheckForUpdates),
+                keyEquivalent: ""
+            )
+            checkUpdate.target = self
+            menu.addItem(checkUpdate)
+        }
 
         menu.addItem(.separator())
 
@@ -473,6 +639,23 @@ final class MenuBarController: ObservableObject {
 
     @objc private func menuToggleMainBarHiding() {
         isMainBarHidingEnabled.toggle()
+    }
+
+    @objc private func menuToggleHoverToOpen() {
+        hoverToOpenEnabled.toggle()
+    }
+
+    @objc private func menuToggleLaunchAtLogin() {
+        launchAtLogin.toggle()
+    }
+
+    @objc private func menuCheckForUpdates() {
+        onOpenSelectionWindowRequested?()
+        UpdateCheckerService.shared.checkForUpdatesManually()
+    }
+
+    @objc private func menuInstallAvailableUpdate() {
+        UpdateCheckerService.shared.installAvailableUpdate()
     }
 
     @objc private func menuQuitApp() {
@@ -521,7 +704,10 @@ final class MenuBarController: ObservableObject {
             hidingEnabled: isMainBarHidingEnabled,
             autoHideSeconds: autoHideDuration.rawValue,
             showSelectionOnLaunch: showSelectionOnLaunch,
-            hideFromDock: hideFromDock
+            hideFromDock: hideFromDock,
+            hotKeyBinding: hotKeyBinding,
+            hoverToOpenEnabled: hoverToOpenEnabled,
+            launchAtLogin: launchAtLogin
         )
     }
 
@@ -2266,5 +2452,58 @@ final class MenuBarController: ObservableObject {
 private extension CGRect {
     func DisplayIntersects(_ other: CGRect) -> Bool {
         abs(self.midY - other.midY) <= 40
+    }
+}
+
+/// Zero-overhead hover tracker attached inside `BarFlow`'s `•••` `NSStatusBarButton`.
+/// Passes 100% of clicks & drags straight through (`hitTest` returns `nil`) while opening
+/// the Secondary Bar after a `0.22s` dwell when `hoverToOpenEnabled` is active.
+@MainActor
+private final class StatusButtonHoverOverlayView: NSView {
+    private var trackingAreaRef: NSTrackingArea?
+    private var hoverDwellWorkItem: DispatchWorkItem?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingAreaRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hoverDwellWorkItem?.cancel()
+        guard MenuBarController.shared.hoverToOpenEnabled,
+              !SecondaryBarController.shared.isVisible else { return }
+
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self = self,
+                      let win = self.window,
+                      MenuBarController.shared.hoverToOpenEnabled,
+                      !SecondaryBarController.shared.isVisible else { return }
+                if NSMouseInRect(NSEvent.mouseLocation, win.frame.insetBy(dx: -4, dy: -4), false) {
+                    SecondaryBarController.shared.showFromHover()
+                }
+            }
+        }
+        hoverDwellWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverDwellWorkItem?.cancel()
+        hoverDwellWorkItem = nil
     }
 }
