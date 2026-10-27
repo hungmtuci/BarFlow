@@ -1360,35 +1360,56 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    // MARK: - Instant App Activation from `Ctrl + B` Secondary Bar
+    // MARK: - Instant App Activation from `Ctrl + B` Secondary Bar (Anchored Right Under Clicked Icon!)
 
-    /// Invoked when the user clicks (or right-clicks) an app icon inside the floating `Ctrl + B` Secondary Bar.
-    func activateAppFromSecondaryBar(_ item: MenuBarAppItem, rightClick: Bool = false) {
-        // 1. Dismiss the floating Secondary Bar immediately (0ms, no animation delay)
-        onHideSecondaryBarRequested?()
+    private enum HiddenInteractionResult: Sendable {
+        case mirroredMenu(AXStatusMenuBridge.MirroredMenuSnapshot)
+        case openedPopoverWindow
+        case triggeredActionOnly
+        case fallbackSystemItem
+    }
 
+    /// Invoked when the user left-clicks or right-clicks an app icon inside the floating `Ctrl + B` Secondary Bar.
+    func activateAppFromSecondaryBar(
+        _ item: MenuBarAppItem,
+        rightClick: Bool = false,
+        anchorScreenRectAppKit: NSRect? = nil,
+        anchorView: NSView? = nil
+    ) {
+        markUserInteraction()
         Task { @MainActor in
-            await performHiddenAppInteraction(item, rightClick: rightClick)
+            await performHiddenAppInteraction(
+                item,
+                rightClick: rightClick,
+                anchorScreenRectAppKit: anchorScreenRectAppKit,
+                anchorView: anchorView
+            )
         }
     }
 
-    private func performHiddenAppInteraction(_ item: MenuBarAppItem, rightClick: Bool) async {
+    private func performHiddenAppInteraction(
+        _ item: MenuBarAppItem,
+        rightClick: Bool,
+        anchorScreenRectAppKit: NSRect?,
+        anchorView: NSView?
+    ) async {
         guard !isPerformingHIDSequence else { return }
 
-        // Handle hidden macOS System Modules (`Spotlight`, `Wi-Fi`, `Battery`, `Screen Mirroring`, `Input Menu`, etc.) instantaneously
-        if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture &&
-            (item.pid == 0 || (item.isSystemItem && !item.isCurrentlyOnBar)) {
+        // Pure system modules hosted inside ControlCenter (`pid == 0`, e.g. Wi-Fi, Battery, Screen Mirroring, Spotlight)
+        if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture && item.pid == 0 {
+            onHideSecondaryBarRequested?()
             MenuBarVisibilityEngine.shared.triggerHiddenSystemItem(item, rightClick: rightClick)
             return
         }
 
         isPerformingHIDSequence = true
+        defer { isPerformingHIDSequence = false }
 
         let displays = MenuBarScanner.captureDisplayGeometries()
         let windowsBefore = currentOnScreenWindows(for: item.pid)
         var collapsedSpacersTemporarily = false
 
-        // 2. Legacy macOS 14/15 spacer collapse (skipped on macOS 26/27 where `AXPress` opens menus at top-right directly while hidden!)
+        // Legacy macOS 14/15 spacer collapse fallback
         if !MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture && areSpacersCurrentlyExpanded {
             let ownFrame = mainStatusItemFrameCG()
             let alreadyVisibleRightOfSpacer: Bool = {
@@ -1400,104 +1421,274 @@ final class MenuBarController: ObservableObject {
             }()
 
             if !alreadyVisibleRightOfSpacer {
+                onHideSecondaryBarRequested?()
                 isTemporarilyRevealedForClick = true
                 collapsedSpacersTemporarily = true
                 setSpacersExpanded(false)
-                // Give MenuBarAgent ~75ms to restore the item's on-bar slot so its menu/popover anchors cleanly
                 try? await Task.sleep(nanoseconds: 75_000_000)
             }
         }
 
-        // 3. Trigger the status item directly on the high-priority background interactionQueue (0ms MainActor block!)
         let targetPID = item.pid
-        let mouseDisplay = MenuBarScanner.displayGeometryContainingMouse()
         let savedCursor = currentMouseCGLocation()
+        let anchorRectCG: CGRect = {
+            if let nsRect = anchorScreenRectAppKit, nsRect.width > 0 {
+                return MenuBarScanner.appKitToCGRect(nsRect)
+            }
+            return CGRect(x: savedCursor.x - 14, y: savedCursor.y - 14, width: 28, height: 28)
+        }()
+        let anchorDisplay = displays.first(where: {
+            $0.cgFrame.insetBy(dx: -4, dy: -4).contains(CGPoint(x: anchorRectCG.midX, y: anchorRectCG.midY))
+        }) ?? MenuBarScanner.displayGeometryContainingMouse()
+        let anchorDisplayCG = anchorDisplay?.cgFrame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let usesAgentArch = MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture
 
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        let interactionResult = await withCheckedContinuation { (continuation: CheckedContinuation<HiddenInteractionResult, Never>) in
             interactionQueue.async { [weak self] in
-                defer { continuation.resume() }
+                guard let self = self else {
+                    continuation.resume(returning: .triggeredActionOnly)
+                    return
+                }
 
                 let live = MenuBarScanner.shared.liveStatusElement(
                     for: item,
-                    preferredDisplay: mouseDisplay,
-                    timeout: 0.22
+                    preferredDisplay: anchorDisplay,
+                    timeout: 0.20
                 )
                 guard let axEl = live?.element ?? item.axElement else {
-                    if let app = NSRunningApplication(processIdentifier: targetPID) {
-                        app.activate()
+                    if item.isSystemItem && usesAgentArch {
+                        continuation.resume(returning: .fallbackSystemItem)
+                    } else {
+                        continuation.resume(returning: .triggeredActionOnly)
                     }
                     return
                 }
 
-                AXUIElementSetMessagingTimeout(axEl, 0.18)
+                AXUIElementSetMessagingTimeout(axEl, 0.16)
 
+                // STEP 1: Fast path — if the status item exposes an attached `AXMenu` (MKey/OpenKey, Alfred, QuickFolder,
+                // Moom, AnyDesk, Yoink, Typinator, Default Folder X, TextInputMenuAgent, etc.), mirror & pop it
+                // pixel-perfectly right underneath the clicked icon in < 2ms (works for BOTH Left-Click & Right-Click!).
+                if let snapshot = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: false) {
+                    continuation.resume(returning: .mirroredMenu(snapshot))
+                    return
+                }
+
+                // STEP 2: Snapshot existing AXWindows BEFORE triggering action so we can snap any opened popover/panel
+                // (1Password 7, LogiPresentation, Maccy, AdGuard, Itsycal, etc.) directly underneath the clicked icon!
+                let axApp = AXUIElementCreateApplication(targetPID)
+                AXUIElementSetMessagingTimeout(axApp, 0.18)
+                let baselineAXWins = self.readAXWindows(of: axApp)
+
+                // STEP 3: Trigger the status item action (Right-Click tries AXShowMenu/AXSecondaryMenu first, then AXPress!)
+                var actionErr: AXError = .failure
                 if rightClick {
-                    // Check if status item exposes a dedicated right-click / context menu AX action
                     var actionsRef: CFArray?
                     let actions: [String] = (AXUIElementCopyActionNames(axEl, &actionsRef) == .success)
                         ? ((actionsRef as? [String]) ?? [])
                         : []
-
                     if let menuAction = actions.first(where: { $0 == "AXShowMenu" || $0 == "AXSecondaryMenu" }) {
-                        _ = AXUIElementPerformAction(axEl, menuAction as CFString)
-                        return
-                    }
-
-                    if let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
-                        self?.postWarpedHIDClickSync(
-                            at: CGPoint(x: rect.midX, y: rect.midY),
-                            button: .right,
-                            savedCursor: savedCursor
-                        )
-                        return
-                    }
-
-                    _ = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
-                    return
-                }
-
-                // Left-click: Direct Accessibility `AXPress`
-                // Empirical behavior on macOS 14–27:
-                // - Returns `.success` (0) for NSPopover / NSPanel / MenuBarExtra(.window) apps (Itsycal, Maccy, Claude, Caffeine, etc.)
-                // - Returns `.cannotComplete` (-25204) when NSMenu opens and enters NSEventTrackingRunLoopMode (QuickFolder, Moom, OpenKey, Yoink, etc.)
-                // NEVER call runningApp.activate() on -25204, as stealing focus closes the open NSMenu!
-                let err = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
-                if err == .success || err == .cannotComplete {
-                    return
-                }
-
-                // Fallback 1: Custom NSView inside NSStatusItem with a child AXButton
-                var childrenRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-                   let children = childrenRef as? [AXUIElement],
-                   let childButton = children.first {
-                    AXUIElementSetMessagingTimeout(childButton, 0.18)
-                    let childErr = AXUIElementPerformAction(childButton, kAXPressAction as CFString)
-                    if childErr == .success || childErr == .cannotComplete {
-                        return
+                        actionErr = AXUIElementPerformAction(axEl, menuAction as CFString)
                     }
                 }
 
-                // Fallback 2: Legacy warped HID click or app activation
-                if let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
-                    self?.postWarpedHIDClickSync(
+                if actionErr != .success && actionErr != .cannotComplete {
+                    actionErr = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
+                }
+
+                if actionErr != .success && actionErr != .cannotComplete {
+                    var childrenRef: CFTypeRef?
+                    if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+                       let children = childrenRef as? [AXUIElement],
+                       let childButton = children.first {
+                        AXUIElementSetMessagingTimeout(childButton, 0.16)
+                        actionErr = AXUIElementPerformAction(childButton, kAXPressAction as CFString)
+                    }
+                }
+
+                // Legacy macOS 14/15 physical slot click fallback ONLY when item is physically visible on the Menu Bar
+                if actionErr != .success && actionErr != .cannotComplete && !usesAgentArch && item.isCurrentlyOnBar,
+                   let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
+                    self.postWarpedHIDClickSync(
                         at: CGPoint(x: rect.midX, y: rect.midY),
-                        button: .left,
+                        button: rightClick ? .right : .left,
                         savedCursor: savedCursor
                     )
-                } else if let app = NSRunningApplication(processIdentifier: targetPID) {
-                    app.activate()
+                    actionErr = .success
+                }
+
+                // STEP 4: Poll briefly (15ms..190ms) to catch either:
+                //   (a) a dynamically attached `AXMenu` (close off-corner menu & mirror under icon), OR
+                //   (b) a newly opened / revealed popover `AXWindow` -> snap its `AXPosition` right under the icon!
+                let delaysMicros: [useconds_t] = [15_000, 25_000, 35_000, 45_000, 65_000]
+                for waitUs in delaysMicros {
+                    usleep(waitUs)
+
+                    if let dynMenu = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: true) {
+                        continuation.resume(returning: .mirroredMenu(dynMenu))
+                        return
+                    }
+
+                    if self.snapOpenedPopoverWindowIfFound(
+                        axApp: axApp,
+                        baselineWindows: baselineAXWins,
+                        anchorRectCG: anchorRectCG,
+                        displayCG: anchorDisplayCG
+                    ) {
+                        continuation.resume(returning: .openedPopoverWindow)
+                        return
+                    }
+                }
+
+                if item.isSystemItem && usesAgentArch && !item.isCurrentlyOnBar {
+                    continuation.resume(returning: .fallbackSystemItem)
+                } else {
+                    continuation.resume(returning: .triggeredActionOnly)
                 }
             }
         }
 
-        isPerformingHIDSequence = false
+        // STEP 5: Finalize presentation on MainActor
+        switch interactionResult {
+        case .mirroredMenu(let snapshot):
+            let barVisible = SecondaryBarController.shared.isVisible
+            if barVisible {
+                SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
+            }
+            let selectedNodeID = AXStatusMenuBridge.shared.presentMirroredMenu(
+                snapshot,
+                anchorView: anchorView,
+                anchorScreenRectAppKit: anchorScreenRectAppKit
+            )
+            if barVisible {
+                SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: selectedNodeID != nil)
+            }
+            if let nodeID = selectedNodeID {
+                interactionQueue.async {
+                    AXStatusMenuBridge.shared.performSelectedMenuNode(nodeID, in: snapshot)
+                }
+            }
 
-        // 4. Re-expand spacers cleanly once the user closes the opened NSMenu or NSPopover/NSPanel
+        case .openedPopoverWindow:
+            NSRunningApplication(processIdentifier: targetPID)?.activate()
+            if SecondaryBarController.shared.isVisible {
+                SecondaryBarController.shared.beginExternalPopoverSession(
+                    itemID: item.id,
+                    pid: targetPID,
+                    baselineWinIDs: windowsBefore
+                )
+            }
+
+        case .fallbackSystemItem:
+            onHideSecondaryBarRequested?()
+            MenuBarVisibilityEngine.shared.triggerHiddenSystemItem(item, rightClick: rightClick)
+
+        case .triggeredActionOnly:
+            SecondaryBarController.shared.clearExternalPopoverSessionIfIdle()
+            if rightClick, let app = NSRunningApplication(processIdentifier: targetPID), app.activationPolicy == .regular {
+                onHideSecondaryBarRequested?()
+                app.activate()
+            }
+        }
+
         if collapsedSpacersTemporarily {
             try? await Task.sleep(nanoseconds: 220_000_000)
             scheduleSmartRehide(targetPID: item.pid, baselineWindows: windowsBefore)
         }
+    }
+
+    nonisolated private func readAXWindows(of axApp: AXUIElement) -> [AXUIElement] {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &ref) == .success,
+              let wins = ref as? [AXUIElement] else {
+            return []
+        }
+        return wins
+    }
+
+    nonisolated private func snapOpenedPopoverWindowIfFound(
+        axApp: AXUIElement,
+        baselineWindows: [AXUIElement],
+        anchorRectCG: CGRect,
+        displayCG: CGRect
+    ) -> Bool {
+        let currentWins = readAXWindows(of: axApp)
+        guard !currentWins.isEmpty else { return false }
+
+        var chosenWin: AXUIElement? = nil
+        var chosenSize = CGSize.zero
+
+        for w in currentWins {
+            AXUIElementSetMessagingTimeout(w, 0.12)
+            guard let sz = readAXWindowSize(w), sz.width >= 40, sz.height >= 28 else { continue }
+            var settable: DarwinBoolean = false
+            guard AXUIElementIsAttributeSettable(w, kAXPositionAttribute as CFString, &settable) == .success,
+                  settable.boolValue else { continue }
+
+            let isBrandNew = !baselineWindows.contains(where: { CFEqual($0, w) })
+            if isBrandNew {
+                chosenWin = w
+                chosenSize = sz
+                break
+            }
+
+            // Also catch reusable pre-allocated popovers/panels (e.g. Itsycal / custom NSPanel) that were ordered in
+            var subroleRef: CFTypeRef?
+            let subrole = (AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &subroleRef) == .success)
+                ? ((subroleRef as? String) ?? "")
+                : ""
+            if sz.width <= 820 && sz.height <= 960 && subrole != "AXStandardWindow" {
+                chosenWin = w
+                chosenSize = sz
+                break
+            }
+        }
+
+        guard let targetWin = chosenWin else { return false }
+
+        func computeTargetOrigin(for size: CGSize) -> CGPoint {
+            let minX = displayCG.minX + 8.0
+            let maxX = max(minX, displayCG.maxX - size.width - 8.0)
+            let centeredX = min(max(anchorRectCG.midX - size.width * 0.5, minX), maxX)
+
+            let minY = displayCG.minY + 30.0
+            let maxY = max(minY, displayCG.maxY - min(size.height, displayCG.height - 40.0) - 8.0)
+            let anchoredY = min(max(anchorRectCG.maxY + 4.0, minY), maxY)
+            return CGPoint(x: round(centeredX), y: round(anchoredY))
+        }
+
+        var firstPt = computeTargetOrigin(for: chosenSize)
+        if let val = AXValueCreate(.cgPoint, &firstPt) {
+            _ = AXUIElementSetAttributeValue(targetWin, kAXPositionAttribute as CFString, val)
+        }
+
+        // Re-verify 38ms later in case the app ran an initial frame animation right after orderFront
+        usleep(38_000)
+        let updatedSize = readAXWindowSize(targetWin) ?? chosenSize
+        var finalPt = computeTargetOrigin(for: updatedSize)
+        if let curPos = readAXWindowPosition(targetWin),
+           hypot(curPos.x - finalPt.x, curPos.y - finalPt.y) > 4.0,
+           let val2 = AXValueCreate(.cgPoint, &finalPt) {
+            _ = AXUIElementSetAttributeValue(targetWin, kAXPositionAttribute as CFString, val2)
+        }
+
+        return true
+    }
+
+    nonisolated private func readAXWindowSize(_ win: AXUIElement) -> CGSize? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &ref) == .success,
+              let val = ref else { return nil }
+        var sz = CGSize.zero
+        return AXValueGetValue(val as! AXValue, .cgSize, &sz) ? sz : nil
+    }
+
+    nonisolated private func readAXWindowPosition(_ win: AXUIElement) -> CGPoint? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &ref) == .success,
+              let val = ref else { return nil }
+        var pt = CGPoint.zero
+        return AXValueGetValue(val as! AXValue, .cgPoint, &pt) ? pt : nil
     }
 
     // MARK: - Smart Auto-Rehide After Menu/Popover Closes

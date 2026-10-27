@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CoreGraphics
 import SwiftUI
 
 final class NonActivatingBarPanel: NSPanel {
@@ -18,14 +19,20 @@ final class SecondaryBarController: ObservableObject {
     static let shared = SecondaryBarController()
 
     @Published private(set) var isVisible: Bool = false
+    @Published private(set) var activeOpenedItemID: String? = nil
     let countdown = SecondaryBarCountdownModel()
 
     private var panel: NonActivatingBarPanel?
     private var autoHideTimer: Timer?
     private var outsideClickMonitor: Any?
-    private var localRightClickMonitor: Any?
     private var lastInteractionDate: Date = Date()
     private var lastWarmScanTimestamp: CFAbsoluteTime = 0
+
+    /// Tracks an active native `NSMenu` or repositioned app popover anchored underneath `Ctrl + B`.
+    private(set) var isPresentingMirroredMenu: Bool = false
+    private var trackedPopoverPID: pid_t = 0
+    private var trackedPopoverBaselineWinIDs = Set<Int>()
+    private var trackedPopoverOpenedAt: CFAbsoluteTime = 0
 
     /// Layout constants matching `SecondaryBarView` single-row metrics
     static let panelHeight: CGFloat = 38.0
@@ -107,6 +114,12 @@ final class SecondaryBarController: ObservableObject {
 
         stopAutoHideMonitoring()
         removeOutsideClickMonitor()
+        isPresentingMirroredMenu = false
+        trackedPopoverPID = 0
+        trackedPopoverBaselineWinIDs.removeAll()
+        if activeOpenedItemID != nil {
+            activeOpenedItemID = nil
+        }
         isVisible = false
         MenuBarController.shared.updateMainButtonAppearance(isSecondaryOpen: false)
         panel?.orderOut(nil)
@@ -119,6 +132,56 @@ final class SecondaryBarController: ObservableObject {
         let newFrame = calculateTargetFrame(on: screen)
         if abs(panel.frame.width - newFrame.width) > 1 || abs(panel.frame.origin.x - newFrame.origin.x) > 1 {
             panel.setFrame(newFrame, display: true)
+        }
+    }
+
+    // MARK: - Anchored App Menu / Popover Lifecycle
+
+    func beginMirroredMenuSession(itemID: String) {
+        isPresentingMirroredMenu = true
+        trackedPopoverPID = 0
+        activeOpenedItemID = itemID
+        lastInteractionDate = Date()
+        if countdown.progress != 1.0 {
+            countdown.progress = 1.0
+        }
+    }
+
+    func endMirroredMenuSession(didSelectAction: Bool) {
+        isPresentingMirroredMenu = false
+        activeOpenedItemID = nil
+
+        if didSelectAction {
+            hide()
+            return
+        }
+
+        // If user clicked another icon inside `Ctrl + B`, keep the bar open; otherwise close cleanly.
+        if let panel = panel, NSMouseInRect(NSEvent.mouseLocation, panel.frame.insetBy(dx: -4, dy: -4), false) {
+            lastInteractionDate = Date()
+            countdown.progress = 1.0
+        } else {
+            hide()
+        }
+    }
+
+    func beginExternalPopoverSession(itemID: String, pid: pid_t, baselineWinIDs: Set<Int>) {
+        isPresentingMirroredMenu = false
+        activeOpenedItemID = itemID
+        trackedPopoverPID = pid
+        trackedPopoverBaselineWinIDs = baselineWinIDs
+        trackedPopoverOpenedAt = CFAbsoluteTimeGetCurrent()
+        lastInteractionDate = Date()
+        if countdown.progress != 1.0 {
+            countdown.progress = 1.0
+        }
+    }
+
+    func clearExternalPopoverSessionIfIdle() {
+        trackedPopoverPID = 0
+        trackedPopoverBaselineWinIDs.removeAll()
+        if activeOpenedItemID != nil {
+            activeOpenedItemID = nil
         }
     }
 
@@ -159,14 +222,37 @@ final class SecondaryBarController: ObservableObject {
         lastInteractionDate = Date()
         countdown.progress = 1.0
 
-        let durationSeconds = Double(MenuBarController.shared.autoHideDuration.rawValue)
-        guard durationSeconds > 0 else { return }
-
-        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] timer in
+        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] timer in
             Task { @MainActor in
                 guard let self = self, self.isVisible else {
                     timer.invalidate()
                     return
+                }
+
+                // 1. Keep bar pinned while a mirrored NSMenu or drag-reorder is active
+                if self.isPresentingMirroredMenu || MenuBarController.shared.draggingItemID != nil {
+                    self.lastInteractionDate = Date()
+                    if self.countdown.progress != 1.0 {
+                        self.countdown.progress = 1.0
+                    }
+                    return
+                }
+
+                // 2. Keep bar anchored while the opened app's popover/panel window is still visible
+                if self.trackedPopoverPID > 0 {
+                    let age = CFAbsoluteTimeGetCurrent() - self.trackedPopoverOpenedAt
+                    if age < 0.85 || self.hasOpenPopupWindow(for: self.trackedPopoverPID, baseline: self.trackedPopoverBaselineWinIDs) {
+                        self.lastInteractionDate = Date()
+                        if self.countdown.progress != 1.0 {
+                            self.countdown.progress = 1.0
+                        }
+                        return
+                    } else {
+                        // Popover closed -> dismiss Ctrl + B cleanly as well
+                        timer.invalidate()
+                        self.hide()
+                        return
+                    }
                 }
 
                 let total = Double(MenuBarController.shared.autoHideDuration.rawValue)
@@ -177,9 +263,8 @@ final class SecondaryBarController: ObservableObject {
                     return
                 }
 
-                // Pause & reset timer whenever cursor hovers inside the bar OR while dragging to reorder icons
-                if MenuBarController.shared.draggingItemID != nil ||
-                   (self.panel != nil && NSMouseInRect(NSEvent.mouseLocation, self.panel!.frame.insetBy(dx: -4, dy: -4), false)) {
+                // 3. Pause & reset countdown whenever cursor hovers inside the bar
+                if let p = self.panel, NSMouseInRect(NSEvent.mouseLocation, p.frame.insetBy(dx: -4, dy: -4), false) {
                     self.lastInteractionDate = Date()
                     if self.countdown.progress != 1.0 {
                         self.countdown.progress = 1.0
@@ -212,14 +297,20 @@ final class SecondaryBarController: ObservableObject {
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self, self.isVisible, let panel = self.panel else { return }
+                guard !self.isPresentingMirroredMenu else { return }
+
                 let mouseLoc = NSEvent.mouseLocation
                 if let statusRect = MenuBarController.shared.mainStatusItemFrameAppKit(),
                    NSMouseInRect(mouseLoc, statusRect.insetBy(dx: -2, dy: -2), false) {
                     return
                 }
-                if !NSMouseInRect(mouseLoc, panel.frame, false) {
-                    self.hide()
+                if NSMouseInRect(mouseLoc, panel.frame, false) {
+                    return
                 }
+                if self.trackedPopoverPID > 0, self.isMouseInsideWindow(ofPID: self.trackedPopoverPID, mouseAppKit: mouseLoc) {
+                    return
+                }
+                self.hide()
             }
         }
     }
@@ -229,9 +320,49 @@ final class SecondaryBarController: ObservableObject {
             NSEvent.removeMonitor(monitor)
             outsideClickMonitor = nil
         }
-        if let rightMonitor = localRightClickMonitor {
-            NSEvent.removeMonitor(rightMonitor)
-            localRightClickMonitor = nil
+    }
+
+    private func hasOpenPopupWindow(for pid: pid_t, baseline: Set<Int>) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return false
         }
+        for w in list {
+            let ownerPID = pid_t(w[kCGWindowOwnerPID as String] as? Int ?? 0)
+            guard ownerPID == pid else { continue }
+            let alpha = w[kCGWindowAlpha as String] as? Double ?? 1.0
+            guard alpha > 0.05 else { continue }
+            let wid = w[kCGWindowNumber as String] as? Int ?? 0
+            if !baseline.contains(wid) {
+                return true
+            }
+            let layer = w[kCGWindowLayer as String] as? Int ?? 0
+            if layer > 0 && layer != 25 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func isMouseInsideWindow(ofPID pid: pid_t, mouseAppKit: NSPoint) -> Bool {
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 1440
+        let mouseCG = CGPoint(x: mouseAppKit.x, y: primaryHeight - mouseAppKit.y)
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return false
+        }
+        for w in list {
+            let ownerPID = pid_t(w[kCGWindowOwnerPID as String] as? Int ?? 0)
+            guard ownerPID == pid else { continue }
+            if let b = w[kCGWindowBounds as String] as? [String: Any],
+               let x = b["X"] as? CGFloat,
+               let y = b["Y"] as? CGFloat,
+               let width = b["Width"] as? CGFloat,
+               let height = b["Height"] as? CGFloat {
+                let rect = CGRect(x: x, y: y, width: width, height: height).insetBy(dx: -8, dy: -8)
+                if rect.contains(mouseCG) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }

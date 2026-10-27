@@ -25,7 +25,7 @@
 - **Thanh phụ gọn 1 dòng ngay bên phải dưới Menu Bar (`Ctrl + B`)**:
   - Hiện tức thì (`< 5ms`) gọn đúng **1 dòng duy nhất** ở góc trên bên phải màn hình, sát ngay dưới thanh Menu Bar gốc (hỗ trợ đa màn hình & màn hình tai thỏ MacBook).
   - Không cướp tiêu điểm bàn phím (`NSPanel` non-activating) của ứng dụng bạn đang làm việc.
-  - **Click chuột trái** vào biểu tượng để mở tức thì menu / popover thật của ứng dụng đó (tự động thu gọn lại ngay sau khi bạn đóng menu); **click chuột phải** để mở menu ngữ cảnh hoặc ghim nhanh lên Menu Bar chính.
+  - **Click chuột trái hoặc Click chuột phải** vào biểu tượng để mở tức thì menu / popover thật của ứng dụng đó **ngay đúng vị trí bên dưới biểu tượng vừa bấm** (không bị nhảy sang góc trái/phải màn hình); giữ **`⌥ Option + Click`** để mở tuỳ chọn nhanh của BarFlow.
 - **Tự động ẩn thông minh & Toggle tức thì**:
   - Tự động ẩn sau khoảng thời gian tuỳ chỉnh (`3s`, `5s`, `8s`, `12s`, `20s`, hoặc thủ công), tự động **tạm dừng đếm ngược** khi con trỏ chuột đang rê bên trong thanh phụ.
   - Bấm lại **`Ctrl + B`** 1 lần nữa (hoặc phím `Esc`, hoặc click ra ngoài) để ẩn thanh phụ ngay lập tức.
@@ -44,8 +44,8 @@
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.5.0.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.5.0-macOS.zip`**
+   - **`BarFlow-Installer-v1.6.0.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.6.0-macOS.zip`**
 2. Mở file `.dmg`:
    - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:
