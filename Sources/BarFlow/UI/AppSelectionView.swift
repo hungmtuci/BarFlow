@@ -42,8 +42,8 @@ struct AppSelectionView: View {
             headerSection
             Divider()
 
-            if !menuController.isAccessibilityGranted {
-                accessibilityPermissionBanner
+            if !menuController.isAccessibilityGranted || (menuController.requiresFullDiskAccess && !menuController.isFullDiskAccessGranted) {
+                permissionsOnboardingBanner
                 Divider()
             }
 
@@ -103,7 +103,7 @@ struct AppSelectionView: View {
 
             HStack(spacing: 8) {
                 Button {
-                    menuController.refreshRunningAppsAsync(forceFullScan: true)
+                    menuController.refreshAndSyncManually()
                 } label: {
                     Label("Làm mới", systemImage: "arrow.clockwise")
                         .font(.system(size: 12.5, weight: .medium))
@@ -146,34 +146,98 @@ struct AppSelectionView: View {
         .padding(.vertical, 14)
     }
 
-    // MARK: - 2. Accessibility Permission Banner
+    // MARK: - 2. Permissions Onboarding Banner (Accessibility + Full Disk Access on macOS 26/27)
 
-    private var accessibilityPermissionBanner: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "exclamationmark.shield.fill")
-                .font(.system(size: 22))
-                .foregroundStyle(.orange)
+    private var permissionsOnboardingBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if menuController.shouldOfferMoveToApplications {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.blue)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Cần cấp quyền Trợ năng (Accessibility) để đọc đầy đủ ứng dụng Menu Bar")
-                    .font(.system(size: 13, weight: .semibold))
-                Text("Nếu vừa cập nhật BarFlow, hãy tắt rồi bật lại công tắc BarFlow trong System Settings → Privacy & Security → Accessibility.")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
+                    Text("Bạn đang chạy BarFlow từ thư mục tạm/Downloads. Hãy cài vào /Applications trước khi cấp quyền để không bị mất quyền khi tải bản mới:")
+                        .font(.system(size: 11.5, weight: .medium))
+
+                    Spacer()
+
+                    Button("Cài vào /Applications & Mở lại") {
+                        menuController.installToApplicationsAndRelaunch()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
-            Spacer()
+            if !menuController.isAccessibilityGranted {
+                HStack(spacing: 12) {
+                    Image(systemName: "1.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.orange)
 
-            Button("Cấp quyền ngay") {
-                MenuBarScanner.shared.promptForAccessibilityPermission(openSystemSettings: true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Bước 1 — Cấp quyền Trợ năng (Accessibility) để quét & kích hoạt ứng dụng Menu Bar")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Text("Nếu vừa cập nhật BarFlow, hãy tắt rồi bật lại công tắc BarFlow (hoặc kéo thả file BarFlow mới vào danh sách Accessibility).")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button("Cấp quyền Accessibility") {
+                        MenuBarScanner.shared.promptForAccessibilityPermission(openSystemSettings: true)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
+                    .controlSize(.small)
+                    .fixedSize()
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-            .fixedSize()
+
+            if menuController.requiresFullDiskAccess && !menuController.isFullDiskAccessGranted {
+                HStack(spacing: 12) {
+                    Image(systemName: menuController.isAccessibilityGranted ? "exclamationmark.lock.fill" : "2.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.red)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Cần cấp quyền Full Disk Access (Truy cập Toàn bộ Đĩa) để ẩn thực sự các icon khỏi Menu Bar chính")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Text("Trên macOS 26/27, Apple khoá cấu hình MenuBarAgent bằng TCC. Bấm 'Cấp quyền Full Disk Access' → kéo BarFlow.app từ Finder thả vào danh sách Full Disk Access và bật công tắc → chọn Quit & Reopen.")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 6) {
+                        Button("Hiện trong Finder") {
+                            menuController.revealRunningAppInFinder()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .fixedSize()
+
+                        Button("Cấp quyền Full Disk Access") {
+                            menuController.openFullDiskAccessSettings(alsoRevealInFinder: true)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .controlSize(.small)
+                        .fixedSize()
+                    }
+                }
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
-        .background(Color.orange.opacity(0.10))
+        .background(Color.orange.opacity(0.11))
     }
 
     // MARK: - 3. Live Dual-Bar Visual Preview (With Direct Bulk Transfer Buttons)

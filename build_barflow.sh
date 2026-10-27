@@ -7,7 +7,7 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.3.0"
+VERSION="1.4.0"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
@@ -133,7 +133,7 @@ cat > "$STAGE_CONTENTS/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -183,7 +183,9 @@ echo "✓ Đã cài đặt thành công tại: $APP_DST"
 echo "✓ Đang khởi chạy BarFlow..."
 open "$APP_DST"
 echo ""
-echo "Lưu ý: Trong lần chạy đầu tiên, hãy cấp quyền Accessibility (Trợ năng) trong System Settings -> Privacy & Security -> Accessibility để BarFlow quản lý các biểu tượng trên Menu Bar."
+echo "Lưu ý trên macOS 26 Tahoe / macOS 27:"
+echo "  1. Cấp quyền Accessibility (Trợ năng) để quét & kích hoạt menu ứng dụng."
+echo "  2. Cấp quyền Full Disk Access (Truy cập Toàn bộ Đĩa) theo nút hướng dẫn ngay trong BarFlow để ẩn thực sự các icon khỏi Menu Bar chính."
 sleep 2
 INSTALLER_EOF
 chmod +x "$DMG_STAGING/Cai_Dat_BarFlow.command"

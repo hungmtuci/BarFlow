@@ -72,6 +72,17 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         return hasAgent && FileManager.default.fileExists(atPath: ccGroupPlistPath)
     }
 
+    /// Returns `true` when `BarFlow` has TCC `Full Disk Access` (`kTCCServiceSystemPolicyAllFiles`) required by macOS
+    /// to read and write `~/Library/Group Containers/group.com.apple.controlcenter/...` and `com.apple.MenuBar.plist`.
+    /// Uses a `0.005ms` `open(..., O_RDWR)` check so it verifies real live read+write access without allocating memory.
+    var hasFullDiskAccess: Bool {
+        guard usesMenuBarAgentArchitecture else { return true }
+        let fd = open(ccGroupPlistPath, O_RDWR)
+        guard fd >= 0 else { return false }
+        close(fd)
+        return true
+    }
+
     private init() {}
 
     // MARK: - Persisted Hidden System Items Access
@@ -128,11 +139,18 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     // MARK: - Main Async Sync Entrypoint
 
+    enum SyncErrorReason: Equatable, Sendable {
+        case missingFullDiskAccess
+        case writeFailed(String)
+    }
+
     struct SyncOutcome: Sendable {
         let didModifyPreferences: Bool
+        let didReloadAgent: Bool
         let deferredReloadDelay: TimeInterval?
         let hiddenCount: Int
         let visibleCount: Int
+        let errorReason: SyncErrorReason?
     }
 
     /// Writes updated `trackedApplications`, system module flags, and `TrailingItemPreferredPositions` for `BarFlow`
@@ -140,10 +158,31 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     func syncMenuBarState(
         allApps: [MenuBarAppItem],
         selectedMainBarIDs: Set<String>,
-        hidingEnabled: Bool
+        hidingEnabled: Bool,
+        forceReload: Bool = false
     ) async -> SyncOutcome {
         guard usesMenuBarAgentArchitecture else {
-            return SyncOutcome(didModifyPreferences: false, deferredReloadDelay: nil, hiddenCount: 0, visibleCount: allApps.count)
+            return SyncOutcome(
+                didModifyPreferences: false,
+                didReloadAgent: false,
+                deferredReloadDelay: nil,
+                hiddenCount: 0,
+                visibleCount: allApps.count,
+                errorReason: nil
+            )
+        }
+
+        // Never partially modify system extras or restart MenuBarAgent (which causes a 1-2s blank Menu Bar flash)
+        // when Full Disk Access hasn't been granted yet!
+        guard hasFullDiskAccess else {
+            return SyncOutcome(
+                didModifyPreferences: false,
+                didReloadAgent: false,
+                deferredReloadDelay: nil,
+                hiddenCount: 0,
+                visibleCount: allApps.count,
+                errorReason: .missingFullDiskAccess
+            )
         }
 
         // Capture running process bundle/executable metadata on MainActor cleanly
@@ -158,7 +197,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                     selectedMainBarIDs: selectedMainBarIDs,
                     hidingEnabled: hidingEnabled,
                     processMeta: processMeta,
-                    allowImmediateReload: true
+                    allowImmediateReload: true,
+                    forceReload: forceReload
                 )
                 continuation.resume(returning: outcome)
             }
@@ -182,7 +222,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     /// Restores 100% of apps and system extras hidden by BarFlow when the user quits BarFlow.
     func restoreAllSynchronouslyOnQuit() {
-        guard FileManager.default.fileExists(atPath: ccGroupPlistPath) else { return }
+        guard usesMenuBarAgentArchitecture, hasFullDiskAccess else { return }
         engineQueue.sync {
             let changedCC = self.restoreTrackedAppsAndSpotlightOnDisk()
             let changedSys = self.restoreSystemExtrasOnDisk()
@@ -190,6 +230,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                 // Only reload MenuBarAgent immediately on quit if safe from launchd throttle;
                 // even if within throttle window, flushing cfprefsd ensures preferences are clean on disk.
                 self.flushUserCfprefsd()
+                usleep(40_000)
                 if self.remainingSecondsBeforeSafeReload() <= 0.1 {
                     self.terminateMenuBarAgent()
                 }
@@ -331,8 +372,20 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         selectedMainBarIDs: Set<String>,
         hidingEnabled: Bool,
         processMeta: [pid_t: ProcessIdentity],
-        allowImmediateReload: Bool
+        allowImmediateReload: Bool,
+        forceReload: Bool
     ) -> SyncOutcome {
+        guard hasFullDiskAccess else {
+            return SyncOutcome(
+                didModifyPreferences: false,
+                didReloadAgent: false,
+                deferredReloadDelay: nil,
+                hiddenCount: 0,
+                visibleCount: allApps.count,
+                errorReason: .missingFullDiskAccess
+            )
+        }
+
         let effectiveSelectedIDs: Set<String> = hidingEnabled
             ? selectedMainBarIDs
             : Set(allApps.map(\.id))
@@ -340,20 +393,34 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         let visibleItems = allApps.filter { effectiveSelectedIDs.contains($0.id) }
         let hiddenItems = hidingEnabled ? allApps.filter { !effectiveSelectedIDs.contains($0.id) } : []
 
-        // 1. Update `group.com.apple.controlcenter.plist` (`trackedApplications` + `showSpotlight` / `showSiri`)
-        let changedCCGroup = updateControlCenterGroupPlist(
-            visibleItems: visibleItems,
-            hiddenItems: hiddenItems,
-            hidingEnabled: hidingEnabled,
-            processMeta: processMeta
-        )
+        // Check whether any hidden app is STILL physically hosted on the Main Menu Bar right now
+        let hasLiveBarMismatch = hiddenItems.contains(where: { $0.isCurrentlyOnBar }) ||
+            visibleItems.contains(where: { !$0.isCurrentlyOnBar && !$0.isSystemItem })
 
-        // 2. Update System Menu Extras (`Wi-Fi`, `Battery`, `Screen Mirroring`, `Input Menu`, etc.)
+        // 1. Update System Menu Extras FIRST so their CFPreferencesSynchronize calls flush cleanly BEFORE we SIGKILL cfprefsd!
         let changedSystemModules = updateSystemModulesPreferences(
             visibleItems: visibleItems,
             hiddenItems: hiddenItems,
             hidingEnabled: hidingEnabled
         )
+
+        // 2. Update `group.com.apple.controlcenter.plist` (`trackedApplications` + `showSpotlight` / `showSiri`)
+        let ccResult = updateControlCenterGroupPlist(
+            visibleItems: visibleItems,
+            hiddenItems: hiddenItems,
+            hidingEnabled: hidingEnabled,
+            processMeta: processMeta
+        )
+        if let errMsg = ccResult.writeError {
+            return SyncOutcome(
+                didModifyPreferences: false,
+                didReloadAgent: false,
+                deferredReloadDelay: nil,
+                hiddenCount: hiddenItems.count,
+                visibleCount: visibleItems.count,
+                errorReason: .writeFailed(errMsg)
+            )
+        }
 
         // 3. Update `com.apple.MenuBar.plist` (`TrailingItemPreferredPositions`) so BarFlow `•••` + selected apps sit cleanly at top-right!
         let changedPositions = updateMenuBarPreferredPositions(
@@ -361,23 +428,29 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             processMeta: processMeta
         )
 
-        let anyChanged = changedCCGroup || changedSystemModules || changedPositions
-        guard anyChanged else {
+        let anyChanged = ccResult.didChange || changedSystemModules || changedPositions
+        let shouldReload = anyChanged || (forceReload && hasLiveBarMismatch)
+
+        guard shouldReload else {
             return SyncOutcome(
                 didModifyPreferences: false,
+                didReloadAgent: false,
                 deferredReloadDelay: nil,
                 hiddenCount: hiddenItems.count,
-                visibleCount: visibleItems.count
+                visibleCount: visibleItems.count,
+                errorReason: nil
             )
         }
 
         guard allowImmediateReload else {
             flushUserCfprefsd()
             return SyncOutcome(
-                didModifyPreferences: true,
+                didModifyPreferences: anyChanged,
+                didReloadAgent: false,
                 deferredReloadDelay: nil,
                 hiddenCount: hiddenItems.count,
-                visibleCount: visibleItems.count
+                visibleCount: visibleItems.count,
+                errorReason: nil
             )
         }
 
@@ -385,19 +458,23 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         if remainingWait > 0.05 {
             flushUserCfprefsd()
             return SyncOutcome(
-                didModifyPreferences: true,
+                didModifyPreferences: anyChanged,
+                didReloadAgent: false,
                 deferredReloadDelay: remainingWait,
                 hiddenCount: hiddenItems.count,
-                visibleCount: visibleItems.count
+                visibleCount: visibleItems.count,
+                errorReason: nil
             )
         }
 
         flushUserCfprefsdAndReloadMenuBarAgent()
         return SyncOutcome(
-            didModifyPreferences: true,
+            didModifyPreferences: anyChanged,
+            didReloadAgent: true,
             deferredReloadDelay: nil,
             hiddenCount: hiddenItems.count,
-            visibleCount: visibleItems.count
+            visibleCount: visibleItems.count,
+            errorReason: nil
         )
     }
 
@@ -408,15 +485,20 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         hiddenItems: [MenuBarAppItem],
         hidingEnabled: Bool,
         processMeta: [pid_t: ProcessIdentity]
-    ) -> Bool {
+    ) -> (didChange: Bool, writeError: String?) {
         let url = URL(fileURLWithPath: ccGroupPlistPath)
-        guard let rawOuterData = try? Data(contentsOf: url),
-              var outer = (try? PropertyListSerialization.propertyList(
-                  from: rawOuterData,
-                  options: [.mutableContainersAndLeaves],
-                  format: nil
-              )) as? [String: Any] else {
-            return false
+        let rawOuterData: Data
+        do {
+            rawOuterData = try Data(contentsOf: url)
+        } catch {
+            return (false, error.localizedDescription)
+        }
+        guard var outer = (try? PropertyListSerialization.propertyList(
+            from: rawOuterData,
+            options: [.mutableContainersAndLeaves],
+            format: nil
+        )) as? [String: Any] else {
+            return (false, "Không đọc được định dạng group.com.apple.controlcenter.plist")
         }
 
         var didChange = false
@@ -474,8 +556,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         saveSystemPrefBackup(backup)
 
-        // --- B. Build Visible & Hidden Identifier Sets for Non-System Apps ---
-        var visibleBundleIDs = Set<String>(["com.hunglx.BarFlow", "BarFlow"])
+        // --- B. Build Visible & Hidden Identifier Sets for Non-System Apps (case-insensitive bundle matching) ---
+        var visibleBundleIDs = Set<String>(["com.hunglx.barflow", "barflow"])
         var visibleExecURLs = Set<String>()
         if let ownExec = Bundle.main.executableURL?.absoluteString {
             visibleExecURLs.insert(ownExec)
@@ -514,7 +596,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                 let (entryBundles, entryExecs) = extractEntryIdentifiers(keyDict: keyDict, valDict: valDict)
                 let currentAllowed = (valDict["isAllowed"] as? Bool) ?? true
 
-                let matchesBarFlow = entryBundles.contains("com.hunglx.BarFlow") || entryBundles.contains("BarFlow")
+                let matchesBarFlow = entryBundles.contains("com.hunglx.barflow") || entryBundles.contains("barflow")
                 let matchesVisible = matchesBarFlow ||
                     !entryBundles.isDisjoint(with: visibleBundleIDs) ||
                     !entryExecs.isDisjoint(with: visibleExecURLs)
@@ -567,10 +649,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
                     if let primaryBundle = processMeta[item.pid]?.outerAppBundleID ?? item.bundleIdentifier,
                        !primaryBundle.isEmpty,
-                       primaryBundle != "com.hunglx.BarFlow" {
+                       primaryBundle.lowercased() != "com.hunglx.barflow" {
+                        let lowerPrimary = primaryBundle.lowercased()
                         let locDict: [String: Any] = ["bundle": ["_0": primaryBundle]]
                         var menuLocs: [[String: Any]] = [["bundle": ["_0": primaryBundle]]]
-                        if let subBundle = item.bundleIdentifier, subBundle != primaryBundle {
+                        if let subBundle = item.bundleIdentifier, subBundle.lowercased() != lowerPrimary {
                             menuLocs.append(["bundle": ["_0": subBundle]])
                         }
                         if let execStr = processMeta[item.pid]?.executableURLString {
@@ -583,8 +666,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                         ]
                         arr.append(locDict)
                         arr.append(valDict)
-                        managedKeys.insert("bundle:\(primaryBundle)")
-                        matchedHiddenBundles.insert(primaryBundle)
+                        managedKeys.insert("bundle:\(lowerPrimary)")
+                        matchedHiddenBundles.insert(lowerPrimary)
                         trackedModified = true
                     } else if let execStr = processMeta[item.pid]?.executableURLString, !execStr.isEmpty {
                         let locDict: [String: Any] = ["adhocBinary": ["_0": ["relative": execStr]]]
@@ -611,12 +694,18 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         saveManagedTrackedKeys(managedKeys)
 
-        if didChange,
-           let newOuterData = try? PropertyListSerialization.data(fromPropertyList: outer, format: .binary, options: 0) {
-            try? newOuterData.write(to: url, options: .atomic)
+        if didChange {
+            guard let newOuterData = try? PropertyListSerialization.data(fromPropertyList: outer, format: .binary, options: 0) else {
+                return (false, "Không thể mã hoá group.com.apple.controlcenter.plist")
+            }
+            do {
+                try newOuterData.write(to: url, options: .atomic)
+            } catch {
+                return (false, error.localizedDescription)
+            }
         }
 
-        return didChange
+        return (didChange, nil)
     }
 
     private func restoreTrackedAppsAndSpotlightOnDisk() -> Bool {
@@ -1028,14 +1117,14 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         intoExecs execs: inout Set<String>
     ) {
         if let bid = item.bundleIdentifier, !bid.isEmpty {
-            bundles.insert(bid)
+            bundles.insert(bid.lowercased())
         }
         if let meta = processMeta[item.pid] {
             if let bid = meta.bundleID, !bid.isEmpty {
-                bundles.insert(bid)
+                bundles.insert(bid.lowercased())
             }
             if let outer = meta.outerAppBundleID, !outer.isEmpty {
-                bundles.insert(outer)
+                bundles.insert(outer.lowercased())
             }
             if let ex = meta.executableURLString, !ex.isEmpty {
                 execs.insert(ex)
@@ -1046,7 +1135,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     private func canonicalLocationKey(from locDict: [String: Any]) -> String {
         if let bundleDict = locDict["bundle"] as? [String: Any],
            let bid = bundleDict["_0"] as? String {
-            return "bundle:\(bid)"
+            return "bundle:\(bid.lowercased())"
         }
         if let adhoc = locDict["adhocBinary"] as? [String: Any],
            let inner = adhoc["_0"] as? [String: Any],
@@ -1065,7 +1154,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         func parseLocation(_ dict: [String: Any]) {
             if let b = (dict["bundle"] as? [String: Any])?["_0"] as? String {
-                bundles.insert(b)
+                bundles.insert(b.lowercased())
             }
             if let rel = ((dict["adhocBinary"] as? [String: Any])?["_0"] as? [String: Any])?["relative"] as? String {
                 execs.insert(rel)
@@ -1152,6 +1241,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     }
 
     private func flushUserCfprefsd() {
+        // Send standard SIGTERM so cfprefsd exits cleanly under launchd's EnablePressuredExit
+        // without triggering launchd's 10-second abnormal-exit respawn throttle.
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         proc.arguments = ["-u", NSUserName(), "cfprefsd"]

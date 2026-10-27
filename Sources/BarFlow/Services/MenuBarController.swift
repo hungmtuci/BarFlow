@@ -72,6 +72,18 @@ final class MenuBarController: ObservableObject {
     /// Whether Accessibility permission is currently granted.
     @Published private(set) var isAccessibilityGranted: Bool = AXIsProcessTrusted()
 
+    /// Whether Full Disk Access (`Privacy_AllFiles`) is currently granted (required on macOS 26/27 `MenuBarAgent`).
+    @Published private(set) var isFullDiskAccessGranted: Bool = MenuBarVisibilityEngine.shared.hasFullDiskAccess
+
+    /// Whether the current macOS version uses `MenuBarAgent` (macOS 26 Tahoe / macOS 27+).
+    let requiresFullDiskAccess: Bool = MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture
+
+    /// Returns `true` when the user launched `BarFlow.app` directly from `~/Downloads`, a mounted `.dmg`, or AppTranslocation.
+    var shouldOfferMoveToApplications: Bool {
+        let p = Bundle.main.bundlePath
+        return p.contains("/Downloads/") || p.hasPrefix("/Volumes/") || p.contains("/AppTranslocation/")
+    }
+
     // MARK: - Computed Filtered Lists
 
     /// Apps chosen to stay on the Main Menu Bar.
@@ -178,19 +190,32 @@ final class MenuBarController: ObservableObject {
         }
 
         // Ultra-lightweight monitor:
-        // - Checks AXIsProcessTrusted() (0.01ms) every 2s so granting permission takes effect immediately
+        // - Checks AXIsProcessTrusted() (0.01ms) & hasFullDiskAccess (0.005ms) every 2s so granting permissions takes effect immediately
         // - Once trusted, only runs a 11ms warm background scan every 10s without blocking MainActor
         backgroundMonitorTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
                 let trusted = AXIsProcessTrusted()
+                let fda = MenuBarVisibilityEngine.shared.hasFullDiskAccess
+
                 let changedTrust = (trusted != self.isAccessibilityGranted)
+                let changedFDA = (fda != self.isFullDiskAccessGranted)
+
                 if changedTrust {
                     self.isAccessibilityGranted = trusted
                     self.applySpacersVisibilityState()
-                    if trusted {
-                        self.refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
-                    }
+                }
+                if changedFDA {
+                    self.isFullDiskAccessGranted = fda
+                }
+
+                if changedTrust && trusted {
+                    self.refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
+                    return
+                }
+                if changedFDA && fda && trusted && self.isMainBarHidingEnabled {
+                    self.statusMessage = "Đã nhận quyền Full Disk Access — đang tự động ẩn các ứng dụng không chọn..."
+                    self.scheduleNativeMenuBarSync(delay: 0.25)
                     return
                 }
 
@@ -523,23 +548,126 @@ final class MenuBarController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
+    // MARK: - Permission & Installation Helpers
+
+    func refreshPermissionsState() {
+        let trusted = AXIsProcessTrusted()
+        if isAccessibilityGranted != trusted {
+            isAccessibilityGranted = trusted
+        }
+        let fda = MenuBarVisibilityEngine.shared.hasFullDiskAccess
+        if isFullDiskAccessGranted != fda {
+            isFullDiskAccessGranted = fda
+        }
+    }
+
+    func openFullDiskAccessSettings(alsoRevealInFinder: Bool = false) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+        if alsoRevealInFinder {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+            }
+        }
+    }
+
+    func revealRunningAppInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+
+    func installToApplicationsAndRelaunch() {
+        let srcPath = Bundle.main.bundlePath
+        let dstPath = "/Applications/BarFlow.app"
+        guard srcPath != dstPath else { return }
+
+        let copyProc = Process()
+        copyProc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        copyProc.arguments = ["--noextattr", srcPath, dstPath]
+        do {
+            try? FileManager.default.removeItem(atPath: dstPath)
+            try copyProc.run()
+            copyProc.waitUntilExit()
+            guard copyProc.terminationStatus == 0 else {
+                statusMessage = "Không thể chép vào /Applications (hãy kéo BarFlow.app vào thư mục Applications thủ công)."
+                return
+            }
+            let xattrProc = Process()
+            xattrProc.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            xattrProc.arguments = ["-cr", dstPath]
+            try? xattrProc.run()
+            xattrProc.waitUntilExit()
+
+            NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: dstPath), configuration: NSWorkspace.OpenConfiguration()) { _, _ in
+                Task { @MainActor in
+                    NSApp.terminate(nil)
+                }
+            }
+        } catch {
+            statusMessage = "Không thể tự động cài vào /Applications: \(error.localizedDescription)"
+        }
+    }
+
+    func refreshAndSyncManually() {
+        refreshPermissionsState()
+        guard isAccessibilityGranted else {
+            MenuBarScanner.shared.promptForAccessibilityPermission()
+            statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) ở khung phía trên để quét danh sách Menu Bar."
+            return
+        }
+        statusMessage = "Đang quét lại toàn bộ ứng dụng trên Menu Bar..."
+        Task { @MainActor in
+            let scanned = await MenuBarScanner.shared.scanMenuBarAsync(forceFullScan: true)
+            self.allRunningApps = scanned
+            self.onSecondaryAppsChanged?()
+
+            if self.requiresFullDiskAccess && !self.isFullDiskAccessGranted {
+                self.statusMessage = "Đã quét \(scanned.count) biểu tượng. Hãy cấp thêm quyền Full Disk Access ở khung phía trên để ẩn khỏi Menu Bar chính."
+                return
+            }
+
+            if self.isMainBarHidingEnabled && self.requiresFullDiskAccess {
+                let anyUnselectedStillVisible = self.secondaryBarApps.contains(where: \.isCurrentlyOnBar)
+                if anyUnselectedStillVisible {
+                    await self.executeNativeMenuBarSync(forceReload: true)
+                    return
+                }
+            }
+            self.statusMessage = "Đã làm mới danh sách (\(scanned.count) biểu tượng đang chạy)."
+        }
+    }
+
     // MARK: - Native MenuBarAgent Visibility Sync (macOS 26/27+) & Legacy ⌘-Drag Fallback
 
     private func scheduleNativeMenuBarSync(delay: TimeInterval) {
         guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
+        guard MenuBarVisibilityEngine.shared.hasFullDiskAccess else {
+            isFullDiskAccessGranted = false
+            return
+        }
         nativeSyncDebounceWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                await self?.executeNativeMenuBarSync()
+                await self?.executeNativeMenuBarSync(forceReload: false)
             }
         }
         nativeSyncDebounceWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func executeNativeMenuBarSync() async {
+    private func executeNativeMenuBarSync(forceReload: Bool = false) async {
         guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
-        guard AXIsProcessTrusted(), !allRunningApps.isEmpty else { return }
+        refreshPermissionsState()
+
+        guard isAccessibilityGranted else {
+            statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) ở khung phía trên trước khi áp dụng."
+            return
+        }
+        guard isFullDiskAccessGranted else {
+            statusMessage = "Chưa có quyền Full Disk Access — hãy bấm nút 'Cấp quyền Full Disk Access' ở khung hướng dẫn phía trên để macOS cho phép ẩn icon khỏi Menu Bar chính."
+            return
+        }
+        guard !allRunningApps.isEmpty else { return }
 
         if isExecutingNativeSync {
             hasQueuedFollowUpNativeSync = true
@@ -558,14 +686,27 @@ final class MenuBarController: ObservableObject {
         let outcome = await MenuBarVisibilityEngine.shared.syncMenuBarState(
             allApps: appsSnapshot,
             selectedMainBarIDs: selectedSnapshot,
-            hidingEnabled: hidingSnapshot
+            hidingEnabled: hidingSnapshot,
+            forceReload: forceReload
         )
 
         isExecutingNativeSync = false
 
         if hasQueuedFollowUpNativeSync {
             hasQueuedFollowUpNativeSync = false
-            await executeNativeMenuBarSync()
+            await executeNativeMenuBarSync(forceReload: forceReload)
+            return
+        }
+
+        if let err = outcome.errorReason {
+            isArrangingMenuBar = false
+            switch err {
+            case .missingFullDiskAccess:
+                isFullDiskAccessGranted = false
+                statusMessage = "Cần cấp quyền Full Disk Access (Truy cập Toàn bộ Đĩa) ở khung phía trên để ẩn ứng dụng khỏi Menu Bar chính."
+            case .writeFailed(let detail):
+                statusMessage = "Không thể ghi cấu hình Menu Bar (\(detail)). Hãy kiểm tra lại quyền Full Disk Access."
+            }
             return
         }
 
@@ -577,7 +718,7 @@ final class MenuBarController: ObservableObject {
         }
 
         isArrangingMenuBar = false
-        if outcome.didModifyPreferences {
+        if outcome.didReloadAgent || outcome.didModifyPreferences {
             if hidingSnapshot {
                 statusMessage = outcome.hiddenCount > 0
                     ? "Đã ẩn \(outcome.hiddenCount) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
@@ -585,10 +726,15 @@ final class MenuBarController: ObservableObject {
             } else {
                 statusMessage = "Đã tạm tắt ẩn — toàn bộ ứng dụng đang hiện trên Menu Bar chính."
             }
-            // Refresh live slot statuses cleanly once MenuBarAgent finishes respawning (~1.0s)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) { [weak self] in
+            // Refresh live slot statuses cleanly once MenuBarAgent finishes respawning (~1.1s)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { [weak self] in
                 self?.refreshRunningAppsAsync(forceFullScan: false)
             }
+        } else if forceReload {
+            let countNow = secondaryBarApps.count
+            statusMessage = (hidingSnapshot && countNow > 0)
+                ? "Đã xác nhận ẩn \(countNow) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
+                : "Menu Bar chính đã khớp danh sách chọn lọc!"
         }
     }
 
@@ -610,7 +756,7 @@ final class MenuBarController: ObservableObject {
                 } else {
                     self.statusMessage = "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { [weak self] in
                     self?.refreshRunningAppsAsync(forceFullScan: false)
                 }
             }
@@ -618,7 +764,8 @@ final class MenuBarController: ObservableObject {
     }
 
     func arrangeMenuBarAccordingToSelection() async {
-        guard AXIsProcessTrusted() else {
+        refreshPermissionsState()
+        guard isAccessibilityGranted else {
             MenuBarScanner.shared.promptForAccessibilityPermission()
             statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) để sắp xếp Menu Bar."
             return
@@ -626,16 +773,15 @@ final class MenuBarController: ObservableObject {
 
         // Fast native path for macOS 26/27+ (`MenuBarAgent`)
         if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture {
+            guard isFullDiskAccessGranted else {
+                openFullDiskAccessSettings(alsoRevealInFinder: true)
+                statusMessage = "Đã mở cài đặt Full Disk Access & Finder — hãy kéo BarFlow.app thả vào danh sách Full Disk Access rồi bật công tắc!"
+                return
+            }
             nativeSyncDebounceWorkItem?.cancel()
             nativeSyncDebounceWorkItem = nil
             statusMessage = "Đang áp dụng danh sách chọn lọc lên Menu Bar chính..."
-            await executeNativeMenuBarSync()
-            if !isArrangingMenuBar && statusMessage == "Đang áp dụng danh sách chọn lọc lên Menu Bar chính..." {
-                let countNow = secondaryBarApps.count
-                statusMessage = (isMainBarHidingEnabled && countNow > 0)
-                    ? "Menu Bar chính đã khớp — đang ẩn \(countNow) ứng dụng trong thanh Ctrl + B!"
-                    : "Menu Bar chính đã khớp danh sách chọn lọc!"
-            }
+            await executeNativeMenuBarSync(forceReload: true)
             return
         }
 

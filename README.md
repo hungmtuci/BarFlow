@@ -41,15 +41,17 @@
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.3.0.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.3.0-macOS.zip`**
+   - **`BarFlow-Installer-v1.4.0.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.4.0-macOS.zip`**
 2. Mở file `.dmg`:
-   - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt và gỡ cờ cách ly Gatekeeper.
+   - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:
    ```bash
    xattr -cr /Applications/BarFlow.app && open /Applications/BarFlow.app
    ```
-4. Cấp quyền **Accessibility (Trợ năng)** cho `BarFlow` trong **System Settings → Privacy & Security → Accessibility** để ứng dụng có thể đọc danh sách biểu tượng trên Menu Bar và kích hoạt thao tác click.
+4. Cấp 2 quyền trong **System Settings → Privacy & Security** (có nút mở nhanh ngay trên thanh hướng dẫn bên trong `BarFlow`):
+   - **Accessibility (Trợ năng)**: Để đọc danh sách biểu tượng trên Menu Bar và kích hoạt thao tác click mở menu trong `Ctrl + B`.
+   - **Full Disk Access (Truy cập Toàn bộ Đĩa)** *(Bắt buộc trên macOS 26 Tahoe / macOS 27)*: Để macOS cho phép `BarFlow` ghi cấu hình ẩn biểu tượng gốc của `MenuBarAgent`.
 
 ---
 
