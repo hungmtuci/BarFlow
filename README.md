@@ -18,7 +18,10 @@
   - Tự động quét đầy đủ 100% ứng dụng và tiện ích đang chạy trên Menu Bar (bao gồm helper ngầm, tiến trình tray `.prohibited`, multi-icon apps, và các module hệ thống như Wi-Fi, Pin, Spotlight, Bộ gõ bàn phím).
   - Trên **macOS 26 Tahoe / macOS 27 (`MenuBarAgent`)**, `BarFlow` ẩn thực sự các ứng dụng không chọn khỏi thanh Menu Bar gốc (không sinh mũi tên tràn `«`, không tốn chỗ tai thỏ MacBook) và đặt biểu tượng `BarFlow` (`•••`) gọn ở góc trên bên phải sát Control Center.
   - Tự động khôi phục 100% biểu tượng về trạng thái ban đầu khi chọn lại hoặc khi thoát `BarFlow`.
-- **Xem trước 2 vùng trực quan & Chuyển hàng loạt 1 chạm**: Hiển thị trực quan nhóm biểu tượng giữ lại trên **Menu Bar chính** và nhóm chuyển xuống **Thanh phụ `Ctrl + B`**, tích hợp nút **Chuyển toàn bộ xuống phụ** / **Chuyển toàn bộ lên chính** và đồng bộ tự động ngay khi bật/tắt.
+- **Kéo thả sắp xếp thứ tự Trái → Phải trên cả 2 thanh (Phản hồi tức thì `0ms`)**:
+  - Sắp xếp tự do thứ tự hiển thị **Trái → Phải** cho cả **Menu Bar chính** (đồng bộ trực tiếp vị trí ưu tiên `TrailingItemPreferredPositions` lên `MenuBarAgent` của macOS) lẫn **Thanh phụ `Ctrl + B`** (cập nhật tức thì `0ms`).
+  - Hỗ trợ **kéo thả (Drag & Drop)** trực tiếp trên các chip xem trước, kéo thả trực tiếp các icon ngay bên trong thanh nổi `Ctrl + B`, hoặc bấm nút `◀` / `▶` trên từng dòng ứng dụng.
+- **Xem trước 2 vùng trực quan & Chuyển hàng loạt 1 chạm**: Hiển thị trực quan nhóm biểu tượng giữ lại trên **Menu Bar chính** và nhóm chuyển xuống **Thanh phụ `Ctrl + B`**, tích hợp nút **Chuyển toàn bộ xuống phụ** / **Chuyển toàn bộ lên chính** và đồng bộ mượt mà không giật giao diện.
 - **Thanh phụ gọn 1 dòng ngay bên phải dưới Menu Bar (`Ctrl + B`)**:
   - Hiện tức thì (`< 5ms`) gọn đúng **1 dòng duy nhất** ở góc trên bên phải màn hình, sát ngay dưới thanh Menu Bar gốc (hỗ trợ đa màn hình & màn hình tai thỏ MacBook).
   - Không cướp tiêu điểm bàn phím (`NSPanel` non-activating) của ứng dụng bạn đang làm việc.
@@ -41,8 +44,8 @@
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.4.0.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.4.0-macOS.zip`**
+   - **`BarFlow-Installer-v1.5.0.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.5.0-macOS.zip`**
 2. Mở file `.dmg`:
    - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:

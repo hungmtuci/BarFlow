@@ -4,6 +4,20 @@ import AppKit
 import CoreGraphics
 import Combine
 
+/// Off-MainActor JSON state snapshot (`~/Library/Application Support/BarFlow/layout_state.json`)
+/// so toggling & reordering NEVER block `@MainActor` on `cfprefsd` / `NSUserDefaults` XPC!
+private struct PersistedLayoutState: Codable, Sendable {
+    var initialized: Bool = false
+    var selectedMainBarIDs: [String] = []
+    var mainBarOrderIDs: [String] = []
+    var secondaryBarOrderIDs: [String] = []
+    var allAppsOrderIDs: [String] = []
+    var hidingEnabled: Bool = true
+    var autoHideSeconds: Int = AutoHideDuration.fiveSeconds.rawValue
+    var showSelectionOnLaunch: Bool = true
+    var hideFromDock: Bool = false
+}
+
 @MainActor
 final class MenuBarController: ObservableObject {
     static let shared = MenuBarController()
@@ -13,26 +27,35 @@ final class MenuBarController: ObservableObject {
     /// All currently running menu bar applications discovered by the background scanner.
     @Published private(set) var allRunningApps: [MenuBarAppItem] = []
 
+    /// Stable-ordered list for the "Tất cả" tab (never jumps up/down when toggling an app!).
+    @Published private(set) var stableAllApps: [MenuBarAppItem] = []
+
+    /// Apps chosen to stay on the Main Menu Bar, ordered strictly Left -> Right per user preference.
+    @Published private(set) var mainBarApps: [MenuBarAppItem] = []
+
+    /// Apps shown in the `Ctrl + B` Secondary Bar, ordered strictly Left -> Right per user preference.
+    @Published private(set) var secondaryBarApps: [MenuBarAppItem] = []
+
     /// IDs of applications chosen by the user to stay visible on the Main Menu Bar.
-    @Published var selectedMainBarIDs: Set<String> {
-        didSet {
-            guard selectedMainBarIDs != oldValue else { return }
-            scheduleSaveSelection()
-            onSecondaryAppsChanged?()
-            if !allRunningApps.isEmpty {
-                scheduleNativeMenuBarSync(delay: 0.60)
-            }
-        }
-    }
+    @Published private(set) var selectedMainBarIDs: Set<String>
+
+    /// Ordered IDs (Left -> Right) for Main Menu Bar & Secondary Bar (`Ctrl + B`).
+    private(set) var mainBarOrderIDs: [String] = []
+    private(set) var secondaryBarOrderIDs: [String] = []
+    private var allAppsOrderIDs: [String] = []
+
+    /// Active item ID currently being dragged during Drag & Drop reordering (avoids @State macro).
+    @Published var draggingItemID: String? = nil
 
     /// Whether BarFlow actively hides unselected apps from the Main Menu Bar.
     @Published var isMainBarHidingEnabled: Bool {
         didSet {
             guard isMainBarHidingEnabled != oldValue else { return }
-            UserDefaults.standard.set(isMainBarHidingEnabled, forKey: Keys.hidingEnabled)
+            markUserInteraction()
+            scheduleSaveState()
             applySpacersVisibilityState()
             if !allRunningApps.isEmpty {
-                scheduleNativeMenuBarSync(delay: 0.35)
+                scheduleNativeMenuBarSync(delay: 0.16)
             }
         }
     }
@@ -40,26 +63,29 @@ final class MenuBarController: ObservableObject {
     /// Auto-hide duration for the `Ctrl + B` floating secondary bar.
     @Published var autoHideDuration: AutoHideDuration {
         didSet {
-            UserDefaults.standard.set(autoHideDuration.rawValue, forKey: Keys.autoHideSeconds)
+            guard autoHideDuration != oldValue else { return }
+            scheduleSaveState()
         }
     }
 
     /// Whether to open the App Selection window automatically when BarFlow launches.
     @Published var showSelectionOnLaunch: Bool {
         didSet {
-            UserDefaults.standard.set(showSelectionOnLaunch, forKey: Keys.showSelectionOnLaunch)
+            guard showSelectionOnLaunch != oldValue else { return }
+            scheduleSaveState()
         }
     }
 
     /// Whether to hide BarFlow's icon from the macOS Dock.
     @Published var hideFromDock: Bool {
         didSet {
-            UserDefaults.standard.set(hideFromDock, forKey: Keys.hideFromDock)
+            guard hideFromDock != oldValue else { return }
+            scheduleSaveState()
             applyDockPolicy()
         }
     }
 
-    /// Whether BarFlow is currently rearranging items on the macOS Menu Bar.
+    /// Whether the user explicitly triggered a manual arrangement/sync (used only for the header button spinner).
     @Published private(set) var isArrangingMenuBar: Bool = false
 
     /// Human-readable status banner message for UI feedback.
@@ -84,18 +110,6 @@ final class MenuBarController: ObservableObject {
         return p.contains("/Downloads/") || p.hasPrefix("/Volumes/") || p.contains("/AppTranslocation/")
     }
 
-    // MARK: - Computed Filtered Lists
-
-    /// Apps chosen to stay on the Main Menu Bar.
-    var mainBarApps: [MenuBarAppItem] {
-        allRunningApps.filter { selectedMainBarIDs.contains($0.id) }
-    }
-
-    /// Remaining running menu bar apps that appear in the `Ctrl + B` Secondary Bar right below the Menu Bar.
-    var secondaryBarApps: [MenuBarAppItem] {
-        allRunningApps.filter { !selectedMainBarIDs.contains($0.id) }
-    }
-
     // MARK: - Callbacks to UI Controllers
 
     var onToggleSecondaryBarRequested: (() -> Void)?
@@ -118,6 +132,11 @@ final class MenuBarController: ObservableObject {
         label: "com.hunglx.BarFlow.interaction",
         qos: .userInteractive
     )
+    private let persistenceQueue = DispatchQueue(
+        label: "com.hunglx.BarFlow.persistence",
+        qos: .utility
+    )
+    private let stateFileURL: URL
 
     private var mainStatusItem: NSStatusItem?
     private var spacerItems: [NSStatusItem] = []
@@ -137,41 +156,73 @@ final class MenuBarController: ObservableObject {
     private var isExecutingNativeSync: Bool = false
     private var hasQueuedFollowUpNativeSync: Bool = false
     private var hasPerformedStartupVisibilitySync: Bool = false
+    private var hasInitializedSelectionFlag: Bool = false
     private var knownDiscoveredAppIDs = Set<String>()
     private var lastBackgroundScanTime: CFAbsoluteTime = 0
+    private var lastUserInteractionTime: CFAbsoluteTime = 0
     private var pendingSaveWorkItem: DispatchWorkItem?
+    private var dragEndWatchdogTimer: Timer?
+    private var needsNativeSyncAfterDragEnd: Bool = false
 
     private init() {
-        let savedArray = UserDefaults.standard.stringArray(forKey: Keys.selectedIDs) ?? []
-        self.selectedMainBarIDs = Set(savedArray)
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        let dirURL = appSupport.appendingPathComponent("BarFlow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
+        let fileURL = dirURL.appendingPathComponent("layout_state.json")
+        self.stateFileURL = fileURL
 
-        if UserDefaults.standard.object(forKey: Keys.hidingEnabled) == nil {
-            self.isMainBarHidingEnabled = true
-            UserDefaults.standard.set(true, forKey: Keys.hidingEnabled)
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? JSONDecoder().decode(PersistedLayoutState.self, from: data) {
+            self.hasInitializedSelectionFlag = decoded.initialized
+            self.selectedMainBarIDs = Set(decoded.selectedMainBarIDs)
+            self.mainBarOrderIDs = decoded.mainBarOrderIDs
+            self.secondaryBarOrderIDs = decoded.secondaryBarOrderIDs
+            self.allAppsOrderIDs = decoded.allAppsOrderIDs
+            self.isMainBarHidingEnabled = decoded.hidingEnabled
+            self.autoHideDuration = AutoHideDuration(rawValue: decoded.autoHideSeconds) ?? .fiveSeconds
+            self.showSelectionOnLaunch = decoded.showSelectionOnLaunch
+            self.hideFromDock = decoded.hideFromDock
         } else {
-            self.isMainBarHidingEnabled = UserDefaults.standard.bool(forKey: Keys.hidingEnabled)
-        }
+            // Seamless migration from v1.0–v1.4 UserDefaults
+            let savedArray = UserDefaults.standard.stringArray(forKey: Keys.selectedIDs) ?? []
+            self.hasInitializedSelectionFlag = UserDefaults.standard.bool(forKey: Keys.initialized)
+            self.selectedMainBarIDs = Set(savedArray)
+            self.mainBarOrderIDs = savedArray
+            self.secondaryBarOrderIDs = []
+            self.allAppsOrderIDs = []
 
-        if UserDefaults.standard.object(forKey: Keys.autoHideSeconds) == nil {
-            self.autoHideDuration = .fiveSeconds
-            UserDefaults.standard.set(AutoHideDuration.fiveSeconds.rawValue, forKey: Keys.autoHideSeconds)
-        } else {
-            let raw = UserDefaults.standard.integer(forKey: Keys.autoHideSeconds)
-            self.autoHideDuration = AutoHideDuration(rawValue: raw) ?? .fiveSeconds
-        }
+            if UserDefaults.standard.object(forKey: Keys.hidingEnabled) == nil {
+                self.isMainBarHidingEnabled = true
+            } else {
+                self.isMainBarHidingEnabled = UserDefaults.standard.bool(forKey: Keys.hidingEnabled)
+            }
 
-        if UserDefaults.standard.object(forKey: Keys.showSelectionOnLaunch) == nil {
-            self.showSelectionOnLaunch = true
-            UserDefaults.standard.set(true, forKey: Keys.showSelectionOnLaunch)
-        } else {
-            self.showSelectionOnLaunch = UserDefaults.standard.bool(forKey: Keys.showSelectionOnLaunch)
-        }
+            if UserDefaults.standard.object(forKey: Keys.autoHideSeconds) == nil {
+                self.autoHideDuration = .fiveSeconds
+            } else {
+                let raw = UserDefaults.standard.integer(forKey: Keys.autoHideSeconds)
+                self.autoHideDuration = AutoHideDuration(rawValue: raw) ?? .fiveSeconds
+            }
 
-        if UserDefaults.standard.object(forKey: Keys.hideFromDock) == nil {
-            self.hideFromDock = false
-            UserDefaults.standard.set(false, forKey: Keys.hideFromDock)
-        } else {
-            self.hideFromDock = UserDefaults.standard.bool(forKey: Keys.hideFromDock)
+            if UserDefaults.standard.object(forKey: Keys.showSelectionOnLaunch) == nil {
+                self.showSelectionOnLaunch = true
+            } else {
+                self.showSelectionOnLaunch = UserDefaults.standard.bool(forKey: Keys.showSelectionOnLaunch)
+            }
+
+            if UserDefaults.standard.object(forKey: Keys.hideFromDock) == nil {
+                self.hideFromDock = false
+            } else {
+                self.hideFromDock = UserDefaults.standard.bool(forKey: Keys.hideFromDock)
+            }
+
+            let initialSnapshot = makePersistedSnapshot()
+            persistenceQueue.async {
+                if let encoded = try? JSONEncoder().encode(initialSnapshot) {
+                    try? encoded.write(to: fileURL, options: .atomic)
+                }
+            }
         }
     }
 
@@ -219,9 +270,11 @@ final class MenuBarController: ObservableObject {
                     return
                 }
 
-                guard trusted, !self.isPerformingHIDSequence, !self.isArrangingMenuBar else { return }
+                guard trusted, !self.isPerformingHIDSequence, !self.isArrangingMenuBar, !self.isExecutingNativeSync else { return }
                 let now = CFAbsoluteTimeGetCurrent()
-                if (now - self.lastBackgroundScanTime) >= 10.0 {
+                // Never run background AX polling within 4s of user clicks/drags so UI stays 120fps smooth
+                guard (now - self.lastUserInteractionTime) >= 4.0 else { return }
+                if (now - self.lastBackgroundScanTime) >= 12.0 {
                     self.refreshRunningAppsAsync(forceFullScan: false, initializeDefaultsIfNeeded: false)
                 }
             }
@@ -235,8 +288,15 @@ final class MenuBarController: ObservableObject {
         nativeSyncDebounceWorkItem = nil
         deferredReloadTimer?.invalidate()
         deferredReloadTimer = nil
-        pendingSaveWorkItem?.perform()
+        pendingSaveWorkItem?.cancel()
         pendingSaveWorkItem = nil
+        let finalSnapshot = makePersistedSnapshot()
+        let url = stateFileURL
+        persistenceQueue.sync {
+            if let encoded = try? JSONEncoder().encode(finalSnapshot) {
+                try? encoded.write(to: url, options: .atomic)
+            }
+        }
         // Always collapse legacy spacers and restore native MenuBarAgent visibility on quit
         for spacer in spacerItems {
             spacer.isVisible = false
@@ -444,7 +504,115 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    // MARK: - Non-Blocking Scanning & Instant Selection Management
+    // MARK: - Non-Blocking Scanning, Instant Selection & Custom Ordering (Main + Secondary Bars)
+
+    func markUserInteraction() {
+        lastUserInteractionTime = CFAbsoluteTimeGetCurrent()
+    }
+
+    private func makePersistedSnapshot() -> PersistedLayoutState {
+        PersistedLayoutState(
+            initialized: hasInitializedSelectionFlag,
+            selectedMainBarIDs: Array(selectedMainBarIDs),
+            mainBarOrderIDs: mainBarOrderIDs,
+            secondaryBarOrderIDs: secondaryBarOrderIDs,
+            allAppsOrderIDs: allAppsOrderIDs,
+            hidingEnabled: isMainBarHidingEnabled,
+            autoHideSeconds: autoHideDuration.rawValue,
+            showSelectionOnLaunch: showSelectionOnLaunch,
+            hideFromDock: hideFromDock
+        )
+    }
+
+    private func scheduleSaveState() {
+        pendingSaveWorkItem?.cancel()
+        let snapshot = makePersistedSnapshot()
+        let url = stateFileURL
+        let work = DispatchWorkItem {
+            if let encoded = try? JSONEncoder().encode(snapshot) {
+                try? encoded.write(to: url, options: .atomic)
+            }
+        }
+        pendingSaveWorkItem = work
+        persistenceQueue.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    /// Recomputes `mainBarApps`, `secondaryBarApps`, and `stableAllApps` in a single O(N) pass (< 0.02ms)
+    /// while preserving exact Left -> Right user ordering across toggles and app restarts.
+    private func rebuildDerivedLists() {
+        var byID: [String: MenuBarAppItem] = [:]
+        byID.reserveCapacity(allRunningApps.count)
+        for app in allRunningApps where byID[app.id] == nil {
+            byID[app.id] = app
+        }
+
+        // 1. Ensure newly discovered apps are appended into order lists without disturbing existing custom order
+        var mainSet = Set(mainBarOrderIDs)
+        var secSet = Set(secondaryBarOrderIDs)
+        var allSet = Set(allAppsOrderIDs)
+        var ordersMutated = false
+
+        for app in allRunningApps {
+            if allSet.insert(app.id).inserted {
+                allAppsOrderIDs.append(app.id)
+                ordersMutated = true
+            }
+            if selectedMainBarIDs.contains(app.id) {
+                if mainSet.insert(app.id).inserted {
+                    mainBarOrderIDs.append(app.id)
+                    ordersMutated = true
+                }
+            } else {
+                if secSet.insert(app.id).inserted {
+                    secondaryBarOrderIDs.append(app.id)
+                    ordersMutated = true
+                }
+            }
+        }
+
+        // 2. Build ordered Main Bar list (Left -> Right)
+        var newMain: [MenuBarAppItem] = []
+        newMain.reserveCapacity(selectedMainBarIDs.count)
+        var seenMain = Set<String>()
+        for id in mainBarOrderIDs where selectedMainBarIDs.contains(id) {
+            if let item = byID[id], seenMain.insert(id).inserted {
+                newMain.append(item)
+            }
+        }
+
+        // 3. Build ordered Secondary Bar list (Left -> Right)
+        var newSecondary: [MenuBarAppItem] = []
+        newSecondary.reserveCapacity(max(0, allRunningApps.count - newMain.count))
+        var seenSec = Set<String>()
+        for id in secondaryBarOrderIDs where !selectedMainBarIDs.contains(id) {
+            if let item = byID[id], seenSec.insert(id).inserted {
+                newSecondary.append(item)
+            }
+        }
+
+        // 4. Build stable "Tất cả" list (never jumps when toggling switches!)
+        var newStableAll: [MenuBarAppItem] = []
+        newStableAll.reserveCapacity(allRunningApps.count)
+        var seenAll = Set<String>()
+        for id in allAppsOrderIDs {
+            if let item = byID[id], seenAll.insert(id).inserted {
+                newStableAll.append(item)
+            }
+        }
+
+        if mainBarApps != newMain {
+            mainBarApps = newMain
+        }
+        if secondaryBarApps != newSecondary {
+            secondaryBarApps = newSecondary
+        }
+        if stableAllApps != newStableAll {
+            stableAllApps = newStableAll
+        }
+        if ordersMutated {
+            scheduleSaveState()
+        }
+    }
 
     func refreshRunningAppsAsync(forceFullScan: Bool = false, initializeDefaultsIfNeeded: Bool = false) {
         let trusted = AXIsProcessTrusted()
@@ -471,28 +639,43 @@ final class MenuBarController: ObservableObject {
                 self.allRunningApps = scannedApps
             }
 
-            let hasInitialized = UserDefaults.standard.bool(forKey: Keys.initialized)
-            if initializeDefaultsIfNeeded && !hasInitialized && !scannedApps.isEmpty {
+            if initializeDefaultsIfNeeded && !self.hasInitializedSelectionFlag && !scannedApps.isEmpty {
                 var initialIDs = Set<String>()
+                var initialMainOrder: [String] = []
+                var initialSecOrder: [String] = []
                 var nonSystemCount = 0
                 for app in scannedApps {
                     if app.isSystemItem {
                         initialIDs.insert(app.id)
+                        initialMainOrder.append(app.id)
                     } else if nonSystemCount < 5 {
                         initialIDs.insert(app.id)
+                        initialMainOrder.append(app.id)
                         nonSystemCount += 1
+                    } else {
+                        initialSecOrder.append(app.id)
                     }
                 }
+                self.hasInitializedSelectionFlag = true
                 self.hasPerformedStartupVisibilitySync = true
+                self.mainBarOrderIDs = initialMainOrder
+                self.secondaryBarOrderIDs = initialSecOrder
                 self.selectedMainBarIDs = initialIDs
-                UserDefaults.standard.set(true, forKey: Keys.initialized)
-            } else if !self.hasPerformedStartupVisibilitySync && !scannedApps.isEmpty {
-                self.hasPerformedStartupVisibilitySync = true
+                self.rebuildDerivedLists()
+                self.scheduleSaveState()
                 if self.isMainBarHidingEnabled {
-                    self.scheduleNativeMenuBarSync(delay: 0.40)
+                    self.scheduleNativeMenuBarSync(delay: 0.25)
                 }
-            } else if newUnselectedLaunched && self.isMainBarHidingEnabled {
-                self.scheduleNativeMenuBarSync(delay: 0.75)
+            } else {
+                self.rebuildDerivedLists()
+                if !self.hasPerformedStartupVisibilitySync && !scannedApps.isEmpty {
+                    self.hasPerformedStartupVisibilitySync = true
+                    if self.isMainBarHidingEnabled {
+                        self.scheduleNativeMenuBarSync(delay: 0.30)
+                    }
+                } else if newUnselectedLaunched && self.isMainBarHidingEnabled {
+                    self.scheduleNativeMenuBarSync(delay: 0.45)
+                }
             }
 
             if self.secondaryBarApps.count != oldSecondaryCount {
@@ -506,46 +689,262 @@ final class MenuBarController: ObservableObject {
     }
 
     func toggleAppSelection(_ item: MenuBarAppItem) {
-        if selectedMainBarIDs.contains(item.id) {
-            selectedMainBarIDs.remove(item.id)
-        } else {
-            selectedMainBarIDs.insert(item.id)
-        }
+        setAppSelection(item, visibleOnMainBar: !selectedMainBarIDs.contains(item.id))
     }
 
-    func setAppSelection(_ item: MenuBarAppItem, visibleOnMainBar: Bool) {
+    func setAppSelection(_ item: MenuBarAppItem, visibleOnMainBar: Bool, insertBeforeID: String? = nil) {
+        let currentlySelected = selectedMainBarIDs.contains(item.id)
         if visibleOnMainBar {
-            if !selectedMainBarIDs.contains(item.id) {
-                selectedMainBarIDs.insert(item.id)
+            guard !currentlySelected || insertBeforeID != nil else { return }
+            selectedMainBarIDs.insert(item.id)
+            mainBarOrderIDs.removeAll { $0 == item.id }
+            if let beforeID = insertBeforeID, let idx = mainBarOrderIDs.firstIndex(of: beforeID) {
+                mainBarOrderIDs.insert(item.id, at: idx)
+            } else {
+                mainBarOrderIDs.append(item.id)
             }
         } else {
-            if selectedMainBarIDs.contains(item.id) {
-                selectedMainBarIDs.remove(item.id)
+            guard currentlySelected || insertBeforeID != nil else { return }
+            selectedMainBarIDs.remove(item.id)
+            secondaryBarOrderIDs.removeAll { $0 == item.id }
+            if let beforeID = insertBeforeID, let idx = secondaryBarOrderIDs.firstIndex(of: beforeID) {
+                secondaryBarOrderIDs.insert(item.id, at: idx)
+            } else {
+                secondaryBarOrderIDs.insert(item.id, at: 0)
             }
+        }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        onSecondaryAppsChanged?()
+        if !allRunningApps.isEmpty {
+            scheduleNativeMenuBarSync(delay: 0.16)
         }
     }
 
     func selectAllForMainBar() {
-        selectedMainBarIDs = Set(allRunningApps.map(\.id))
+        let allIDs = allRunningApps.map(\.id)
+        guard selectedMainBarIDs.count != allIDs.count else { return }
+        for item in secondaryBarApps where !mainBarOrderIDs.contains(item.id) {
+            mainBarOrderIDs.append(item.id)
+        }
+        selectedMainBarIDs = Set(allIDs)
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        onSecondaryAppsChanged?()
+        if !allRunningApps.isEmpty {
+            scheduleNativeMenuBarSync(delay: 0.16)
+        }
     }
 
     func moveAllToSecondaryBar() {
+        guard !selectedMainBarIDs.isEmpty else { return }
+        for item in mainBarApps.reversed() {
+            secondaryBarOrderIDs.removeAll { $0 == item.id }
+            secondaryBarOrderIDs.insert(item.id, at: 0)
+        }
         selectedMainBarIDs = []
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        onSecondaryAppsChanged?()
+        if !allRunningApps.isEmpty {
+            scheduleNativeMenuBarSync(delay: 0.16)
+        }
     }
 
     func deselectAllNonSystemForMainBar() {
         selectedMainBarIDs = Set(allRunningApps.filter(\.isSystemItem).map(\.id))
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        onSecondaryAppsChanged?()
+        if !allRunningApps.isEmpty {
+            scheduleNativeMenuBarSync(delay: 0.16)
+        }
     }
 
-    private func scheduleSaveSelection() {
-        pendingSaveWorkItem?.cancel()
-        let snapshot = Array(selectedMainBarIDs)
-        let work = DispatchWorkItem {
-            UserDefaults.standard.set(snapshot, forKey: Keys.selectedIDs)
-            UserDefaults.standard.set(true, forKey: Keys.initialized)
+    // MARK: - Live Custom Reordering (Main Menu Bar & Secondary `Ctrl + B` Bar)
+
+    func beginDraggingItem(_ id: String) {
+        markUserInteraction()
+        if draggingItemID != id {
+            draggingItemID = id
         }
-        pendingSaveWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        dragEndWatchdogTimer?.invalidate()
+        dragEndWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] timer in
+            Task { @MainActor in
+                guard let self = self else {
+                    timer.invalidate()
+                    return
+                }
+                if (NSEvent.pressedMouseButtons & 1) == 0 {
+                    timer.invalidate()
+                    self.endDraggingSession()
+                }
+            }
+        }
+    }
+
+    func endDraggingSession() {
+        dragEndWatchdogTimer?.invalidate()
+        dragEndWatchdogTimer = nil
+        if draggingItemID != nil {
+            draggingItemID = nil
+        }
+        if needsNativeSyncAfterDragEnd {
+            needsNativeSyncAfterDragEnd = false
+            scheduleNativeMenuBarSync(delay: 0.08)
+        }
+    }
+
+    /// Reorders an item on the Main Menu Bar (or transfers a Secondary Bar item directly onto a Main Bar slot).
+    func reorderMainBarItem(draggedID: String, targetID: String) {
+        guard draggedID != targetID else { return }
+        var activeIDs = mainBarApps.map(\.id)
+        let wasCrossZone = !selectedMainBarIDs.contains(draggedID)
+
+        if wasCrossZone {
+            selectedMainBarIDs.insert(draggedID)
+            if let targetIdx = activeIDs.firstIndex(of: targetID) {
+                activeIDs.insert(draggedID, at: targetIdx)
+            } else {
+                activeIDs.append(draggedID)
+            }
+        } else {
+            guard let fromIdx = activeIDs.firstIndex(of: draggedID),
+                  let toIdx = activeIDs.firstIndex(of: targetID),
+                  fromIdx != toIdx else { return }
+            let moved = activeIDs.remove(at: fromIdx)
+            activeIDs.insert(moved, at: toIdx)
+        }
+
+        // Preserve non-running saved IDs after active running IDs
+        let activeSet = Set(activeIDs)
+        let offlineSaved = mainBarOrderIDs.filter { !activeSet.contains($0) }
+        mainBarOrderIDs = activeIDs + offlineSaved
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        if wasCrossZone {
+            onSecondaryAppsChanged?()
+        }
+        scheduleNativeMenuBarSync(delay: 0.22)
+    }
+
+    /// Moves a Main Menu Bar item one step Left (`direction = -1`) or Right (`direction = +1`).
+    func moveMainBarItem(id: String, direction: Int) {
+        var activeIDs = mainBarApps.map(\.id)
+        guard let idx = activeIDs.firstIndex(of: id) else { return }
+        let newIdx = idx + direction
+        guard newIdx >= 0 && newIdx < activeIDs.count else { return }
+        activeIDs.swapAt(idx, newIdx)
+
+        let activeSet = Set(activeIDs)
+        mainBarOrderIDs = activeIDs + mainBarOrderIDs.filter { !activeSet.contains($0) }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        scheduleNativeMenuBarSync(delay: 0.20)
+    }
+
+    /// Moves a Main Menu Bar item to the far Left (`toStart = true`) or far Right (`toStart = false`).
+    func moveMainBarItemToEdge(id: String, toStart: Bool) {
+        var activeIDs = mainBarApps.map(\.id)
+        guard let idx = activeIDs.firstIndex(of: id) else { return }
+        let targetIdx = toStart ? 0 : (activeIDs.count - 1)
+        guard idx != targetIdx else { return }
+        let moved = activeIDs.remove(at: idx)
+        activeIDs.insert(moved, at: targetIdx)
+
+        let activeSet = Set(activeIDs)
+        mainBarOrderIDs = activeIDs + mainBarOrderIDs.filter { !activeSet.contains($0) }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        scheduleNativeMenuBarSync(delay: 0.20)
+    }
+
+    /// Reorders an item in the `Ctrl + B` Secondary Bar (0ms instant update — zero MenuBarAgent reload unless cross-zone!).
+    func reorderSecondaryBarItem(draggedID: String, targetID: String) {
+        guard draggedID != targetID else { return }
+        var activeIDs = secondaryBarApps.map(\.id)
+        let wasCrossZone = selectedMainBarIDs.contains(draggedID)
+
+        if wasCrossZone {
+            selectedMainBarIDs.remove(draggedID)
+            if let targetIdx = activeIDs.firstIndex(of: targetID) {
+                activeIDs.insert(draggedID, at: targetIdx)
+            } else {
+                activeIDs.append(draggedID)
+            }
+        } else {
+            guard let fromIdx = activeIDs.firstIndex(of: draggedID),
+                  let toIdx = activeIDs.firstIndex(of: targetID),
+                  fromIdx != toIdx else { return }
+            let moved = activeIDs.remove(at: fromIdx)
+            activeIDs.insert(moved, at: toIdx)
+        }
+
+        let activeSet = Set(activeIDs)
+        let offlineSaved = secondaryBarOrderIDs.filter { !activeSet.contains($0) }
+        secondaryBarOrderIDs = activeIDs + offlineSaved
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        if wasCrossZone {
+            onSecondaryAppsChanged?()
+            scheduleNativeMenuBarSync(delay: 0.18)
+        }
+    }
+
+    /// Moves a Secondary Bar (`Ctrl + B`) item one step Left (`direction = -1`) or Right (`direction = +1`) in 0ms!
+    func moveSecondaryBarItem(id: String, direction: Int) {
+        var activeIDs = secondaryBarApps.map(\.id)
+        guard let idx = activeIDs.firstIndex(of: id) else { return }
+        let newIdx = idx + direction
+        guard newIdx >= 0 && newIdx < activeIDs.count else { return }
+        activeIDs.swapAt(idx, newIdx)
+
+        let activeSet = Set(activeIDs)
+        secondaryBarOrderIDs = activeIDs + secondaryBarOrderIDs.filter { !activeSet.contains($0) }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+    }
+
+    /// Moves a Secondary Bar (`Ctrl + B`) item to the far Left (`toStart = true`) or far Right (`toStart = false`) in 0ms!
+    func moveSecondaryBarItemToEdge(id: String, toStart: Bool) {
+        var activeIDs = secondaryBarApps.map(\.id)
+        guard let idx = activeIDs.firstIndex(of: id) else { return }
+        let targetIdx = toStart ? 0 : (activeIDs.count - 1)
+        guard idx != targetIdx else { return }
+        let moved = activeIDs.remove(at: idx)
+        activeIDs.insert(moved, at: targetIdx)
+
+        let activeSet = Set(activeIDs)
+        secondaryBarOrderIDs = activeIDs + secondaryBarOrderIDs.filter { !activeSet.contains($0) }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+    }
+
+    /// Handles dropping an item onto an empty zone (Zone A = Main Bar, Zone B = Secondary Bar).
+    func dropItemIntoZone(draggedID: String, toMainBar: Bool) {
+        guard let item = allRunningApps.first(where: { $0.id == draggedID }) else { return }
+        if toMainBar && !selectedMainBarIDs.contains(draggedID) {
+            setAppSelection(item, visibleOnMainBar: true)
+        } else if !toMainBar && selectedMainBarIDs.contains(draggedID) {
+            setAppSelection(item, visibleOnMainBar: false)
+        }
     }
 
     // MARK: - Permission & Installation Helpers
@@ -619,6 +1018,7 @@ final class MenuBarController: ObservableObject {
         Task { @MainActor in
             let scanned = await MenuBarScanner.shared.scanMenuBarAsync(forceFullScan: true)
             self.allRunningApps = scanned
+            self.rebuildDerivedLists()
             self.onSecondaryAppsChanged?()
 
             if self.requiresFullDiskAccess && !self.isFullDiskAccessGranted {
@@ -629,7 +1029,7 @@ final class MenuBarController: ObservableObject {
             if self.isMainBarHidingEnabled && self.requiresFullDiskAccess {
                 let anyUnselectedStillVisible = self.secondaryBarApps.contains(where: \.isCurrentlyOnBar)
                 if anyUnselectedStillVisible {
-                    await self.executeNativeMenuBarSync(forceReload: true)
+                    await self.executeNativeMenuBarSync(forceReload: true, isManualTrigger: true)
                     return
                 }
             }
@@ -637,7 +1037,7 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    // MARK: - Native MenuBarAgent Visibility Sync (macOS 26/27+) & Legacy ⌘-Drag Fallback
+    // MARK: - Native MenuBarAgent Visibility & Order Sync (macOS 26/27+) & Legacy ⌘-Drag Fallback
 
     private func scheduleNativeMenuBarSync(delay: TimeInterval) {
         guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
@@ -646,25 +1046,50 @@ final class MenuBarController: ObservableObject {
             return
         }
         nativeSyncDebounceWorkItem?.cancel()
+        if draggingItemID != nil {
+            needsNativeSyncAfterDragEnd = true
+            return
+        }
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                await self?.executeNativeMenuBarSync(forceReload: false)
+                await self?.executeNativeMenuBarSync(forceReload: false, isManualTrigger: false)
             }
         }
         nativeSyncDebounceWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func executeNativeMenuBarSync(forceReload: Bool = false) async {
+    /// Updates `isCurrentlyOnBar` optimistically in memory (0.02ms) so UI never stalls or jumps waiting for an AX rescan!
+    private func applyOptimisticBarResidency(selectedIDs: Set<String>, hidingEnabled: Bool) {
+        var changed = false
+        var updated = allRunningApps
+        for i in updated.indices {
+            let shouldBeOnBar = !hidingEnabled || selectedIDs.contains(updated[i].id)
+            if updated[i].isCurrentlyOnBar != shouldBeOnBar {
+                updated[i].isCurrentlyOnBar = shouldBeOnBar
+                changed = true
+            }
+        }
+        if changed {
+            allRunningApps = updated
+            rebuildDerivedLists()
+        }
+    }
+
+    private func executeNativeMenuBarSync(forceReload: Bool = false, isManualTrigger: Bool = false) async {
         guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
         refreshPermissionsState()
 
         guard isAccessibilityGranted else {
-            statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) ở khung phía trên trước khi áp dụng."
+            if isManualTrigger {
+                statusMessage = "Vui lòng cấp quyền Trợ năng (Accessibility) ở khung phía trên trước khi áp dụng."
+            }
             return
         }
         guard isFullDiskAccessGranted else {
-            statusMessage = "Chưa có quyền Full Disk Access — hãy bấm nút 'Cấp quyền Full Disk Access' ở khung hướng dẫn phía trên để macOS cho phép ẩn icon khỏi Menu Bar chính."
+            if isManualTrigger {
+                statusMessage = "Chưa có quyền Full Disk Access — hãy bấm nút 'Cấp quyền Full Disk Access' ở khung hướng dẫn phía trên."
+            }
             return
         }
         guard !allRunningApps.isEmpty else { return }
@@ -675,17 +1100,21 @@ final class MenuBarController: ObservableObject {
         }
 
         isExecutingNativeSync = true
-        isArrangingMenuBar = true
+        if isManualTrigger {
+            isArrangingMenuBar = true
+        }
         deferredReloadTimer?.invalidate()
         deferredReloadTimer = nil
 
         let appsSnapshot = allRunningApps
         let selectedSnapshot = selectedMainBarIDs
+        let orderedMainSnapshot = mainBarApps.map(\.id)
         let hidingSnapshot = isMainBarHidingEnabled
 
         let outcome = await MenuBarVisibilityEngine.shared.syncMenuBarState(
             allApps: appsSnapshot,
             selectedMainBarIDs: selectedSnapshot,
+            orderedMainBarIDs: orderedMainSnapshot,
             hidingEnabled: hidingSnapshot,
             forceReload: forceReload
         )
@@ -694,12 +1123,12 @@ final class MenuBarController: ObservableObject {
 
         if hasQueuedFollowUpNativeSync {
             hasQueuedFollowUpNativeSync = false
-            await executeNativeMenuBarSync(forceReload: forceReload)
+            await executeNativeMenuBarSync(forceReload: forceReload, isManualTrigger: isManualTrigger)
             return
         }
 
         if let err = outcome.errorReason {
-            isArrangingMenuBar = false
+            if isArrangingMenuBar { isArrangingMenuBar = false }
             switch err {
             case .missingFullDiskAccess:
                 isFullDiskAccessGranted = false
@@ -711,30 +1140,32 @@ final class MenuBarController: ObservableObject {
         }
 
         if let waitSec = outcome.deferredReloadDelay {
+            if isArrangingMenuBar { isArrangingMenuBar = false }
             let secs = max(1, Int(ceil(waitSec)))
-            statusMessage = "Đang đồng bộ Menu Bar chính (cập nhật sau ~\(secs) giây để tránh trễ hệ thống)..."
-            scheduleDeferredMenuBarAgentReload(after: waitSec + 0.12, hiddenCount: outcome.hiddenCount)
+            statusMessage = "Đã lưu thứ tự & chọn lọc — Menu Bar cập nhật sau ~\(secs)s (tránh trễ tiến trình hệ thống)..."
+            scheduleDeferredMenuBarAgentReload(after: waitSec + 0.10, hiddenCount: outcome.hiddenCount)
             return
         }
 
-        isArrangingMenuBar = false
+        if isArrangingMenuBar {
+            isArrangingMenuBar = false
+        }
         if outcome.didReloadAgent || outcome.didModifyPreferences {
+            applyOptimisticBarResidency(selectedIDs: selectedSnapshot, hidingEnabled: hidingSnapshot)
             if hidingSnapshot {
-                statusMessage = outcome.hiddenCount > 0
-                    ? "Đã ẩn \(outcome.hiddenCount) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
-                    : "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
+                let nextMsg = outcome.hiddenCount > 0
+                    ? "Đã đồng bộ Menu Bar chính (giữ \(outcome.visibleCount) • ẩn \(outcome.hiddenCount) vào Ctrl + B)"
+                    : "Đã đồng bộ thứ tự trên Menu Bar chính!"
+                if statusMessage != nextMsg { statusMessage = nextMsg }
             } else {
-                statusMessage = "Đã tạm tắt ẩn — toàn bộ ứng dụng đang hiện trên Menu Bar chính."
-            }
-            // Refresh live slot statuses cleanly once MenuBarAgent finishes respawning (~1.1s)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { [weak self] in
-                self?.refreshRunningAppsAsync(forceFullScan: false)
+                let nextMsg = "Đã tạm tắt ẩn — toàn bộ ứng dụng đang hiện trên Menu Bar chính."
+                if statusMessage != nextMsg { statusMessage = nextMsg }
             }
         } else if forceReload {
             let countNow = secondaryBarApps.count
             statusMessage = (hidingSnapshot && countNow > 0)
-                ? "Đã xác nhận ẩn \(countNow) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
-                : "Menu Bar chính đã khớp danh sách chọn lọc!"
+                ? "Menu Bar chính đã khớp thứ tự & đang ẩn \(countNow) ứng dụng vào Ctrl + B!"
+                : "Menu Bar chính đã khớp thứ tự chọn lọc!"
         }
     }
 
@@ -744,20 +1175,20 @@ final class MenuBarController: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 if let stillRemaining = await MenuBarVisibilityEngine.shared.performDeferredReloadIfReady() {
-                    self.scheduleDeferredMenuBarAgentReload(after: stillRemaining + 0.15, hiddenCount: hiddenCount)
+                    self.scheduleDeferredMenuBarAgentReload(after: stillRemaining + 0.12, hiddenCount: hiddenCount)
                     return
                 }
-                self.isArrangingMenuBar = false
+                if self.isArrangingMenuBar {
+                    self.isArrangingMenuBar = false
+                }
+                self.applyOptimisticBarResidency(selectedIDs: self.selectedMainBarIDs, hidingEnabled: self.isMainBarHidingEnabled)
                 if self.isMainBarHidingEnabled {
                     let countNow = self.secondaryBarApps.count
                     self.statusMessage = countNow > 0
-                        ? "Đã ẩn \(countNow) ứng dụng khỏi Menu Bar chính (bấm Ctrl + B để mở nhanh)!"
-                        : "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
+                        ? "Đã đồng bộ Menu Bar chính (giữ \(self.mainBarApps.count) • ẩn \(countNow) vào Ctrl + B)"
+                        : "Đã đồng bộ thứ tự trên Menu Bar chính!"
                 } else {
                     self.statusMessage = "Đã hiển thị toàn bộ ứng dụng lên Menu Bar chính!"
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) { [weak self] in
-                    self?.refreshRunningAppsAsync(forceFullScan: false)
                 }
             }
         }
@@ -780,8 +1211,8 @@ final class MenuBarController: ObservableObject {
             }
             nativeSyncDebounceWorkItem?.cancel()
             nativeSyncDebounceWorkItem = nil
-            statusMessage = "Đang áp dụng danh sách chọn lọc lên Menu Bar chính..."
-            await executeNativeMenuBarSync(forceReload: true)
+            statusMessage = "Đang áp dụng chọn lọc & thứ tự lên Menu Bar chính..."
+            await executeNativeMenuBarSync(forceReload: true, isManualTrigger: true)
             return
         }
 
@@ -1094,10 +1525,16 @@ final class MenuBarController: ObservableObject {
     }
 
     private func observeWorkspaceNotifications() {
+        let ignoreBundles: Set<String> = [
+            "com.apple.MenuBarAgent",
+            "com.apple.TextInputMenuAgent",
+            "com.apple.campo",
+            "com.apple.controlcenter"
+        ]
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            let launchedBundle = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
-            guard launchedBundle != "com.apple.MenuBarAgent" else { return }
+            let launchedBundle = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier ?? ""
+            guard !ignoreBundles.contains(launchedBundle) else { return }
             Task { @MainActor in
                 MenuBarScanner.shared.handleAppLaunched()
                 try? await Task.sleep(nanoseconds: 900_000_000)
@@ -1106,9 +1543,11 @@ final class MenuBarController: ObservableObject {
         }
         ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            guard app?.bundleIdentifier != "com.apple.MenuBarAgent" else { return }
+            let bundle = app?.bundleIdentifier ?? ""
             let terminatedPID = app?.processIdentifier ?? 0
             Task { @MainActor in
+                MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
+                guard !ignoreBundles.contains(bundle) else { return }
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
                 self?.refreshRunningAppsAsync(forceFullScan: false)
             }

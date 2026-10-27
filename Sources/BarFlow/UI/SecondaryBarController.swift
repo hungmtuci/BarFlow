@@ -25,6 +25,7 @@ final class SecondaryBarController: ObservableObject {
     private var outsideClickMonitor: Any?
     private var localRightClickMonitor: Any?
     private var lastInteractionDate: Date = Date()
+    private var lastWarmScanTimestamp: CFAbsoluteTime = 0
 
     /// Layout constants matching `SecondaryBarView` single-row metrics
     static let panelHeight: CGFloat = 38.0
@@ -93,8 +94,12 @@ final class SecondaryBarController: ObservableObject {
         startAutoHideMonitoring()
         installOutsideClickMonitor()
 
-        // Non-blocking warm background refresh AFTER the bar is already visible on screen
-        MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false)
+        // Non-blocking warm background refresh at most once every 8s AFTER the bar is already visible on screen
+        let now = CFAbsoluteTimeGetCurrent()
+        if (now - lastWarmScanTimestamp) >= 8.0 {
+            lastWarmScanTimestamp = now
+            MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false)
+        }
     }
 
     func hide() {
@@ -172,8 +177,9 @@ final class SecondaryBarController: ObservableObject {
                     return
                 }
 
-                // Pause & reset timer whenever cursor hovers inside the bar
-                if let p = self.panel, NSMouseInRect(NSEvent.mouseLocation, p.frame.insetBy(dx: -3, dy: -3), false) {
+                // Pause & reset timer whenever cursor hovers inside the bar OR while dragging to reorder icons
+                if MenuBarController.shared.draggingItemID != nil ||
+                   (self.panel != nil && NSMouseInRect(NSEvent.mouseLocation, self.panel!.frame.insetBy(dx: -4, dy: -4), false)) {
                     self.lastInteractionDate = Date()
                     if self.countdown.progress != 1.0 {
                         self.countdown.progress = 1.0

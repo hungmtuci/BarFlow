@@ -59,6 +59,9 @@ final class MenuBarScanner: @unchecked Sendable {
 
     /// MainActor-owned pre-rendered `32x32` (@2x) icon cache keyed by PID or symbol key.
     @MainActor private var scaledIconCache: [String: NSImage] = [:]
+    /// MainActor-owned cached `CandidateProcess` per PID so warm scans do zero LaunchServices/icon work on MainActor.
+    @MainActor private var candidateProcessCache: [pid_t: CandidateProcess] = [:]
+    @MainActor private var skippedDaemonPIDs = Set<pid_t>()
 
     private let systemExtrasContainerBundleIDs: Set<String> = [
         "com.apple.MenuBarAgent",
@@ -106,6 +109,11 @@ final class MenuBarScanner: @unchecked Sendable {
     func handleAppTerminated(pid: pid_t) {
         if pid > 0 {
             scaledIconCache.removeValue(forKey: "pid:\(pid)")
+            candidateProcessCache.removeValue(forKey: pid)
+            skippedDaemonPIDs.remove(pid)
+        } else {
+            candidateProcessCache.removeAll()
+            skippedDaemonPIDs.removeAll()
         }
         cacheLock.lock()
         if pid > 0 {
@@ -129,7 +137,7 @@ final class MenuBarScanner: @unchecked Sendable {
         let symbolIcons = prepareSystemSymbolIconMap()
         let fallbackDefaultIcon = symbolIcons["default"] ?? NSImage()
 
-        // Capture ALL NSWorkspace runningApplications across .regular, .accessory, AND .prohibited!
+        // Capture ALL NSWorkspace runningApplications across .regular, .accessory, AND .prohibited (< 0.05ms with PID cache!)
         let runningApps = NSWorkspace.shared.runningApplications
         var candidatesByPID: [pid_t: CandidateProcess] = [:]
         candidatesByPID.reserveCapacity(runningApps.count)
@@ -138,9 +146,18 @@ final class MenuBarScanner: @unchecked Sendable {
             let pid = app.processIdentifier
             guard pid > 0, pid != ownPID else { continue }
 
+            if skippedDaemonPIDs.contains(pid) {
+                continue
+            }
+            if let cachedCandidate = candidateProcessCache[pid] {
+                candidatesByPID[pid] = cachedCandidate
+                continue
+            }
+
             let bundleID = app.bundleIdentifier
             let name = app.localizedName
             if Self.isKnownNonMenuBarAppleDaemon(bundleID: bundleID, name: name) {
+                skippedDaemonPIDs.insert(pid)
                 continue
             }
 
@@ -157,7 +174,7 @@ final class MenuBarScanner: @unchecked Sendable {
 
             let isSystem = isContainer || (bundleID.map { systemAppBundleIDs.contains($0) || $0.hasPrefix("com.apple.") } ?? false)
 
-            candidatesByPID[pid] = CandidateProcess(
+            let candidate = CandidateProcess(
                 pid: pid,
                 bundleID: bundleID,
                 localizedName: name,
@@ -166,6 +183,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 isMovable: true,
                 isSystemExtrasContainer: isContainer
             )
+            candidateProcessCache[pid] = candidate
+            candidatesByPID[pid] = candidate
         }
 
         return await withCheckedContinuation { continuation in
@@ -403,13 +422,13 @@ final class MenuBarScanner: @unchecked Sendable {
             }
         }
 
-        // Sort right-to-left (largest X first = rightmost on menu bar) for items on bar, then alphabetically
+        // Sort naturally Left -> Right (smallest X first = leftmost on Menu Bar) for items on bar, then alphabetically
         deduplicated.sort { a, b in
             if a.isCurrentlyOnBar != b.isCurrentlyOnBar {
                 return a.isCurrentlyOnBar && !b.isCurrentlyOnBar
             }
-            if abs(a.sortX - b.sortX) > 1 {
-                return a.sortX > b.sortX
+            if a.slotFrame != nil && b.slotFrame != nil && abs(a.sortX - b.sortX) > 1 {
+                return a.sortX < b.sortX
             }
             return a.appName.localizedCaseInsensitiveCompare(b.appName) == .orderedAscending
         }

@@ -48,6 +48,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     private let engineQueue = DispatchQueue(label: "com.hunglx.BarFlow.visibilityEngine", qos: .userInitiated)
     private let stateLock = NSLock()
+    @MainActor private var rawProcessCache: [pid_t: RawProcessSnapshot] = [:]
+    private var outerBundleIDCache: [String: String] = [:]
 
     private enum Keys {
         static let managedTrackedKeys = "BarFlow.ManagedHiddenTrackedLocationKeys"
@@ -153,11 +155,21 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         let errorReason: SyncErrorReason?
     }
 
-    /// Writes updated `trackedApplications`, system module flags, and `TrailingItemPreferredPositions` for `BarFlow`
+    @MainActor
+    func invalidateProcessCache(pid: pid_t) {
+        if pid > 0 {
+            rawProcessCache.removeValue(forKey: pid)
+        } else {
+            rawProcessCache.removeAll()
+        }
+    }
+
+    /// Writes updated `trackedApplications`, system module flags, and `TrailingItemPreferredPositions` (Left -> Right custom order)
     /// and reloads `MenuBarAgent` if needed (respecting `launchd` 10.4s uptime to prevent throttling).
     func syncMenuBarState(
         allApps: [MenuBarAppItem],
         selectedMainBarIDs: Set<String>,
+        orderedMainBarIDs: [String] = [],
         hidingEnabled: Bool,
         forceReload: Bool = false
     ) async -> SyncOutcome {
@@ -185,16 +197,19 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             )
         }
 
-        // Capture running process bundle/executable metadata on MainActor cleanly
-        let processMeta = await MainActor.run {
-            captureRunningProcessMetadata()
+        let neededPIDs = Set(allApps.map(\.pid).filter { $0 > 0 })
+        // Lightweight O(K) in-memory snapshot on MainActor (< 0.03ms, ZERO disk Info.plist reads!)
+        let rawSnapshots = await MainActor.run {
+            captureRawProcessSnapshots(for: neededPIDs)
         }
 
         return await withCheckedContinuation { continuation in
             engineQueue.async {
+                let processMeta = self.resolveProcessIdentitiesOnQueue(from: rawSnapshots)
                 let outcome = self.performSyncOnQueue(
                     allApps: allApps,
                     selectedMainBarIDs: selectedMainBarIDs,
+                    orderedMainBarIDs: orderedMainBarIDs,
                     hidingEnabled: hidingEnabled,
                     processMeta: processMeta,
                     allowImmediateReload: true,
@@ -324,34 +339,84 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     // MARK: - Core Disk Synchronization Logic
 
+    private struct RawProcessSnapshot: Sendable {
+        let pid: pid_t
+        let bundleID: String?
+        let bundleOrExecPath: String?
+        let executableName: String?
+        let executableURLString: String?
+    }
+
     private struct ProcessIdentity: Sendable {
         let pid: pid_t
         let bundleID: String?
         let outerAppBundleID: String?
+        let executableName: String?
         let executableURLString: String?
     }
 
     @MainActor
-    private func captureRunningProcessMetadata() -> [pid_t: ProcessIdentity] {
-        var map: [pid_t: ProcessIdentity] = [:]
+    private func captureRawProcessSnapshots(for neededPIDs: Set<pid_t>) -> [pid_t: RawProcessSnapshot] {
+        guard !neededPIDs.isEmpty else { return [:] }
+        var map: [pid_t: RawProcessSnapshot] = [:]
+        map.reserveCapacity(neededPIDs.count)
+
+        var missingPIDs = Set<pid_t>()
+        for pid in neededPIDs {
+            if let cached = rawProcessCache[pid] {
+                map[pid] = cached
+            } else {
+                missingPIDs.insert(pid)
+            }
+        }
+        guard !missingPIDs.isEmpty else { return map }
+
         for app in NSWorkspace.shared.runningApplications {
             let pid = app.processIdentifier
-            guard pid > 0 else { continue }
-            let bundleID = app.bundleIdentifier
-            let execStr = app.executableURL?.absoluteString
-            let outerBundleID = Self.resolveOuterAppBundleID(from: app.bundleURL ?? app.executableURL)
+            guard missingPIDs.contains(pid) else { continue }
+            let execURL = app.executableURL
+            let snap = RawProcessSnapshot(
+                pid: pid,
+                bundleID: app.bundleIdentifier,
+                bundleOrExecPath: (app.bundleURL ?? execURL)?.path,
+                executableName: execURL?.lastPathComponent ?? app.localizedName,
+                executableURLString: execURL?.absoluteString
+            )
+            rawProcessCache[pid] = snap
+            map[pid] = snap
+        }
+        return map
+    }
+
+    private func resolveProcessIdentitiesOnQueue(from snapshots: [pid_t: RawProcessSnapshot]) -> [pid_t: ProcessIdentity] {
+        var map: [pid_t: ProcessIdentity] = [:]
+        map.reserveCapacity(snapshots.count)
+        for (pid, snap) in snapshots {
+            let outerBundleID: String?
+            if let path = snap.bundleOrExecPath {
+                if let cached = outerBundleIDCache[path] {
+                    outerBundleID = cached.isEmpty ? nil : cached
+                } else {
+                    let resolved = Self.resolveOuterAppBundleID(fromPath: path)
+                    outerBundleIDCache[path] = resolved ?? ""
+                    outerBundleID = resolved
+                }
+            } else {
+                outerBundleID = nil
+            }
             map[pid] = ProcessIdentity(
                 pid: pid,
-                bundleID: bundleID,
+                bundleID: snap.bundleID,
                 outerAppBundleID: outerBundleID,
-                executableURLString: execStr
+                executableName: snap.executableName,
+                executableURLString: snap.executableURLString
             )
         }
         return map
     }
 
-    private static func resolveOuterAppBundleID(from url: URL?) -> String? {
-        guard let path = url?.path, let firstAppRange = path.range(of: ".app/") ?? (path.hasSuffix(".app") ? path.range(of: ".app") : nil) else {
+    private static func resolveOuterAppBundleID(fromPath path: String) -> String? {
+        guard let firstAppRange = path.range(of: ".app/") ?? (path.hasSuffix(".app") ? path.range(of: ".app") : nil) else {
             return nil
         }
         let rootAppPath: String
@@ -370,6 +435,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     private func performSyncOnQueue(
         allApps: [MenuBarAppItem],
         selectedMainBarIDs: Set<String>,
+        orderedMainBarIDs: [String],
         hidingEnabled: Bool,
         processMeta: [pid_t: ProcessIdentity],
         allowImmediateReload: Bool,
@@ -390,7 +456,22 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             ? selectedMainBarIDs
             : Set(allApps.map(\.id))
 
-        let visibleItems = allApps.filter { effectiveSelectedIDs.contains($0.id) }
+        let rawVisibleItems = allApps.filter { effectiveSelectedIDs.contains($0.id) }
+        let visibleItems: [MenuBarAppItem]
+        if !orderedMainBarIDs.isEmpty {
+            var rankByID: [String: Int] = [:]
+            for (idx, id) in orderedMainBarIDs.enumerated() where rankByID[id] == nil {
+                rankByID[id] = idx
+            }
+            visibleItems = rawVisibleItems.enumerated().sorted { lhs, rhs in
+                let rL = rankByID[lhs.element.id] ?? (10_000 + lhs.offset)
+                let rR = rankByID[rhs.element.id] ?? (10_000 + rhs.offset)
+                return rL < rR
+            }.map(\.element)
+        } else {
+            visibleItems = rawVisibleItems
+        }
+
         let hiddenItems = hidingEnabled ? allApps.filter { !effectiveSelectedIDs.contains($0.id) } : []
 
         // Check whether any hidden app is STILL physically hosted on the Main Menu Bar right now
@@ -1025,7 +1106,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         return didChange
     }
 
-    // MARK: - 3. `com.apple.MenuBar.plist` (`TrailingItemPreferredPositions` — Top-Right Placement!)
+    // MARK: - 3. `com.apple.MenuBar.plist` (`TrailingItemPreferredPositions` — Exact Left -> Right Ordering!)
 
     private func updateMenuBarPreferredPositions(
         visibleItems: [MenuBarAppItem],
@@ -1051,32 +1132,59 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             didChange = true
         }
 
-        // Keep Clock (0) and Control Center (116) anchored at far right, place selected apps at 136+,
-        // and place BarFlow `•••` right next to the selected apps at the top-right (never stranded left of the notch!)
-        var nextPos: Double = 136.0
-        for item in visibleItems {
-            if let bid = item.bundleIdentifier ?? processMeta[item.pid]?.bundleID {
-                let candidatePrefix = "status:\(bid)::"
-                let matchingKeys = trailing.keys.filter { $0.hasPrefix(candidatePrefix) }.sorted()
-                for mk in matchingKeys {
-                    let oldVal = (trailing[mk] as? NSNumber)?.doubleValue ?? -1
-                    if abs(oldVal - nextPos) > 8 {
-                        trailing[mk] = Int(nextPos)
-                        didChange = true
+        // Anchor Clock (0), Control Center (116), and BarFlow `•••` (136) cleanly at the far right of the Menu Bar.
+        let targetBarFlowPos = 136
+        for bfKey in ["status:BarFlow::BarFlow.MainToggle", "status:com.hunglx.BarFlow::BarFlow.MainToggle"] {
+            let currentBF = (trailing[bfKey] as? NSNumber)?.intValue ?? -1
+            if abs(currentBF - targetBarFlowPos) >= 4 {
+                trailing[bfKey] = targetBarFlowPos
+                didChange = true
+            }
+        }
+
+        // `TrailingItemPreferredPositions` measures distance in points FROM THE RIGHT EDGE of the screen:
+        // Larger value = further LEFT on the Menu Bar!
+        // Since `visibleItems` is ordered Left -> Right (`[leftmost, ..., rightmost]`), we iterate `visibleItems.reversed()`
+        // starting at 176 (immediately left of BarFlow at 136) and stepping +38pt per slot!
+        let existingKeys = Array(trailing.keys)
+        var assignedKeys = Set<String>()
+        var nextPos: Double = 176.0
+        var ccDomainTouched = false
+        let ccDomain = "com.apple.controlcenter" as CFString
+
+        for item in visibleItems.reversed() {
+            let (slotKeys, ccModuleKeys) = resolvePreferredPositionKeys(
+                for: item,
+                processMeta: processMeta,
+                existingTrailingKeys: existingKeys
+            )
+            var placedAny = false
+            for key in slotKeys where !assignedKeys.contains(key) {
+                assignedKeys.insert(key)
+                let oldVal = (trailing[key] as? NSNumber)?.doubleValue ?? -9999
+                if abs(oldVal - nextPos) >= 2.0 {
+                    trailing[key] = Int(nextPos)
+                    didChange = true
+                }
+                placedAny = true
+                nextPos += 38.0
+            }
+
+            if placedAny && !ccModuleKeys.isEmpty {
+                let modulePos = Int(nextPos - 38.0)
+                for modKey in ccModuleKeys {
+                    let prefKey = "NSStatusItem Preferred Position \(modKey)" as CFString
+                    if let existingCCPos = (CFPreferencesCopyValue(prefKey, ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? NSNumber)?.intValue,
+                       abs(existingCCPos - modulePos) >= 4 {
+                        CFPreferencesSetValue(prefKey, modulePos as CFNumber, ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+                        ccDomainTouched = true
                     }
-                    nextPos += 38.0
                 }
             }
         }
 
-        let targetBarFlowPos = Int(max(130.0, nextPos))
-        for bfKey in ["status:BarFlow::BarFlow.MainToggle", "status:com.hunglx.BarFlow::BarFlow.MainToggle"] {
-            let currentBF = (trailing[bfKey] as? NSNumber)?.intValue ?? -1
-            // Only rewrite if BarFlow was stranded far left (> target + 120) or missing
-            if currentBF < 120 || currentBF > targetBarFlowPos + 120 {
-                trailing[bfKey] = targetBarFlowPos
-                didChange = true
-            }
+        if ccDomainTouched {
+            CFPreferencesSynchronize(ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
         }
 
         if didChange {
@@ -1087,6 +1195,71 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         }
 
         return didChange
+    }
+
+    private func resolvePreferredPositionKeys(
+        for item: MenuBarAppItem,
+        processMeta: [pid_t: ProcessIdentity],
+        existingTrailingKeys: [String]
+    ) -> (trailingKeys: [String], ccModuleKeys: [String]) {
+        if isSpotlightItem(item) {
+            return (["status:com.apple.campo::Item-0"], [])
+        }
+        if isSiriOnlyItem(item) {
+            return (["status:com.apple.Siri::Item-0"], [])
+        }
+        if isInputMenuItem(item) {
+            return (["status:com.apple.TextInputMenuAgent::Item-0"], [])
+        }
+        if let sysMapping = mappingForSystemItem(item), !sysMapping.byHostKeys.isEmpty {
+            let modKeys = sysMapping.byHostKeys.map { "module:\($0)" }
+            return (modKeys, sysMapping.byHostKeys)
+        }
+
+        // Third-party app or standalone status binary
+        let meta = processMeta[item.pid]
+        var candidateOwners: [String] = []
+        for raw in [item.bundleIdentifier, meta?.bundleID, meta?.outerAppBundleID, meta?.executableName] {
+            if let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                if !candidateOwners.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+                    candidateOwners.append(trimmed)
+                }
+            }
+        }
+
+        guard !candidateOwners.isEmpty else { return ([], []) }
+
+        let lowerPrefixes = candidateOwners.map { "status:\($0.lowercased())::" }
+        var matched = existingTrailingKeys.filter { existing in
+            let lower = existing.lowercased()
+            return lowerPrefixes.contains(where: { lower.hasPrefix($0) })
+        }.sorted()
+
+        // If a multi-icon app exposes a specific axIdentifier matching one of its keys, prioritize that key
+        if matched.count > 1,
+           let axID = item.axIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !axID.isEmpty {
+            let specific = matched.filter { $0.lowercased().hasSuffix("::\(axID.lowercased())") }
+            if !specific.isEmpty {
+                matched = specific
+            }
+        }
+
+        if !matched.isEmpty {
+            return (matched, [])
+        }
+
+        // Brand-new app never dragged before: synthesize its canonical TrailingItemPreferredPositions key
+        let primaryOwner = candidateOwners[0]
+        let suffix: String
+        if let axID = item.axIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !axID.isEmpty,
+           !axID.contains(" ") {
+            suffix = axID
+        } else {
+            suffix = "Item-\(max(0, item.axChildIndex))"
+        }
+        return (["status:\(primaryOwner)::\(suffix)"], [])
     }
 
     // MARK: - Identifier Helpers
@@ -1173,29 +1346,58 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         return (bundles, execs)
     }
 
-    // MARK: - Zero-Throttle Daemon Reload Helpers (`proc_pidinfo` Uptime Check)
+    // MARK: - Zero-Fork Pure C Daemon Lookup & Reload Helpers (0.05ms via `proc_listpids` + `proc_pidinfo`)
 
     private func currentMenuBarAgentPID() -> pid_t? {
-        currentDaemonPID(named: "MenuBarAgent")
+        currentUserDaemonPIDs(named: "MenuBarAgent").first
     }
 
     private func currentDaemonPID(named processName: String) -> pid_t? {
-        // Fast check via pgrep so it works on any background queue without NSWorkspace RunLoop lag
-        let proc = Process()
-        let pipe = Pipe()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        proc.arguments = ["-u", "\(getuid())", "-x", processName]
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-        proc.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard let firstLine = out.components(separatedBy: .newlines).first,
-              let pid = pid_t(firstLine), pid > 0 else {
-            return nil
+        currentUserDaemonPIDs(named: processName).first
+    }
+
+    private func currentUserDaemonPIDs(named processName: String) -> [pid_t] {
+        let uid = getuid()
+        let byteCount = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard byteCount > 0 else { return [] }
+        let capacity = Int(byteCount) / MemoryLayout<pid_t>.stride + 64
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let actualBytes = pids.withUnsafeMutableBytes { rawBuf -> Int32 in
+            guard let base = rawBuf.baseAddress else { return 0 }
+            return proc_listpids(UInt32(PROC_ALL_PIDS), 0, base, Int32(rawBuf.count))
         }
-        return pid
+        guard actualBytes > 0 else { return [] }
+        let count = Int(actualBytes) / MemoryLayout<pid_t>.stride
+        let infoStride = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        var matches: [pid_t] = []
+        var nameBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+
+        for i in 0..<count {
+            let pid = pids[i]
+            guard pid > 0 else { continue }
+            var info = proc_bsdinfo()
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, infoStride) == infoStride,
+                  info.pbi_uid == uid else {
+                continue
+            }
+            let nameLen = proc_name(pid, &nameBuf, UInt32(nameBuf.count))
+            if nameLen > 0 {
+                let exeName = String(cString: nameBuf)
+                if exeName == processName {
+                    matches.append(pid)
+                    continue
+                }
+            }
+            let comm = withUnsafePointer(to: &info.pbi_comm) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                    String(cString: $0)
+                }
+            }
+            if comm == processName || (processName.count >= Int(MAXCOMLEN) && processName.hasPrefix(comm)) {
+                matches.append(pid)
+            }
+        }
+        return matches
     }
 
     private func processUptimeSeconds(pid: pid_t) -> Double? {
@@ -1228,8 +1430,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     private func remainingSecondsBeforeSafeReload() -> TimeInterval {
         guard let agentPID = currentMenuBarAgentPID() else {
-            // Agent is currently respawning; wait ~1.5s
-            return 1.5
+            // Agent is currently respawning; wait ~1.2s
+            return 1.2
         }
         guard let uptime = processUptimeSeconds(pid: agentPID) else {
             return 0
@@ -1241,15 +1443,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     }
 
     private func flushUserCfprefsd() {
-        // Send standard SIGTERM so cfprefsd exits cleanly under launchd's EnablePressuredExit
-        // without triggering launchd's 10-second abnormal-exit respawn throttle.
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        proc.arguments = ["-u", NSUserName(), "cfprefsd"]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-        proc.waitUntilExit()
+        // Send standard SIGTERM directly via kill() (0.05ms, zero fork/exec overhead!) so cfprefsd exits cleanly
+        // under launchd's EnablePressuredExit without triggering launchd's 10-second abnormal-exit throttle.
+        for pid in currentUserDaemonPIDs(named: "cfprefsd") {
+            _ = kill(pid, SIGTERM)
+        }
     }
 
     private func terminateMenuBarAgent() {
@@ -1260,7 +1458,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     private func flushUserCfprefsdAndReloadMenuBarAgent() {
         flushUserCfprefsd()
-        usleep(40_000)
+        usleep(20_000)
         terminateMenuBarAgent()
     }
 }

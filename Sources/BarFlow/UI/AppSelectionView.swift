@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 enum AppFilterMode: String, CaseIterable, Identifiable {
     case all = "all"
@@ -17,11 +18,15 @@ struct AppSelectionView: View {
         AppFilterMode(rawValue: menuController.filterModeRaw) ?? .all
     }
 
+    private var isSearchEmpty: Bool {
+        menuController.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var filteredApps: [MenuBarAppItem] {
         let base: [MenuBarAppItem]
         switch filterMode {
         case .all:
-            base = menuController.allRunningApps
+            base = menuController.stableAllApps
         case .mainBar:
             base = menuController.mainBarApps
         case .secondaryBar:
@@ -58,7 +63,7 @@ struct AppSelectionView: View {
 
             footerSettingsBar
         }
-        .frame(minWidth: 780, idealWidth: 850, minHeight: 620, idealHeight: 690)
+        .frame(minWidth: 800, idealWidth: 870, minHeight: 630, idealHeight: 700)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -92,7 +97,7 @@ struct AppSelectionView: View {
                         .padding(.vertical, 2)
                         .background(Color.blue.opacity(0.12), in: Capsule())
                 }
-                Text("Tự động ẩn thực sự khỏi Menu Bar chính • Các app còn lại hiện gọn 1 dòng bên phải khi bấm Ctrl + B")
+                Text("Chọn lọc & kéo thả sắp xếp thứ tự Trái → Phải cho cả Menu Bar chính lẫn thanh phụ Ctrl + B")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -137,7 +142,7 @@ struct AppSelectionView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(menuController.isArrangingMenuBar)
-                .help("Đồng bộ ngay lập tức việc ẩn/hiện ứng dụng trên Menu Bar chính")
+                .help("Đồng bộ ngay lập tức việc ẩn/hiện & thứ tự ứng dụng trên Menu Bar chính")
             }
             .fixedSize(horizontal: true, vertical: false)
             .layoutPriority(1)
@@ -240,7 +245,7 @@ struct AppSelectionView: View {
         .background(Color.orange.opacity(0.11))
     }
 
-    // MARK: - 3. Live Dual-Bar Visual Preview (With Direct Bulk Transfer Buttons)
+    // MARK: - 3. Live Dual-Bar Visual Preview (Drag & Drop Left -> Right Ordering + 1-Click Transfer)
 
     private var liveZonesPreviewSection: some View {
         let mainApps = menuController.mainBarApps
@@ -254,11 +259,19 @@ struct AppSelectionView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
 
+                    Text("Trái → Phải")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Color.green.opacity(0.12), in: Capsule())
+
                     Spacer()
 
-                    Text("Click icon để chuyển lẻ")
+                    Text("Kéo thả để sắp xếp • Click để chuyển xuống phụ")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
 
                     Button {
                         menuController.moveAllToSecondaryBar()
@@ -276,15 +289,19 @@ struct AppSelectionView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if mainApps.isEmpty {
-                            Text("Đã chuyển toàn bộ xuống thanh phụ Ctrl + B — chỉ còn biểu tượng BarFlow trên Menu Bar chính")
+                            Text("Đã chuyển toàn bộ xuống thanh phụ Ctrl + B — kéo thả icon vào đây hoặc bật công tắc để giữ trên Menu Bar chính")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(mainApps) { item in
+                            ForEach(Array(mainApps.enumerated()), id: \.element.id) { index, item in
                                 PreviewChipButton(
                                     item: item,
+                                    positionNumber: index + 1,
+                                    totalCount: mainApps.count,
                                     isPinnedMain: true,
+                                    isBeingDragged: menuController.draggingItemID == item.id,
+                                    menuController: menuController,
                                     action: {
                                         menuController.toggleAppSelection(item)
                                     }
@@ -294,7 +311,15 @@ struct AppSelectionView: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
+                    .frame(minHeight: 38)
                 }
+                .onDrop(
+                    of: [UTType.text, UTType.plainText],
+                    delegate: BarZoneContainerDropDelegate(
+                        toMainBar: true,
+                        menuController: menuController
+                    )
+                )
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color.primary.opacity(0.04))
@@ -308,15 +333,23 @@ struct AppSelectionView: View {
             // Zone B: Secondary Bar (Ctrl + B) Preview
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Label("Hiện ở thanh phụ bên phải dưới Menu Bar khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
+                    Label("Thanh phụ bên phải khi bấm Ctrl + B (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.blue)
 
+                    Text("Trái → Phải")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.blue)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Color.blue.opacity(0.12), in: Capsule())
+
                     Spacer()
 
-                    Text("Click icon để chuyển lẻ")
+                    Text("Kéo thả để sắp xếp • Click để đưa lên chính")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
 
                     Button {
                         menuController.selectAllForMainBar()
@@ -334,15 +367,19 @@ struct AppSelectionView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if secApps.isEmpty {
-                            Text("Không có ứng dụng ẩn — bấm 'Chuyển toàn bộ xuống phụ' hoặc tắt công tắc bên dưới để đưa vào Ctrl + B")
+                            Text("Không có ứng dụng ẩn — kéo thả icon vào đây hoặc bấm 'Chuyển toàn bộ xuống phụ' để đưa vào Ctrl + B")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(secApps) { item in
+                            ForEach(Array(secApps.enumerated()), id: \.element.id) { index, item in
                                 PreviewChipButton(
                                     item: item,
+                                    positionNumber: index + 1,
+                                    totalCount: secApps.count,
                                     isPinnedMain: false,
+                                    isBeingDragged: menuController.draggingItemID == item.id,
+                                    menuController: menuController,
                                     action: {
                                         menuController.toggleAppSelection(item)
                                     }
@@ -352,7 +389,15 @@ struct AppSelectionView: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
+                    .frame(minHeight: 38)
                 }
+                .onDrop(
+                    of: [UTType.text, UTType.plainText],
+                    delegate: BarZoneContainerDropDelegate(
+                        toMainBar: false,
+                        menuController: menuController
+                    )
+                )
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color.blue.opacity(0.05))
@@ -406,17 +451,16 @@ struct AppSelectionView: View {
             .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
 
             Picker("", selection: $menuController.filterModeRaw) {
-                Text("Tất cả (\(menuController.allRunningApps.count))").tag(AppFilterMode.all.rawValue)
+                Text("Tất cả (\(menuController.stableAllApps.count))").tag(AppFilterMode.all.rawValue)
                 Text("Menu Bar chính (\(menuController.mainBarApps.count))").tag(AppFilterMode.mainBar.rawValue)
                 Text("Thanh phụ ⌃B (\(menuController.secondaryBarApps.count))").tag(AppFilterMode.secondaryBar.rawValue)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(maxWidth: 320)
+            .frame(maxWidth: 330)
 
             Spacer(minLength: 4)
 
-            // Explicit 1-click Bulk Transfer Buttons requested by user
             HStack(spacing: 6) {
                 Button {
                     menuController.moveAllToSecondaryBar()
@@ -446,10 +490,28 @@ struct AppSelectionView: View {
         .padding(.vertical, 9)
     }
 
-    // MARK: - 5. Running Menu Bar Apps List
+    // MARK: - 5. Running Menu Bar Apps List (Equatable Rows + ◀/▶ Ordering + Tab Drag & Drop)
 
     private var appListSection: some View {
         let apps = filteredApps
+        let mainApps = menuController.mainBarApps
+        let secApps = menuController.secondaryBarApps
+
+        var mainIdxMap: [String: Int] = [:]
+        mainIdxMap.reserveCapacity(mainApps.count)
+        for (idx, m) in mainApps.enumerated() {
+            mainIdxMap[m.id] = idx
+        }
+
+        var secIdxMap: [String: Int] = [:]
+        secIdxMap.reserveCapacity(secApps.count)
+        for (idx, s) in secApps.enumerated() {
+            secIdxMap[s.id] = idx
+        }
+
+        let allowRowDrag = isSearchEmpty && (filterMode == .mainBar || filterMode == .secondaryBar)
+        let draggingID = menuController.draggingItemID
+
         return ScrollView {
             LazyVStack(spacing: 5) {
                 if apps.isEmpty {
@@ -467,19 +529,64 @@ struct AppSelectionView: View {
                     .padding(.vertical, 48)
                 } else {
                     ForEach(apps) { item in
-                        AppSelectionRow(
+                        let isSelected = menuController.selectedMainBarIDs.contains(item.id)
+                        let posIdx = isSelected ? (mainIdxMap[item.id] ?? 0) : (secIdxMap[item.id] ?? 0)
+                        let zoneTotal = isSelected ? mainApps.count : secApps.count
+
+                        let row = AppSelectionRow(
                             item: item,
-                            isSelectedOnMainBar: menuController.selectedMainBarIDs.contains(item.id),
+                            isSelectedOnMainBar: isSelected,
+                            positionIndex: posIdx,
+                            zoneCount: zoneTotal,
+                            isBeingDragged: draggingID == item.id,
+                            showDragHandle: allowRowDrag,
                             onToggle: { newValue in
                                 menuController.setAppSelection(item, visibleOnMainBar: newValue)
                             },
                             onRowTap: {
                                 menuController.toggleAppSelection(item)
                             },
+                            onMoveLeft: {
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    if isSelected {
+                                        menuController.moveMainBarItem(id: item.id, direction: -1)
+                                    } else {
+                                        menuController.moveSecondaryBarItem(id: item.id, direction: -1)
+                                    }
+                                }
+                            },
+                            onMoveRight: {
+                                withAnimation(.easeInOut(duration: 0.15)) {
+                                    if isSelected {
+                                        menuController.moveMainBarItem(id: item.id, direction: 1)
+                                    } else {
+                                        menuController.moveSecondaryBarItem(id: item.id, direction: 1)
+                                    }
+                                }
+                            },
                             onTestTrigger: {
                                 menuController.activateAppFromSecondaryBar(item, rightClick: false)
                             }
                         )
+                        .equatable()
+
+                        if allowRowDrag {
+                            row
+                                .onDrag {
+                                    menuController.beginDraggingItem(item.id)
+                                    return NSItemProvider(object: item.id as NSString)
+                                }
+                                .onDrop(
+                                    of: [UTType.text, UTType.plainText],
+                                    delegate: BarZoneChipDropDelegate(
+                                        targetItemID: item.id,
+                                        isMainZone: filterMode == .mainBar,
+                                        menuController: menuController
+                                    )
+                                )
+                        } else {
+                            row
+                        }
                     }
                 }
             }
@@ -534,11 +641,15 @@ struct AppSelectionView: View {
     }
 }
 
-// MARK: - Supporting Row & Chip Views (Zero Parent Hover Churn)
+// MARK: - Supporting Chip, Drop Delegates & Equatable Row Views
 
 private struct PreviewChipButton: View {
     let item: MenuBarAppItem
+    let positionNumber: Int
+    let totalCount: Int
     let isPinnedMain: Bool
+    let isBeingDragged: Bool
+    let menuController: MenuBarController
     let action: () -> Void
 
     @StateObject private var hover = LocalHoverBox()
@@ -546,6 +657,16 @@ private struct PreviewChipButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
+                Text("\(positionNumber)")
+                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                    .foregroundStyle(isPinnedMain ? Color.green : Color.blue)
+                    .frame(minWidth: 14, minHeight: 14)
+                    .padding(.horizontal, 2)
+                    .background(
+                        (isPinnedMain ? Color.green : Color.blue).opacity(0.14),
+                        in: Capsule()
+                    )
+
                 Image(nsImage: item.appIcon)
                     .resizable()
                     .interpolation(.high)
@@ -556,18 +677,25 @@ private struct PreviewChipButton: View {
                     .font(.system(size: 11.5, weight: .medium))
                     .lineLimit(1)
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, 5)
+            .padding(.trailing, 8)
             .padding(.vertical, 4)
             .background(
                 Capsule()
                     .fill(hover.isHovered
-                          ? (isPinnedMain ? Color.red.opacity(0.14) : Color.green.opacity(0.16))
+                          ? (isPinnedMain ? Color.red.opacity(0.13) : Color.green.opacity(0.15))
                           : Color(nsColor: .windowBackgroundColor))
             )
             .overlay(
                 Capsule()
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.8)
+                    .strokeBorder(
+                        isBeingDragged
+                            ? Color.accentColor
+                            : Color.primary.opacity(0.12),
+                        lineWidth: isBeingDragged ? 1.4 : 0.8
+                    )
             )
+            .opacity(isBeingDragged ? 0.45 : 1.0)
         }
         .buttonStyle(.plain)
         .onHover { inside in
@@ -575,22 +703,178 @@ private struct PreviewChipButton: View {
                 hover.isHovered = inside
             }
         }
-        .help(isPinnedMain ? "Click để chuyển \(item.appName) xuống thanh phụ Ctrl + B" : "Click để đưa \(item.appName) lên Menu Bar chính")
+        .onDrag {
+            menuController.beginDraggingItem(item.id)
+            return NSItemProvider(object: item.id as NSString)
+        }
+        .onDrop(
+            of: [UTType.text, UTType.plainText],
+            delegate: BarZoneChipDropDelegate(
+                targetItemID: item.id,
+                isMainZone: isPinnedMain,
+                menuController: menuController
+            )
+        )
+        .contextMenu {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if isPinnedMain {
+                        menuController.moveMainBarItem(id: item.id, direction: -1)
+                    } else {
+                        menuController.moveSecondaryBarItem(id: item.id, direction: -1)
+                    }
+                }
+            } label: {
+                Label("Di chuyển sang trái (◀)", systemImage: "arrow.left")
+            }
+            .disabled(positionNumber <= 1)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if isPinnedMain {
+                        menuController.moveMainBarItem(id: item.id, direction: 1)
+                    } else {
+                        menuController.moveSecondaryBarItem(id: item.id, direction: 1)
+                    }
+                }
+            } label: {
+                Label("Di chuyển sang phải (▶)", systemImage: "arrow.right")
+            }
+            .disabled(positionNumber >= totalCount)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if isPinnedMain {
+                        menuController.moveMainBarItemToEdge(id: item.id, toStart: true)
+                    } else {
+                        menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: true)
+                    }
+                }
+            } label: {
+                Label("Đưa sang ngoài cùng bên trái", systemImage: "arrow.left.to.line")
+            }
+            .disabled(positionNumber <= 1)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if isPinnedMain {
+                        menuController.moveMainBarItemToEdge(id: item.id, toStart: false)
+                    } else {
+                        menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: false)
+                    }
+                }
+            } label: {
+                Label("Đưa sang ngoài cùng bên phải", systemImage: "arrow.right.to.line")
+            }
+            .disabled(positionNumber >= totalCount)
+
+            Divider()
+
+            Button(action: action) {
+                Label(
+                    isPinnedMain ? "Chuyển xuống thanh phụ Ctrl + B" : "Đưa lên Menu Bar chính",
+                    systemImage: isPinnedMain ? "arrow.down.circle" : "pin.fill"
+                )
+            }
+        }
+        .help(
+            isPinnedMain
+                ? "Vị trí #\(positionNumber) trên Menu Bar chính • Kéo thả để đổi thứ tự • Click để chuyển xuống Ctrl + B"
+                : "Vị trí #\(positionNumber) trên thanh phụ Ctrl + B • Kéo thả để đổi thứ tự • Click để đưa lên Menu Bar chính"
+        )
     }
 }
 
-private struct AppSelectionRow: View {
+@MainActor
+private struct BarZoneChipDropDelegate: DropDelegate {
+    let targetItemID: String
+    let isMainZone: Bool
+    let menuController: MenuBarController
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedID = menuController.draggingItemID,
+              draggedID != targetItemID else { return }
+        withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
+            if isMainZone {
+                menuController.reorderMainBarItem(draggedID: draggedID, targetID: targetItemID)
+            } else {
+                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
+            }
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let draggedID = menuController.draggingItemID, draggedID != targetItemID {
+            if isMainZone {
+                menuController.reorderMainBarItem(draggedID: draggedID, targetID: targetItemID)
+            } else {
+                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
+            }
+        }
+        menuController.endDraggingSession()
+        return true
+    }
+}
+
+@MainActor
+private struct BarZoneContainerDropDelegate: DropDelegate {
+    let toMainBar: Bool
+    let menuController: MenuBarController
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let draggedID = menuController.draggingItemID {
+            withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
+                menuController.dropItemIntoZone(draggedID: draggedID, toMainBar: toMainBar)
+            }
+        }
+        menuController.endDraggingSession()
+        return true
+    }
+}
+
+private struct AppSelectionRow: View, Equatable {
     let item: MenuBarAppItem
     let isSelectedOnMainBar: Bool
+    let positionIndex: Int
+    let zoneCount: Int
+    let isBeingDragged: Bool
+    let showDragHandle: Bool
     let onToggle: (Bool) -> Void
     let onRowTap: () -> Void
+    let onMoveLeft: () -> Void
+    let onMoveRight: () -> Void
     let onTestTrigger: () -> Void
 
     @StateObject private var hover = LocalHoverBox()
 
+    static func == (lhs: AppSelectionRow, rhs: AppSelectionRow) -> Bool {
+        lhs.item == rhs.item &&
+        lhs.isSelectedOnMainBar == rhs.isSelectedOnMainBar &&
+        lhs.positionIndex == rhs.positionIndex &&
+        lhs.zoneCount == rhs.zoneCount &&
+        lhs.isBeingDragged == rhs.isBeingDragged &&
+        lhs.showDragHandle == rhs.showDragHandle
+    }
+
     var body: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 12) {
+        HStack(spacing: 10) {
+            if showDragHandle {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 14)
+                    .help("Kéo thả lên/xuống để đổi thứ tự Trái → Phải")
+            }
+
+            HStack(spacing: 11) {
                 Image(nsImage: item.appIcon)
                     .resizable()
                     .interpolation(.high)
@@ -601,6 +885,7 @@ private struct AppSelectionRow: View {
                     HStack(spacing: 6) {
                         Text(item.appName)
                             .font(.system(size: 13.5, weight: .semibold))
+                            .lineLimit(1)
 
                         if !item.statusTitle.isEmpty {
                             Text(item.statusTitle)
@@ -609,6 +894,7 @@ private struct AppSelectionRow: View {
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 1)
                                 .background(Color.blue.opacity(0.10), in: Capsule())
+                                .lineLimit(1)
                         }
 
                         if item.isSystemItem {
@@ -625,15 +911,50 @@ private struct AppSelectionRow: View {
                         Text(bundle)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.tertiary)
+                            .lineLimit(1)
                     }
                 }
 
-                Spacer(minLength: 8)
+                Spacer(minLength: 6)
             }
             .contentShape(Rectangle())
             .onTapGesture {
                 onRowTap()
             }
+
+            // Direct 1-click Left / Right order controls for whichever bar this app belongs to
+            HStack(spacing: 2) {
+                Button(action: onMoveLeft) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(positionIndex <= 0)
+                .opacity(positionIndex <= 0 ? 0.28 : 0.88)
+                .help("Đẩy sang trái 1 vị trí trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+
+                Text("#\(positionIndex + 1)")
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(isSelectedOnMainBar ? Color.green : Color.blue)
+                    .frame(minWidth: 24)
+                    .help("Vị trí thứ \(positionIndex + 1) (tính từ trái sang phải) trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+
+                Button(action: onMoveRight) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(positionIndex >= zoneCount - 1)
+                .opacity(positionIndex >= zoneCount - 1 ? 0.28 : 0.88)
+                .help("Đẩy sang phải 1 vị trí trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(Color.primary.opacity(0.045), in: Capsule())
 
             Button(action: onTestTrigger) {
                 Label("Mở menu", systemImage: "cursorarrow.click")
@@ -648,7 +969,7 @@ private struct AppSelectionRow: View {
                 Text(isSelectedOnMainBar ? "Menu Bar chính" : "Thanh phụ ⌃B")
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(isSelectedOnMainBar ? .green : .blue)
-                    .frame(width: 96, alignment: .trailing)
+                    .frame(width: 92, alignment: .trailing)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         onRowTap()
@@ -672,10 +993,13 @@ private struct AppSelectionRow: View {
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(
-                    isSelectedOnMainBar ? Color.green.opacity(0.26) : Color.primary.opacity(0.06),
-                    lineWidth: 1
+                    isBeingDragged
+                        ? Color.accentColor
+                        : (isSelectedOnMainBar ? Color.green.opacity(0.26) : Color.primary.opacity(0.06)),
+                    lineWidth: isBeingDragged ? 1.4 : 1
                 )
         )
+        .opacity(isBeingDragged ? 0.48 : 1.0)
         .onHover { inside in
             if hover.isHovered != inside {
                 hover.isHovered = inside

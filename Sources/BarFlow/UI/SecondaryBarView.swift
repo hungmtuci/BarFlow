@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// Native AppKit frosted glass backdrop matching the macOS Menu Bar material.
 struct FrostedBarBackground: NSViewRepresentable {
@@ -21,13 +22,23 @@ final class LocalHoverBox: ObservableObject {
 }
 
 struct SecondaryBarView: View {
-    let barController: SecondaryBarController
+    @ObservedObject var barController: SecondaryBarController
     @ObservedObject var menuController: MenuBarController
 
     var body: some View {
+        if !barController.isVisible {
+            // Zero layout & rendering overhead while the Ctrl + B panel is hidden
+            Color.clear
+                .frame(maxWidth: .infinity, minHeight: 34, maxHeight: 34)
+        } else {
+            visibleBarContent
+        }
+    }
+
+    private var visibleBarContent: some View {
         let apps = menuController.secondaryBarApps
 
-        HStack(spacing: 5) {
+        return HStack(spacing: 5) {
             if !menuController.isAccessibilityGranted {
                 Button {
                     barController.hide()
@@ -61,9 +72,13 @@ struct SecondaryBarView: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: SecondaryBarController.iconSpacing) {
-                        ForEach(apps) { item in
+                        ForEach(Array(apps.enumerated()), id: \.element.id) { index, item in
                             SecondaryBarIconButton(
                                 item: item,
+                                index: index,
+                                totalCount: apps.count,
+                                isBeingDragged: menuController.draggingItemID == item.id,
+                                menuController: menuController,
                                 onLeftClick: {
                                     menuController.activateAppFromSecondaryBar(item, rightClick: false)
                                 },
@@ -129,6 +144,10 @@ private struct AutoHideHairlineBar: View {
 
 private struct SecondaryBarIconButton: View {
     let item: MenuBarAppItem
+    let index: Int
+    let totalCount: Int
+    let isBeingDragged: Bool
+    let menuController: MenuBarController
     let onLeftClick: () -> Void
     let onRightClickMenu: () -> Void
     let onMoveToMainBar: () -> Void
@@ -136,10 +155,8 @@ private struct SecondaryBarIconButton: View {
     @StateObject private var hover = LocalHoverBox()
 
     private var tooltipText: String {
-        if item.statusTitle.isEmpty {
-            return item.appName
-        }
-        return "\(item.appName) (\(item.statusTitle))"
+        let base = item.statusTitle.isEmpty ? item.appName : "\(item.appName) (\(item.statusTitle))"
+        return "\(base) • Kéo thả để đổi thứ tự"
     }
 
     var body: some View {
@@ -157,6 +174,7 @@ private struct SecondaryBarIconButton: View {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(hover.isHovered ? Color.primary.opacity(0.14) : Color.clear)
                 )
+                .opacity(isBeingDragged ? 0.42 : 1.0)
         }
         .buttonStyle(.plain)
         .onHover { inside in
@@ -164,6 +182,17 @@ private struct SecondaryBarIconButton: View {
                 hover.isHovered = inside
             }
         }
+        .onDrag {
+            menuController.beginDraggingItem(item.id)
+            return NSItemProvider(object: item.id as NSString)
+        }
+        .onDrop(
+            of: [UTType.text, UTType.plainText],
+            delegate: SecondaryBarIconDropDelegate(
+                targetItemID: item.id,
+                menuController: menuController
+            )
+        )
         .help(tooltipText)
         .contextMenu {
             Button(action: onLeftClick) {
@@ -173,6 +202,44 @@ private struct SecondaryBarIconButton: View {
             Button(action: onRightClickMenu) {
                 Label("Click chuột phải vào \(item.appName)", systemImage: "cursorarrow.click.2")
             }
+
+            Divider()
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    menuController.moveSecondaryBarItem(id: item.id, direction: -1)
+                }
+            } label: {
+                Label("Di chuyển sang trái (◀)", systemImage: "arrow.left")
+            }
+            .disabled(index <= 0)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    menuController.moveSecondaryBarItem(id: item.id, direction: 1)
+                }
+            } label: {
+                Label("Di chuyển sang phải (▶)", systemImage: "arrow.right")
+            }
+            .disabled(index >= totalCount - 1)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: true)
+                }
+            } label: {
+                Label("Đưa sang ngoài cùng bên trái", systemImage: "arrow.left.to.line")
+            }
+            .disabled(index <= 0)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: false)
+                }
+            } label: {
+                Label("Đưa sang ngoài cùng bên phải", systemImage: "arrow.right.to.line")
+            }
+            .disabled(index >= totalCount - 1)
 
             Divider()
 
@@ -188,6 +255,32 @@ private struct SecondaryBarIconButton: View {
                 }
             }
         }
+    }
+}
+
+@MainActor
+private struct SecondaryBarIconDropDelegate: DropDelegate {
+    let targetItemID: String
+    let menuController: MenuBarController
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedID = menuController.draggingItemID,
+              draggedID != targetItemID else { return }
+        withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
+            menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let draggedID = menuController.draggingItemID, draggedID != targetItemID {
+            menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
+        }
+        menuController.endDraggingSession()
+        return true
     }
 }
 
@@ -212,6 +305,6 @@ private struct SecondaryBarSettingsButton: View {
                 hover.isHovered = inside
             }
         }
-        .help("Chọn lọc ứng dụng Menu Bar")
+        .help("Chọn lọc & sắp xếp ứng dụng Menu Bar")
     }
 }
