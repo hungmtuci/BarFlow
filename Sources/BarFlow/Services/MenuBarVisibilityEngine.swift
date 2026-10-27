@@ -271,6 +271,12 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             return
         }
 
+        if key.contains("passwords") || key.contains("mật khẩu") {
+            let passwordsURL = URL(fileURLWithPath: "/System/Applications/Passwords.app")
+            NSWorkspace.shared.openApplication(at: passwordsURL, configuration: NSWorkspace.OpenConfiguration())
+            return
+        }
+
         if key.contains("textinput") || key.contains("input menu") || key.contains("bộ gõ") {
             if rightClick {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") {

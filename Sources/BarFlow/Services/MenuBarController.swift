@@ -3,6 +3,7 @@ import AppKit
 @preconcurrency import ApplicationServices
 import CoreGraphics
 import Combine
+import Darwin
 
 /// Off-MainActor JSON state snapshot (`~/Library/Application Support/BarFlow/layout_state.json`)
 /// so toggling & reordering NEVER block `@MainActor` on `cfprefsd` / `NSUserDefaults` XPC!
@@ -1364,7 +1365,9 @@ final class MenuBarController: ObservableObject {
 
     private enum HiddenInteractionResult: Sendable {
         case mirroredMenu(AXStatusMenuBridge.MirroredMenuSnapshot)
+        case synthesizedAppMenu(AXStatusMenuBridge.MirroredMenuSnapshot?)
         case openedPopoverWindow
+        case needsReopenOrMenuFallback(AXStatusMenuBridge.MirroredMenuSnapshot?)
         case triggeredActionOnly
         case fallbackSystemItem
     }
@@ -1458,8 +1461,12 @@ final class MenuBarController: ObservableObject {
                 guard let axEl = live?.element ?? item.axElement else {
                     if item.isSystemItem && usesAgentArch {
                         continuation.resume(returning: .fallbackSystemItem)
+                    } else if rightClick {
+                        let appMenu = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
+                        continuation.resume(returning: .synthesizedAppMenu(appMenu))
                     } else {
-                        continuation.resume(returning: .triggeredActionOnly)
+                        let appMenu = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
+                        continuation.resume(returning: .needsReopenOrMenuFallback(appMenu))
                     }
                     return
                 }
@@ -1474,28 +1481,40 @@ final class MenuBarController: ObservableObject {
                     return
                 }
 
-                // STEP 2: Snapshot existing AXWindows BEFORE triggering action so we can snap any opened popover/panel
-                // (1Password 7, LogiPresentation, Maccy, AdGuard, Itsycal, etc.) directly underneath the clicked icon!
-                let axApp = AXUIElementCreateApplication(targetPID)
-                AXUIElementSetMessagingTimeout(axApp, 0.18)
-                let baselineAXWins = self.readAXWindows(of: axApp)
-
-                // STEP 3: Trigger the status item action (Right-Click tries AXShowMenu/AXSecondaryMenu first, then AXPress!)
-                var actionErr: AXError = .failure
+                // STEP 2: Dedicated RIGHT-CLICK path for apps without a status-item `AXMenu`
+                // (`1Password 7`, `OneDrive`, `Google Drive`, `Caffeine`, `Maccy`, `AdGuard`, `Itsycal`, `LogiPresentation`):
+                // Never trigger Left-Click `AXPress` on Right-Click — otherwise 1Password re-opens its vault window instead
+                // of showing its Application Menu (`Settings…`, `Lock`, `Quit` / `Thoát`)!
                 if rightClick {
                     var actionsRef: CFArray?
                     let actions: [String] = (AXUIElementCopyActionNames(axEl, &actionsRef) == .success)
                         ? ((actionsRef as? [String]) ?? [])
                         : []
                     if let menuAction = actions.first(where: { $0 == "AXShowMenu" || $0 == "AXSecondaryMenu" }) {
-                        actionErr = AXUIElementPerformAction(axEl, menuAction as CFString)
+                        let rc = AXUIElementPerformAction(axEl, menuAction as CFString)
+                        if rc == .success || rc == .cannotComplete {
+                            for waitUs: useconds_t in [15_000, 30_000, 45_000] {
+                                usleep(waitUs)
+                                if let dynMenu = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: true) {
+                                    continuation.resume(returning: .mirroredMenu(dynMenu))
+                                    return
+                                }
+                            }
+                        }
                     }
+
+                    let appMenuSnap = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
+                    continuation.resume(returning: .synthesizedAppMenu(appMenuSnap))
+                    return
                 }
 
-                if actionErr != .success && actionErr != .cannotComplete {
-                    actionErr = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
-                }
+                // STEP 3: LEFT-CLICK path — snapshot existing AXWindows & status label BEFORE `AXPress`
+                let axApp = AXUIElementCreateApplication(targetPID)
+                AXUIElementSetMessagingTimeout(axApp, 0.18)
+                let baselineAXWins = self.readAXWindows(of: axApp)
+                let beforeLabel = self.readStatusElementLabelFingerprint(axEl)
 
+                var actionErr = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
                 if actionErr != .success && actionErr != .cannotComplete {
                     var childrenRef: CFTypeRef?
                     if AXUIElementCopyAttributeValue(axEl, kAXChildrenAttribute as CFString, &childrenRef) == .success,
@@ -1511,16 +1530,16 @@ final class MenuBarController: ObservableObject {
                    let rect = live?.frame ?? MenuBarScanner.shared.readAXFrame(axEl), rect.width > 0 {
                     self.postWarpedHIDClickSync(
                         at: CGPoint(x: rect.midX, y: rect.midY),
-                        button: rightClick ? .right : .left,
+                        button: .left,
                         savedCursor: savedCursor
                     )
                     actionErr = .success
                 }
 
-                // STEP 4: Poll briefly (15ms..190ms) to catch either:
+                // STEP 4: Poll briefly (15ms..120ms) to catch either:
                 //   (a) a dynamically attached `AXMenu` (close off-corner menu & mirror under icon), OR
                 //   (b) a newly opened / revealed popover `AXWindow` -> snap its `AXPosition` right under the icon!
-                let delaysMicros: [useconds_t] = [15_000, 25_000, 35_000, 45_000, 65_000]
+                let delaysMicros: [useconds_t] = [15_000, 25_000, 35_000, 45_000]
                 for waitUs in delaysMicros {
                     usleep(waitUs)
 
@@ -1542,6 +1561,21 @@ final class MenuBarController: ObservableObject {
 
                 if item.isSystemItem && usesAgentArch && !item.isCurrentlyOnBar {
                     continuation.resume(returning: .fallbackSystemItem)
+                    return
+                }
+
+                // Check if status item was a toggle switch whose title/description changed (e.g. Caffeine)
+                let afterLabel = self.readStatusElementLabelFingerprint(axEl)
+                if !beforeLabel.isEmpty && afterLabel != beforeLabel {
+                    continuation.resume(returning: .triggeredActionOnly)
+                    return
+                }
+
+                // Apps using SwiftUI `WindowMenuBarExtraStyle` / `NSPopover.show(relativeTo:)` (e.g. Microsoft OneDrive)
+                // abort `NSPopover` when unhosted by MenuBarAgent (`!item.isCurrentlyOnBar`). Present their native menu right under the icon!
+                if !item.isCurrentlyOnBar {
+                    let appMenuSnap = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
+                    continuation.resume(returning: .needsReopenOrMenuFallback(appMenuSnap))
                 } else {
                     continuation.resume(returning: .triggeredActionOnly)
                 }
@@ -1551,23 +1585,24 @@ final class MenuBarController: ObservableObject {
         // STEP 5: Finalize presentation on MainActor
         switch interactionResult {
         case .mirroredMenu(let snapshot):
-            let barVisible = SecondaryBarController.shared.isVisible
-            if barVisible {
-                SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
-            }
-            let selectedNodeID = AXStatusMenuBridge.shared.presentMirroredMenu(
+            presentMirroredSnapshotOnMain(
                 snapshot,
+                for: item,
                 anchorView: anchorView,
                 anchorScreenRectAppKit: anchorScreenRectAppKit
             )
-            if barVisible {
-                SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: selectedNodeID != nil)
-            }
-            if let nodeID = selectedNodeID {
-                interactionQueue.async {
-                    AXStatusMenuBridge.shared.performSelectedMenuNode(nodeID, in: snapshot)
-                }
-            }
+
+        case .synthesizedAppMenu(let appMenuSnap):
+            await presentSynthesizedMenuAndExecuteChoice(
+                for: item,
+                appMenuSnap: appMenuSnap,
+                includeOpenNoteForMenuBarExtra: false,
+                windowsBefore: windowsBefore,
+                anchorRectCG: anchorRectCG,
+                anchorDisplayCG: anchorDisplayCG,
+                anchorView: anchorView,
+                anchorScreenRectAppKit: anchorScreenRectAppKit
+            )
 
         case .openedPopoverWindow:
             NSRunningApplication(processIdentifier: targetPID)?.activate()
@@ -1579,22 +1614,360 @@ final class MenuBarController: ObservableObject {
                 )
             }
 
+        case .needsReopenOrMenuFallback(let appMenuSnap):
+            await presentSynthesizedMenuAndExecuteChoice(
+                for: item,
+                appMenuSnap: appMenuSnap,
+                includeOpenNoteForMenuBarExtra: true,
+                windowsBefore: windowsBefore,
+                anchorRectCG: anchorRectCG,
+                anchorDisplayCG: anchorDisplayCG,
+                anchorView: anchorView,
+                anchorScreenRectAppKit: anchorScreenRectAppKit
+            )
+
         case .fallbackSystemItem:
             onHideSecondaryBarRequested?()
             MenuBarVisibilityEngine.shared.triggerHiddenSystemItem(item, rightClick: rightClick)
 
         case .triggeredActionOnly:
             SecondaryBarController.shared.clearExternalPopoverSessionIfIdle()
-            if rightClick, let app = NSRunningApplication(processIdentifier: targetPID), app.activationPolicy == .regular {
-                onHideSecondaryBarRequested?()
-                app.activate()
-            }
         }
 
         if collapsedSpacersTemporarily {
             try? await Task.sleep(nanoseconds: 220_000_000)
             scheduleSmartRehide(targetPID: item.pid, baselineWindows: windowsBefore)
         }
+    }
+
+    private func presentMirroredSnapshotOnMain(
+        _ snapshot: AXStatusMenuBridge.MirroredMenuSnapshot,
+        for item: MenuBarAppItem,
+        anchorView: NSView?,
+        anchorScreenRectAppKit: NSRect?
+    ) {
+        let barVisible = SecondaryBarController.shared.isVisible
+        if barVisible {
+            SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
+        }
+        let selectedNodeID = AXStatusMenuBridge.shared.presentMirroredMenu(
+            snapshot,
+            anchorView: anchorView,
+            anchorScreenRectAppKit: anchorScreenRectAppKit
+        )
+        if barVisible {
+            SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: selectedNodeID != nil)
+        }
+        if let nodeID = selectedNodeID {
+            interactionQueue.async {
+                AXStatusMenuBridge.shared.performSelectedMenuNode(nodeID, in: snapshot)
+            }
+        }
+    }
+
+    private func presentSynthesizedMenuAndExecuteChoice(
+        for item: MenuBarAppItem,
+        appMenuSnap: AXStatusMenuBridge.MirroredMenuSnapshot?,
+        includeOpenNoteForMenuBarExtra: Bool,
+        windowsBefore: Set<Int>,
+        anchorRectCG: CGRect,
+        anchorDisplayCG: CGRect,
+        anchorView: NSView?,
+        anchorScreenRectAppKit: NSRect?
+    ) async {
+        let cloudFolder = resolveCloudSyncFolderURL(for: item)
+        let barVisible = SecondaryBarController.shared.isVisible
+        if barVisible {
+            SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
+        }
+        let choice = AXStatusMenuBridge.shared.presentSynthesizedAppMenu(
+            for: item,
+            appMenuSnapshot: appMenuSnap,
+            cloudFolderURL: cloudFolder,
+            includeOpenNoteForMenuBarExtra: includeOpenNoteForMenuBarExtra,
+            anchorView: anchorView,
+            anchorScreenRectAppKit: anchorScreenRectAppKit
+        )
+        if barVisible {
+            SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: choice != nil)
+        }
+
+        guard let choice = choice else { return }
+        switch choice {
+        case .axNode(let nodeID, let selectedTitle, let snap):
+            let lower = selectedTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let isCompleteHelperQuit = lower.contains("completely") || lower.contains("hoàn toàn")
+            let isQuitCommand = lower.hasPrefix("quit") || lower.contains("thoát")
+            let isBackgroundAction = isQuitCommand ||
+                lower.hasPrefix("hide") || lower.contains("ẩn") ||
+                lower.hasPrefix("lock") || lower.contains("khoá")
+
+            if !isBackgroundAction {
+                NSRunningApplication(processIdentifier: item.pid)?.activate()
+            }
+
+            interactionQueue.async {
+                AXStatusMenuBridge.shared.performSelectedMenuNode(nodeID, in: snap)
+            }
+
+            if isQuitCommand && !isCompleteHelperQuit {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.38) { [weak self] in
+                    guard let self = self else { return }
+                    if let stillRunning = NSRunningApplication(processIdentifier: item.pid), !stillRunning.isTerminated {
+                        let alertOpened = !self.currentOnScreenWindows(for: item.pid).subtracting(windowsBefore).isEmpty
+                        if !alertOpened {
+                            self.quitTargetApplication(item)
+                            return
+                        }
+                    }
+                    self.refreshRunningAppsAsync(forceFullScan: false)
+                }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+                    self?.refreshRunningAppsAsync(forceFullScan: false)
+                }
+            }
+
+        case .openAppUI:
+            await openAppPrimaryInterfaceExplicitly(
+                item: item,
+                cloudFolderURL: cloudFolder,
+                windowsBefore: windowsBefore,
+                anchorRectCG: anchorRectCG,
+                anchorDisplayCG: anchorDisplayCG
+            )
+
+        case .openCloudFolder(let url):
+            NSWorkspace.shared.open(url)
+
+        case .pinToMainBar:
+            setAppSelection(item, visibleOnMainBar: true)
+
+        case .quitApp:
+            quitTargetApplication(item)
+        }
+    }
+
+    private func attemptReopenForUnhostedMenuBarExtra(
+        item: MenuBarAppItem,
+        windowsBefore: Set<Int>,
+        anchorRectCG: CGRect,
+        anchorDisplayCG: CGRect
+    ) async -> Bool {
+        let targetPID = item.pid
+        let finderPID = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.finder" })?.processIdentifier ?? 0
+        let finderWinsBefore = finderPID > 0 ? currentOnScreenWindows(for: finderPID) : Set<Int>()
+
+        guard let appURL = resolveAppBundleURL(for: item) else { return false }
+
+        let axApp = AXUIElementCreateApplication(targetPID)
+        let baselineAXWins = readAXWindows(of: axApp)
+
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            NSWorkspace.shared.openApplication(at: appURL, configuration: config) { _, _ in
+                cont.resume()
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 180_000_000)
+
+        let snapped = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            interactionQueue.async { [weak self] in
+                guard let self = self else {
+                    cont.resume(returning: false)
+                    return
+                }
+                let ok = self.snapOpenedPopoverWindowIfFound(
+                    axApp: axApp,
+                    baselineWindows: baselineAXWins,
+                    anchorRectCG: anchorRectCG,
+                    displayCG: anchorDisplayCG
+                )
+                cont.resume(returning: ok)
+            }
+        }
+        if snapped {
+            NSRunningApplication(processIdentifier: targetPID)?.activate()
+            if SecondaryBarController.shared.isVisible {
+                SecondaryBarController.shared.beginExternalPopoverSession(
+                    itemID: item.id,
+                    pid: targetPID,
+                    baselineWinIDs: windowsBefore
+                )
+            }
+            return true
+        }
+
+        let newAppWins = currentOnScreenWindows(for: targetPID).subtracting(windowsBefore)
+        if !newAppWins.isEmpty {
+            onHideSecondaryBarRequested?()
+            NSRunningApplication(processIdentifier: targetPID)?.activate()
+            return true
+        }
+
+        // OneDrive's `handleApplicationReOpenEvent:` opens the user's OneDrive folder in Finder when configured
+        if finderPID > 0 && !currentOnScreenWindows(for: finderPID).subtracting(finderWinsBefore).isEmpty {
+            onHideSecondaryBarRequested?()
+            return true
+        }
+
+        return false
+    }
+
+    private func openAppPrimaryInterfaceExplicitly(
+        item: MenuBarAppItem,
+        cloudFolderURL: URL?,
+        windowsBefore: Set<Int>,
+        anchorRectCG: CGRect,
+        anchorDisplayCG: CGRect
+    ) async {
+        // First try direct Left-Click `AXPress` (e.g. opens 1Password Vault / Maccy / AdGuard / Itsycal right under icon)
+        let targetPID = item.pid
+        let axOpened = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            interactionQueue.async { [weak self] in
+                guard let self = self,
+                      let axEl = MenuBarScanner.shared.liveStatusElement(for: item, preferredDisplay: nil, timeout: 0.18)?.element ?? item.axElement else {
+                    cont.resume(returning: false)
+                    return
+                }
+                let axApp = AXUIElementCreateApplication(targetPID)
+                let baselineAXWins = self.readAXWindows(of: axApp)
+                _ = AXUIElementPerformAction(axEl, kAXPressAction as CFString)
+                for waitUs: useconds_t in [20_000, 40_000, 65_000] {
+                    usleep(waitUs)
+                    if self.snapOpenedPopoverWindowIfFound(
+                        axApp: axApp,
+                        baselineWindows: baselineAXWins,
+                        anchorRectCG: anchorRectCG,
+                        displayCG: anchorDisplayCG
+                    ) {
+                        cont.resume(returning: true)
+                        return
+                    }
+                }
+                cont.resume(returning: false)
+            }
+        }
+        if axOpened {
+            NSRunningApplication(processIdentifier: targetPID)?.activate()
+            return
+        }
+
+        let reopened = await attemptReopenForUnhostedMenuBarExtra(
+            item: item,
+            windowsBefore: windowsBefore,
+            anchorRectCG: anchorRectCG,
+            anchorDisplayCG: anchorDisplayCG
+        )
+        if reopened { return }
+
+        if let folderURL = cloudFolderURL {
+            NSWorkspace.shared.open(folderURL)
+            return
+        }
+
+        if let running = NSRunningApplication(processIdentifier: targetPID) {
+            running.activate()
+        }
+    }
+
+    private func quitTargetApplication(_ item: MenuBarAppItem) {
+        if let running = NSRunningApplication(processIdentifier: item.pid) {
+            if !running.terminate() {
+                kill(item.pid, SIGTERM)
+            }
+        } else if item.pid > 100 {
+            kill(item.pid, SIGTERM)
+        }
+
+        // If quitting OneDrive or its embedded OneDrive Sync Service helper, cleanly terminate both companion user processes
+        let bid = (item.bundleIdentifier ?? "").lowercased()
+        if bid == "com.microsoft.onedrive" || bid == "com.microsoft.sharepoint-mac" {
+            for companion in NSWorkspace.shared.runningApplications where companion.processIdentifier != item.pid {
+                let cbid = (companion.bundleIdentifier ?? "").lowercased()
+                if cbid == "com.microsoft.onedrive" || cbid == "com.microsoft.sharepoint-mac" {
+                    if !companion.terminate() {
+                        kill(companion.processIdentifier, SIGTERM)
+                    }
+                }
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+            self?.refreshRunningAppsAsync(forceFullScan: false)
+        }
+    }
+
+    private func resolveAppBundleURL(for item: MenuBarAppItem) -> URL? {
+        if let url = NSRunningApplication(processIdentifier: item.pid)?.bundleURL {
+            let p = url.path
+            if let outerRange = p.range(of: ".app/") {
+                let outerPath = String(p[..<outerRange.upperBound].dropLast())
+                return URL(fileURLWithPath: outerPath)
+            }
+            if url.pathExtension == "app" {
+                return url
+            }
+        }
+        if item.pid > 0 {
+            var pathBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            if proc_pidpath(item.pid, &pathBuf, UInt32(MAXPATHLEN)) > 0 {
+                let fullPath = String(cString: pathBuf)
+                if let r = fullPath.range(of: ".app/") {
+                    let appPath = String(fullPath[..<r.upperBound].dropLast())
+                    return URL(fileURLWithPath: appPath)
+                }
+            }
+        }
+        if let bundleID = item.bundleIdentifier, !bundleID.isEmpty {
+            return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        }
+        return nil
+    }
+
+    private func resolveCloudSyncFolderURL(for item: MenuBarAppItem) -> URL? {
+        let fingerprint = ((item.bundleIdentifier ?? "") + " " + item.appName).lowercased()
+        let cloudPrefix: String?
+        if fingerprint.contains("onedrive") {
+            cloudPrefix = "onedrive"
+        } else if fingerprint.contains("googledrive") || fingerprint.contains("google drive") {
+            cloudPrefix = "googledrive"
+        } else if fingerprint.contains("dropbox") {
+            cloudPrefix = "dropbox"
+        } else {
+            cloudPrefix = nil
+        }
+        guard let prefix = cloudPrefix else { return nil }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let cloudStorageDir = home.appendingPathComponent("Library/CloudStorage", isDirectory: true)
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: cloudStorageDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            if let match = entries.first(where: { $0.lastPathComponent.lowercased().hasPrefix(prefix) }) {
+                return match
+            }
+        }
+
+        if prefix == "onedrive" {
+            let legacy = home.appendingPathComponent("OneDrive", isDirectory: true)
+            if FileManager.default.fileExists(atPath: legacy.path) {
+                return legacy
+            }
+        }
+        return nil
+    }
+
+    nonisolated private func readStatusElementLabelFingerprint(_ axEl: AXUIElement) -> String {
+        var tRef: CFTypeRef?
+        var dRef: CFTypeRef?
+        let t = (AXUIElementCopyAttributeValue(axEl, kAXTitleAttribute as CFString, &tRef) == .success) ? ((tRef as? String) ?? "") : ""
+        let d = (AXUIElementCopyAttributeValue(axEl, kAXDescriptionAttribute as CFString, &dRef) == .success) ? ((dRef as? String) ?? "") : ""
+        return "\(t)|\(d)"
     }
 
     nonisolated private func readAXWindows(of axApp: AXUIElement) -> [AXUIElement] {

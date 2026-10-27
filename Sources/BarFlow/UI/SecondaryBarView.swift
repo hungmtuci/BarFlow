@@ -268,7 +268,7 @@ final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
         alphaValue = isBeingDragged ? 0.42 : 1.0
 
         let titleBase = item.statusTitle.isEmpty ? item.appName : "\(item.appName) (\(item.statusTitle))"
-        let newTip = "\(titleBase) • Click trái/phải: mở menu ứng dụng • Kéo thả: đổi thứ tự • ⌥+Click: tuỳ chọn BarFlow"
+        let newTip = "\(titleBase) • Click trái: mở ứng dụng • Click phải: mở menu / Thoát • Kéo thả: đổi thứ tự • ⌥+Click: tuỳ chọn BarFlow"
         if toolTip != newTip {
             toolTip = newTip
         }
