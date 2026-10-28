@@ -48,8 +48,8 @@
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.8.0.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.8.0-macOS.zip`**
+   - **`BarFlow-Installer-v1.8.1.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.8.1-macOS.zip`**
 2. Mở file `.dmg`:
    - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:

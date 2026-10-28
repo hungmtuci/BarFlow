@@ -163,7 +163,8 @@ final class MenuBarController: ObservableObject {
 
     private let interactionQueue = DispatchQueue(
         label: "com.hunglx.BarFlow.interaction",
-        qos: .userInteractive
+        qos: .userInteractive,
+        attributes: .concurrent
     )
     private let persistenceQueue = DispatchQueue(
         label: "com.hunglx.BarFlow.persistence",
@@ -181,6 +182,7 @@ final class MenuBarController: ObservableObject {
     private var isMenuCurrentlyTracking: Bool = false
     private var isScanningInBackground: Bool = false
     private var isPerformingHIDSequence: Bool = false
+    private var activeProbeStartedAt: CFAbsoluteTime = 0
 
     private var rehideMonitorTimer: Timer?
     private var backgroundMonitorTimer: Timer?
@@ -1558,6 +1560,23 @@ final class MenuBarController: ObservableObject {
         case fallbackSystemItem
     }
 
+    private final class OnceContinuationGate<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<T, Never>?
+
+        init(_ continuation: CheckedContinuation<T, Never>) {
+            self.continuation = continuation
+        }
+
+        func resume(returning value: T) {
+            lock.lock()
+            let cont = continuation
+            continuation = nil
+            lock.unlock()
+            cont?.resume(returning: value)
+        }
+    }
+
     /// Invoked when the user left-clicks or right-clicks an app icon inside the floating `Ctrl + B` Secondary Bar.
     func activateAppFromSecondaryBar(
         _ item: MenuBarAppItem,
@@ -1566,6 +1585,7 @@ final class MenuBarController: ObservableObject {
         anchorView: NSView? = nil
     ) {
         markUserInteraction()
+        SecondaryBarController.shared.notifyUserInteraction()
         Task { @MainActor in
             await performHiddenAppInteraction(
                 item,
@@ -1582,7 +1602,10 @@ final class MenuBarController: ObservableObject {
         anchorScreenRectAppKit: NSRect?,
         anchorView: NSView?
     ) async {
-        guard !isPerformingHIDSequence else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        if isPerformingHIDSequence && (now - activeProbeStartedAt) < 0.85 {
+            return
+        }
 
         // Pure system modules hosted inside ControlCenter (`pid == 0`, e.g. Wi-Fi, Battery, Screen Mirroring, Spotlight)
         if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture && item.pid == 0 {
@@ -1592,7 +1615,7 @@ final class MenuBarController: ObservableObject {
         }
 
         isPerformingHIDSequence = true
-        defer { isPerformingHIDSequence = false }
+        activeProbeStartedAt = now
 
         let displays = MenuBarScanner.captureDisplayGeometries()
         let windowsBefore = currentOnScreenWindows(for: item.pid)
@@ -1633,9 +1656,19 @@ final class MenuBarController: ObservableObject {
         let usesAgentArch = MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture
 
         let interactionResult = await withCheckedContinuation { (continuation: CheckedContinuation<HiddenInteractionResult, Never>) in
+            let gate = OnceContinuationGate(continuation)
+
+            // Hard 0.85s watchdog so a beachballing / hung app can NEVER block BarFlow or subsequent icon clicks!
+            interactionQueue.asyncAfter(deadline: .now() + 0.85) {
+                let fallback: HiddenInteractionResult = rightClick
+                    ? .synthesizedAppMenu(nil)
+                    : .needsReopenOrMenuFallback(nil)
+                gate.resume(returning: fallback)
+            }
+
             interactionQueue.async { [weak self] in
                 guard let self = self else {
-                    continuation.resume(returning: .triggeredActionOnly)
+                    gate.resume(returning: .triggeredActionOnly)
                     return
                 }
 
@@ -1646,13 +1679,13 @@ final class MenuBarController: ObservableObject {
                 )
                 guard let axEl = live?.element ?? item.axElement else {
                     if item.isSystemItem && usesAgentArch {
-                        continuation.resume(returning: .fallbackSystemItem)
+                        gate.resume(returning: .fallbackSystemItem)
                     } else if rightClick {
                         let appMenu = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
-                        continuation.resume(returning: .synthesizedAppMenu(appMenu))
+                        gate.resume(returning: .synthesizedAppMenu(appMenu))
                     } else {
                         let appMenu = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
-                        continuation.resume(returning: .needsReopenOrMenuFallback(appMenu))
+                        gate.resume(returning: .needsReopenOrMenuFallback(appMenu))
                     }
                     return
                 }
@@ -1660,15 +1693,15 @@ final class MenuBarController: ObservableObject {
                 AXUIElementSetMessagingTimeout(axEl, 0.16)
 
                 // STEP 1: Fast path — if the status item exposes an attached `AXMenu` (MKey/OpenKey, Alfred, QuickFolder,
-                // Moom, AnyDesk, Yoink, Typinator, Default Folder X, TextInputMenuAgent, etc.), mirror & pop it
-                // pixel-perfectly right underneath the clicked icon in < 2ms (works for BOTH Left-Click & Right-Click!).
+                // Moom, AnyDesk, Yoink, Typinator, Default Folder X, TextInputMenuAgent, etc.), mirror & pop its 1st level
+                // pixel-perfectly right underneath the clicked icon in < 10ms with lazy on-demand `NSMenuDelegate` submenus!
                 if let snapshot = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: false) {
-                    continuation.resume(returning: .mirroredMenu(snapshot))
+                    gate.resume(returning: .mirroredMenu(snapshot))
                     return
                 }
 
                 // STEP 2: Dedicated RIGHT-CLICK path for apps without a status-item `AXMenu`
-                // (`1Password 7`, `OneDrive`, `Google Drive`, `Caffeine`, `Maccy`, `AdGuard`, `Itsycal`, `LogiPresentation`):
+                // (`1Password 7`, `OneDrive`, `Google Drive`, `Dropbox`, `Caffeine`, `Maccy`, `Claude`, `Itsycal`):
                 // Never trigger Left-Click `AXPress` on Right-Click — otherwise 1Password re-opens its vault window instead
                 // of showing its Application Menu (`Settings…`, `Lock`, `Quit` / `Thoát`)!
                 if rightClick {
@@ -1682,7 +1715,7 @@ final class MenuBarController: ObservableObject {
                             for waitUs: useconds_t in [15_000, 30_000, 45_000] {
                                 usleep(waitUs)
                                 if let dynMenu = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: true) {
-                                    continuation.resume(returning: .mirroredMenu(dynMenu))
+                                    gate.resume(returning: .mirroredMenu(dynMenu))
                                     return
                                 }
                             }
@@ -1690,7 +1723,7 @@ final class MenuBarController: ObservableObject {
                     }
 
                     let appMenuSnap = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
-                    continuation.resume(returning: .synthesizedAppMenu(appMenuSnap))
+                    gate.resume(returning: .synthesizedAppMenu(appMenuSnap))
                     return
                 }
 
@@ -1730,7 +1763,7 @@ final class MenuBarController: ObservableObject {
                     usleep(waitUs)
 
                     if let dynMenu = AXStatusMenuBridge.shared.captureMenuSnapshot(from: axEl, cancelSourceMenuAfterRead: true) {
-                        continuation.resume(returning: .mirroredMenu(dynMenu))
+                        gate.resume(returning: .mirroredMenu(dynMenu))
                         return
                     }
 
@@ -1740,20 +1773,20 @@ final class MenuBarController: ObservableObject {
                         anchorRectCG: anchorRectCG,
                         displayCG: anchorDisplayCG
                     ) {
-                        continuation.resume(returning: .openedPopoverWindow)
+                        gate.resume(returning: .openedPopoverWindow)
                         return
                     }
                 }
 
                 if item.isSystemItem && usesAgentArch && !item.isCurrentlyOnBar {
-                    continuation.resume(returning: .fallbackSystemItem)
+                    gate.resume(returning: .fallbackSystemItem)
                     return
                 }
 
                 // Check if status item was a toggle switch whose title/description changed (e.g. Caffeine)
                 let afterLabel = self.readStatusElementLabelFingerprint(axEl)
                 if !beforeLabel.isEmpty && afterLabel != beforeLabel {
-                    continuation.resume(returning: .triggeredActionOnly)
+                    gate.resume(returning: .triggeredActionOnly)
                     return
                 }
 
@@ -1761,12 +1794,15 @@ final class MenuBarController: ObservableObject {
                 // abort `NSPopover` when unhosted by MenuBarAgent (`!item.isCurrentlyOnBar`). Present their native menu right under the icon!
                 if !item.isCurrentlyOnBar {
                     let appMenuSnap = AXStatusMenuBridge.shared.captureApplicationMenuSnapshot(forPID: targetPID)
-                    continuation.resume(returning: .needsReopenOrMenuFallback(appMenuSnap))
+                    gate.resume(returning: .needsReopenOrMenuFallback(appMenuSnap))
                 } else {
-                    continuation.resume(returning: .triggeredActionOnly)
+                    gate.resume(returning: .triggeredActionOnly)
                 }
             }
         }
+
+        // Release probe guard BEFORE modal NSMenu tracking so clicking another icon immediately after menu dismissal works 100%!
+        isPerformingHIDSequence = false
 
         // STEP 5: Finalize presentation on MainActor
         switch interactionResult {
@@ -1774,6 +1810,8 @@ final class MenuBarController: ObservableObject {
             presentMirroredSnapshotOnMain(
                 snapshot,
                 for: item,
+                rightClick: rightClick,
+                windowsBefore: windowsBefore,
                 anchorView: anchorView,
                 anchorScreenRectAppKit: anchorScreenRectAppKit
             )
@@ -1829,6 +1867,8 @@ final class MenuBarController: ObservableObject {
     private func presentMirroredSnapshotOnMain(
         _ snapshot: AXStatusMenuBridge.MirroredMenuSnapshot,
         for item: MenuBarAppItem,
+        rightClick: Bool,
+        windowsBefore: Set<Int>,
         anchorView: NSView?,
         anchorScreenRectAppKit: NSRect?
     ) {
@@ -1836,17 +1876,60 @@ final class MenuBarController: ObservableObject {
         if barVisible {
             SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
         }
-        let selectedNodeID = AXStatusMenuBridge.shared.presentMirroredMenu(
+        let selection = AXStatusMenuBridge.shared.presentMirroredMenu(
             snapshot,
+            includeGuaranteedQuitForAppName: rightClick ? item.appName : nil,
             anchorView: anchorView,
             anchorScreenRectAppKit: anchorScreenRectAppKit
         )
         if barVisible {
-            SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: selectedNodeID != nil)
+            SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: selection != nil)
         }
-        if let nodeID = selectedNodeID {
+
+        guard let selection = selection else { return }
+        switch selection {
+        case .quitAppExplicitly:
+            quitTargetApplication(item)
+
+        case .axNode(let nodeID, let selectedTitle):
+            let lower = selectedTitle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let isQuitCommand = lower.hasPrefix("quit") || lower.contains("thoát")
+            let opensDialogWindow =
+                lower.contains("setting") || lower.contains("preferenc") ||
+                lower.contains("cài đặt") || lower.contains("tuỳ chọn") || lower.contains("bảng điều khiển") ||
+                lower.contains("about") || lower.contains("giới thiệu") ||
+                lower.contains("update") || lower.contains("cập nhật") ||
+                lower.contains("quick start") || lower.contains("help") || lower.contains("buy") ||
+                lower.contains("license") || lower.contains("registration")
+
+            if opensDialogWindow {
+                NSRunningApplication(processIdentifier: item.pid)?.activate()
+            }
+
             interactionQueue.async {
                 AXStatusMenuBridge.shared.performSelectedMenuNode(nodeID, in: snapshot)
+            }
+
+            if isQuitCommand {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                    guard let self = self else { return }
+                    if let stillRunning = NSRunningApplication(processIdentifier: item.pid), !stillRunning.isTerminated {
+                        let alertOpened = !self.currentOnScreenWindows(for: item.pid).subtracting(windowsBefore).isEmpty
+                        if !alertOpened {
+                            self.quitTargetApplication(item)
+                            return
+                        }
+                    }
+                    self.refreshRunningAppsAsync(forceFullScan: false)
+                }
+            } else {
+                // If clicking the menu item opened a new window in that app, bring it to front automatically
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                    guard let self = self else { return }
+                    if !self.currentOnScreenWindows(for: item.pid).subtracting(windowsBefore).isEmpty {
+                        NSRunningApplication(processIdentifier: item.pid)?.activate()
+                    }
+                }
             }
         }
     }

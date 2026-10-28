@@ -157,6 +157,13 @@ final class SecondaryBarController: ObservableObject {
 
     // MARK: - Anchored App Menu / Popover Lifecycle
 
+    func notifyUserInteraction() {
+        lastInteractionDate = Date()
+        if countdown.progress != 1.0 {
+            countdown.progress = 1.0
+        }
+    }
+
     func beginMirroredMenuSession(itemID: String) {
         isPresentingMirroredMenu = true
         trackedPopoverPID = 0

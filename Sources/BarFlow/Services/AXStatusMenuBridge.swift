@@ -2,13 +2,15 @@ import Foundation
 import AppKit
 @preconcurrency import ApplicationServices
 
-/// Bridges a hidden status item's Accessibility `AXMenu` (`kAXMenuRole`) — or synthesizes a native
-/// Application Menu (with Settings / Lock / Quit) — anchored directly underneath the clicked icon in `Ctrl + B`.
+/// Bridges a hidden status item's Accessibility `AXMenu` (`kAXMenuRole`) — using instant 1-level snapshots
+/// and lazy on-demand `NSMenuDelegate` submenus so apps with huge folder trees (e.g. Default Folder X) open in < 10ms —
+/// or synthesizes a native Application Menu anchored directly underneath the clicked icon in `Ctrl + B`.
 final class AXStatusMenuBridge: @unchecked Sendable {
     static let shared = AXStatusMenuBridge()
 
     struct MirroredMenuSnapshot: Sendable {
         let items: [MirroredMenuItem]
+        let wasTruncated: Bool
         fileprivate let elementTable: AXElementTable
     }
 
@@ -20,7 +22,13 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         let stateRaw: Int // 1 = on, -1 = mixed, 0 = off
         let keyEquivalent: String
         let modifierMaskRaw: UInt
-        let submenuItems: [MirroredMenuItem]
+        /// Non-zero when this item owns a child `AXMenu` (`kAXMenuRole`) to be expanded lazily on hover.
+        let submenuAXID: Int
+    }
+
+    enum MirroredMenuSelection: Sendable {
+        case axNode(Int, String)
+        case quitAppExplicitly
     }
 
     enum SynthesizedMenuChoice: Sendable {
@@ -32,10 +40,13 @@ final class AXStatusMenuBridge: @unchecked Sendable {
     }
 
     fileprivate final class AXElementTable: @unchecked Sendable {
+        private let lock = NSLock()
         private var storage: [Int: AXUIElement] = [:]
         private var nextID: Int = 1
 
         func register(_ element: AXUIElement) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
             let id = nextID
             nextID += 1
             storage[id] = element
@@ -43,13 +54,15 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         }
 
         func element(for id: Int) -> AXUIElement? {
-            storage[id]
+            lock.lock()
+            defer { lock.unlock() }
+            return storage[id]
         }
     }
 
     private static let skippedBoilerplateTitles: Set<String> = [
         "services", "dịch vụ",
-        "hide others", "ẩn các ứng dụng khác",
+        "hide others", "ẩn các ứng dụng khác", "ẩn các mục khác",
         "show all", "hiển thị tất cả",
         "undo", "hoàn tác",
         "redo", "làm lại",
@@ -67,35 +80,42 @@ final class AXStatusMenuBridge: @unchecked Sendable {
 
     private init() {}
 
-    // MARK: - 1. Off-MainActor Status Item `AXMenu` Extraction
+    // MARK: - 1. Instant 1-Level `AXMenu` Extraction (Lazy Submenus Expanded Only on Hover!)
 
     /// Inspects `statusElement` (and any direct child button) for an attached `AXMenu` (`kAXMenuRole`).
+    /// Reads ONLY the top-level menu items (~1–12ms), deferring all nested submenus (`Computer ▸`, `Favorites ▸`, etc.)
+    /// to lazy `NSMenuDelegate` expansion when hovered.
     func captureMenuSnapshot(
         from statusElement: AXUIElement,
         cancelSourceMenuAfterRead: Bool = false
     ) -> MirroredMenuSnapshot? {
-        AXUIElementSetMessagingTimeout(statusElement, 0.16)
+        AXUIElementSetMessagingTimeout(statusElement, 0.14)
         guard let axMenu = findAXMenuElement(in: statusElement) else {
             return nil
         }
 
-        AXUIElementSetMessagingTimeout(axMenu, 0.16)
         let table = AXElementTable()
-        let items = readMenuItems(from: axMenu, table: table, depth: 0, filterAppBoilerplate: false)
+        let loaded = readSingleMenuLevel(
+            from: axMenu,
+            table: table,
+            filterAppBoilerplate: false,
+            maxItems: 120,
+            wallClockBudget: 0.35
+        )
         if cancelSourceMenuAfterRead {
             _ = AXUIElementPerformAction(axMenu, kAXCancelAction as CFString)
         }
-        guard !items.isEmpty else { return nil }
-        return MirroredMenuSnapshot(items: items, elementTable: table)
+        guard !loaded.items.isEmpty else { return nil }
+        return MirroredMenuSnapshot(items: loaded.items, wasTruncated: loaded.wasTruncated, elementTable: table)
     }
 
     /// Reads the target process's native macOS Application Menu (`kAXMenuBarAttribute` -> `children[1]`,
     /// e.g. `About`, `Settings… / Preferences…`, `Lock`, `Check for Updates…`, `Quit <App>`) for apps
-    /// like `1Password 7`, `OneDrive`, `Google Drive`, `Caffeine`, `Maccy`, etc. whose status item uses a custom popover.
+    /// like `1Password 7`, `OneDrive`, `Google Drive`, `Dropbox`, `Caffeine`, `Maccy`, `Claude`, etc.
     func captureApplicationMenuSnapshot(forPID pid: pid_t) -> MirroredMenuSnapshot? {
         guard pid > 0 else { return nil }
         let axApp = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(axApp, 0.18)
+        AXUIElementSetMessagingTimeout(axApp, 0.16)
 
         var menuBarRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXMenuBarAttribute as CFString, &menuBarRef) == .success,
@@ -111,15 +131,21 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         }
 
         let appMenuBarItem = topItems[1]
-        AXUIElementSetMessagingTimeout(appMenuBarItem, 0.15)
+        AXUIElementSetMessagingTimeout(appMenuBarItem, 0.14)
         guard let appAXMenu = findAXMenuElement(in: appMenuBarItem) else {
             return nil
         }
 
         let table = AXElementTable()
-        let items = readMenuItems(from: appAXMenu, table: table, depth: 0, filterAppBoilerplate: true)
-        guard !items.isEmpty else { return nil }
-        return MirroredMenuSnapshot(items: items, elementTable: table)
+        let loaded = readSingleMenuLevel(
+            from: appAXMenu,
+            table: table,
+            filterAppBoilerplate: true,
+            maxItems: 80,
+            wallClockBudget: 0.30
+        )
+        guard !loaded.items.isEmpty else { return nil }
+        return MirroredMenuSnapshot(items: loaded.items, wasTruncated: loaded.wasTruncated, elementTable: table)
     }
 
     private func findAXMenuElement(in element: AXUIElement) -> AXUIElement? {
@@ -130,7 +156,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         }
 
         for child in children {
-            AXUIElementSetMessagingTimeout(child, 0.12)
+            AXUIElementSetMessagingTimeout(child, 0.10)
             if axRole(of: child) == (kAXMenuRole as String) {
                 return child
             }
@@ -141,7 +167,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
             if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &grandRef) == .success,
                let grandChildren = grandRef as? [AXUIElement] {
                 for grand in grandChildren {
-                    AXUIElementSetMessagingTimeout(grand, 0.12)
+                    AXUIElementSetMessagingTimeout(grand, 0.10)
                     if axRole(of: grand) == (kAXMenuRole as String) {
                         return grand
                     }
@@ -151,55 +177,66 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         return nil
     }
 
-    private func readMenuItems(
+    private func findDirectChildAXMenu(of itemEl: AXUIElement) -> AXUIElement? {
+        var subRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(itemEl, kAXChildrenAttribute as CFString, &subRef) == .success,
+              let subs = subRef as? [AXUIElement], !subs.isEmpty else {
+            return nil
+        }
+        for sub in subs {
+            AXUIElementSetMessagingTimeout(sub, 0.08)
+            if axRole(of: sub) == (kAXMenuRole as String) {
+                return sub
+            }
+        }
+        return nil
+    }
+
+    /// Reads ONLY one `AXMenu` level with strict item count & wall-clock limits so large filesystem/cloud menus
+    /// never stall `BarFlow` or lock out other icons.
+    fileprivate func readSingleMenuLevel(
         from axMenu: AXUIElement,
         table: AXElementTable,
-        depth: Int,
-        filterAppBoilerplate: Bool
-    ) -> [MirroredMenuItem] {
-        guard depth <= 4 else { return [] }
+        filterAppBoilerplate: Bool,
+        maxItems: Int,
+        wallClockBudget: CFAbsoluteTime
+    ) -> (items: [MirroredMenuItem], wasTruncated: Bool) {
+        let deadline = CFAbsoluteTimeGetCurrent() + wallClockBudget
+        AXUIElementSetMessagingTimeout(axMenu, min(0.16, Float(wallClockBudget)))
+
         var childrenRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axMenu, kAXChildrenAttribute as CFString, &childrenRef) == .success,
               let children = childrenRef as? [AXUIElement], !children.isEmpty else {
-            return []
+            return ([], false)
         }
 
         var result: [MirroredMenuItem] = []
-        result.reserveCapacity(children.count)
+        result.reserveCapacity(min(children.count, maxItems))
+        var wasTruncated = false
 
-        for itemEl in children {
-            AXUIElementSetMessagingTimeout(itemEl, 0.12)
+        for (idx, itemEl) in children.enumerated() {
+            if result.count >= maxItems || (idx > 0 && CFAbsoluteTimeGetCurrent() >= deadline) {
+                wasTruncated = true
+                break
+            }
+
+            AXUIElementSetMessagingTimeout(itemEl, 0.08)
             let subrole = axString(itemEl, kAXSubroleAttribute as CFString) ?? ""
             let title = axString(itemEl, kAXTitleAttribute as CFString) ?? ""
             let enabled = axBool(itemEl, kAXEnabledAttribute as CFString, defaultValue: true)
 
-            if filterAppBoilerplate && depth == 0 && !title.isEmpty {
+            if filterAppBoilerplate && !title.isEmpty {
                 let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 if Self.skippedBoilerplateTitles.contains(normalized) {
                     continue
                 }
             }
 
-            var submenuItems: [MirroredMenuItem] = []
-            var subRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(itemEl, kAXChildrenAttribute as CFString, &subRef) == .success,
-               let subs = subRef as? [AXUIElement] {
-                for sub in subs {
-                    AXUIElementSetMessagingTimeout(sub, 0.12)
-                    if axRole(of: sub) == (kAXMenuRole as String) {
-                        submenuItems = readMenuItems(
-                            from: sub,
-                            table: table,
-                            depth: depth + 1,
-                            filterAppBoilerplate: false
-                        )
-                        break
-                    }
-                }
-            }
+            let childSubmenu = findDirectChildAXMenu(of: itemEl)
+            let submenuAXID = childSubmenu.map { table.register($0) } ?? 0
 
             let isSeparator = (subrole == "AXSeparatorMenuItem") ||
-                (title.isEmpty && !enabled && submenuItems.isEmpty)
+                (title.isEmpty && !enabled && submenuAXID == 0)
 
             if isSeparator {
                 result.append(
@@ -211,13 +248,13 @@ final class AXStatusMenuBridge: @unchecked Sendable {
                         stateRaw: 0,
                         keyEquivalent: "",
                         modifierMaskRaw: 0,
-                        submenuItems: []
+                        submenuAXID: 0
                     )
                 )
                 continue
             }
 
-            if title.isEmpty && submenuItems.isEmpty {
+            if title.isEmpty && submenuAXID == 0 {
                 continue
             }
 
@@ -245,12 +282,12 @@ final class AXStatusMenuBridge: @unchecked Sendable {
                     stateRaw: stateRaw,
                     keyEquivalent: keyEq,
                     modifierMaskRaw: modMask.rawValue,
-                    submenuItems: submenuItems
+                    submenuAXID: submenuAXID
                 )
             )
         }
 
-        return normalizeSeparators(in: result)
+        return (normalizeSeparators(in: result), wasTruncated)
     }
 
     private func normalizeSeparators(in raw: [MirroredMenuItem]) -> [MirroredMenuItem] {
@@ -286,19 +323,56 @@ final class AXStatusMenuBridge: @unchecked Sendable {
     @MainActor
     func presentMirroredMenu(
         _ snapshot: MirroredMenuSnapshot,
+        includeGuaranteedQuitForAppName: String? = nil,
         anchorView: NSView?,
         anchorScreenRectAppKit: NSRect?
-    ) -> Int? {
+    ) -> MirroredMenuSelection? {
         let actionHandler = MenuSelectionBox()
-        let nsMenu = buildNSMenu(from: snapshot.items, handler: actionHandler)
+        let nsMenu = NSMenu()
+        nsMenu.autoenablesItems = false
         nsMenu.minimumWidth = 170
 
+        appendMirroredItems(
+            snapshot.items,
+            wasTruncated: snapshot.wasTruncated,
+            depth: 0,
+            table: snapshot.elementTable,
+            into: nsMenu,
+            handler: actionHandler
+        )
+
+        if let appName = includeGuaranteedQuitForAppName {
+            let hasTopLevelQuit = snapshot.items.contains { node in
+                guard node.isEnabled else { return false }
+                let lower = node.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return lower.hasPrefix("quit") || lower.contains("thoát")
+            }
+            if !hasTopLevelQuit {
+                nsMenu.addItem(.separator())
+                let quitItem = NSMenuItem(
+                    title: "Thoát \(appName)",
+                    action: #selector(MenuSelectionBox.handleQuitApp),
+                    keyEquivalent: "q"
+                )
+                quitItem.keyEquivalentModifierMask = [.command]
+                quitItem.target = actionHandler
+                nsMenu.addItem(quitItem)
+            }
+        }
+
         popUpMenu(nsMenu, anchorView: anchorView, anchorScreenRectAppKit: anchorScreenRectAppKit)
-        return actionHandler.selectedNodeID
+
+        if let nodeID = actionHandler.selectedNodeID {
+            return .axNode(nodeID, actionHandler.selectedNodeTitle)
+        }
+        if actionHandler.synthesizedChoice != nil {
+            return .quitAppExplicitly
+        }
+        return nil
     }
 
     /// Presents a native right-click Application Menu for popover-based or `WindowMenuBarExtraStyle` apps
-    /// (`1Password 7`, `OneDrive`, `Google Drive`, `Caffeine`, `Maccy`, `AdGuard`, `Itsycal`, etc.)
+    /// (`1Password 7`, `OneDrive`, `Google Drive`, `Dropbox`, `Caffeine`, `Maccy`, `Claude`, `Itsycal`, etc.)
     /// so Right-Click ALWAYS shows Open / Preferences / Lock / Quit (`Thoát`) right under the icon!
     @MainActor
     func presentSynthesizedAppMenu(
@@ -338,7 +412,14 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         var hasEnabledNativeQuit = false
         if let snap = appMenuSnapshot, !snap.items.isEmpty {
             menu.addItem(.separator())
-            appendMirroredItems(snap.items, into: menu, handler: handler)
+            appendMirroredItems(
+                snap.items,
+                wasTruncated: snap.wasTruncated,
+                depth: 0,
+                table: snap.elementTable,
+                into: menu,
+                handler: handler
+            )
             hasEnabledNativeQuit = snap.items.contains { node in
                 guard node.isEnabled else { return false }
                 let lower = node.title.lowercased()
@@ -382,7 +463,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
 
     @MainActor
     private func popUpMenu(_ nsMenu: NSMenu, anchorView: NSView?, anchorScreenRectAppKit: NSRect?) {
-        if let view = anchorView, view.window != nil {
+        if let view = anchorView, let win = view.window, win.isVisible {
             let anchorPt = NSPoint(x: 0, y: -4)
             _ = nsMenu.popUp(positioning: nil, at: anchorPt, in: view)
         } else {
@@ -407,15 +488,14 @@ final class AXStatusMenuBridge: @unchecked Sendable {
     }
 
     @MainActor
-    private func buildNSMenu(from items: [MirroredMenuItem], handler: MenuSelectionBox) -> NSMenu {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-        appendMirroredItems(items, into: menu, handler: handler)
-        return menu
-    }
-
-    @MainActor
-    private func appendMirroredItems(_ items: [MirroredMenuItem], into menu: NSMenu, handler: MenuSelectionBox) {
+    fileprivate func appendMirroredItems(
+        _ items: [MirroredMenuItem],
+        wasTruncated: Bool,
+        depth: Int,
+        table: AXElementTable,
+        into menu: NSMenu,
+        handler: MenuSelectionBox
+    ) {
         for node in items {
             if node.isSeparator {
                 menu.addItem(.separator())
@@ -439,8 +519,26 @@ final class AXStatusMenuBridge: @unchecked Sendable {
             }
             nsItem.isEnabled = node.isEnabled
 
-            if !node.submenuItems.isEmpty {
-                nsItem.submenu = buildNSMenu(from: node.submenuItems, handler: handler)
+            if node.submenuAXID > 0 && depth < 12 {
+                let subMenu = NSMenu(title: node.title)
+                subMenu.autoenablesItems = false
+                let delegate = LazyAXSubmenuDelegate(
+                    submenuAXID: node.submenuAXID,
+                    depth: depth + 1,
+                    table: table,
+                    handler: handler
+                )
+                handler.retainedDelegates.append(delegate)
+                subMenu.delegate = delegate
+                nsItem.submenu = subMenu
+
+                // Inside cascading folder menus (depth >= 1, e.g. Default Folder X's Favorites/Recent Folders),
+                // allow clicking directly on a folder item itself while hovering still opens its subfolders!
+                if depth >= 1 && node.isEnabled && node.nodeID > 0 {
+                    nsItem.tag = node.nodeID
+                    nsItem.target = handler
+                    nsItem.action = #selector(MenuSelectionBox.handleMenuItemSelected(_:))
+                }
             } else if node.isEnabled && node.nodeID > 0 {
                 nsItem.tag = node.nodeID
                 nsItem.target = handler
@@ -448,6 +546,17 @@ final class AXStatusMenuBridge: @unchecked Sendable {
             }
 
             menu.addItem(nsItem)
+        }
+
+        if wasTruncated {
+            menu.addItem(.separator())
+            let moreItem = NSMenuItem(
+                title: "… (Đã rút gọn danh sách lớn)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            moreItem.isEnabled = false
+            menu.addItem(moreItem)
         }
     }
 
@@ -476,10 +585,69 @@ final class AXStatusMenuBridge: @unchecked Sendable {
 
     private func axInt(_ el: AXUIElement, _ attr: CFString) -> Int? {
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, attr, &ref) == .success, let num = ref as? NSNumber else {
+        guard AXUIElementCopyAttributeValue(el, attr, &ref) == .success, let num = ref else {
             return nil
         }
         return num.intValue
+    }
+}
+
+@MainActor
+private final class LazyAXSubmenuDelegate: NSObject, NSMenuDelegate {
+    private let submenuAXID: Int
+    private let depth: Int
+    private let table: AXStatusMenuBridge.AXElementTable
+    private weak var handler: MenuSelectionBox?
+    private var didPopulate = false
+
+    init(
+        submenuAXID: Int,
+        depth: Int,
+        table: AXStatusMenuBridge.AXElementTable,
+        handler: MenuSelectionBox
+    ) {
+        self.submenuAXID = submenuAXID
+        self.depth = depth
+        self.table = table
+        self.handler = handler
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard !didPopulate else { return }
+        didPopulate = true
+        menu.removeAllItems()
+
+        guard let handler = handler,
+              let axMenu = table.element(for: submenuAXID) else {
+            let empty = NSMenuItem(title: "(Trống)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+
+        let loaded = AXStatusMenuBridge.shared.readSingleMenuLevel(
+            from: axMenu,
+            table: table,
+            filterAppBoilerplate: false,
+            maxItems: 90,
+            wallClockBudget: 0.28
+        )
+
+        if loaded.items.isEmpty {
+            let empty = NSMenuItem(title: "(Trống)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+            return
+        }
+
+        AXStatusMenuBridge.shared.appendMirroredItems(
+            loaded.items,
+            wasTruncated: loaded.wasTruncated,
+            depth: depth,
+            table: table,
+            into: menu,
+            handler: handler
+        )
     }
 }
 
@@ -489,6 +657,7 @@ private final class MenuSelectionBox: NSObject {
     var selectedNodeTitle: String = ""
     var synthesizedChoice: AXStatusMenuBridge.SynthesizedMenuChoice? = nil
     var cloudFolderURL: URL? = nil
+    var retainedDelegates: [LazyAXSubmenuDelegate] = []
 
     @objc func handleMenuItemSelected(_ sender: NSMenuItem) {
         selectedNodeID = sender.tag

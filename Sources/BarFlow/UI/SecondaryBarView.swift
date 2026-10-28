@@ -302,6 +302,7 @@ final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
     // MARK: - Left Click, Right Click & Drag-to-Reorder
 
     override func mouseDown(with event: NSEvent) {
+        SecondaryBarController.shared.notifyUserInteraction()
         mouseDownPoint = convert(event.locationInWindow, from: nil)
         didStartDragSession = false
     }
@@ -355,6 +356,7 @@ final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
 
     override func rightMouseDown(with event: NSEvent) {
         // Consume rightMouseDown so SwiftUI/AppKit never shows a fallback context menu
+        SecondaryBarController.shared.notifyUserInteraction()
     }
 
     override func rightMouseUp(with event: NSEvent) {
