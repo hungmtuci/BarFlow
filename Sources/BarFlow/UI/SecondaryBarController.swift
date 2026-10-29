@@ -6,6 +6,42 @@ import SwiftUI
 final class NonActivatingBarPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    private var lastChromeRightClickTime: CFAbsoluteTime = 0
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .rightMouseUp {
+            let hitView = contentView?.hitTest(event.locationInWindow)
+            let isInsideIconStrip: Bool = {
+                var cur = hitView
+                while let v = cur {
+                    if v is SecondaryBarStripNSView {
+                        return true
+                    }
+                    cur = v.superview
+                }
+                return false
+            }()
+
+            if !isInsideIconStrip {
+                SecondaryBarController.shared.notifyUserInteraction()
+                let now = CFAbsoluteTimeGetCurrent()
+                if event.clickCount >= 2 || (now - lastChromeRightClickTime) <= 0.40 {
+                    lastChromeRightClickTime = 0
+                    let anchorPt = NSPoint(x: NSEvent.mouseLocation.x, y: frame.minY - 4)
+                    MenuBarController.shared.presentBarFlowManagementMenu(
+                        for: nil,
+                        anchorView: nil,
+                        anchorScreenPoint: anchorPt
+                    )
+                    return
+                } else {
+                    lastChromeRightClickTime = now
+                }
+            }
+        }
+        super.sendEvent(event)
+    }
 }
 
 /// Isolated observable model for the 1.5pt bottom countdown hairline so app icons never re-render on timer ticks.
@@ -153,6 +189,13 @@ final class SecondaryBarController: ObservableObject {
         if abs(panel.frame.width - newFrame.width) > 1 || abs(panel.frame.origin.x - newFrame.origin.x) > 1 {
             panel.setFrame(newFrame, display: true)
         }
+    }
+
+    /// Returns `true` if `cgPoint` lies within the currently visible `Ctrl + B` panel frame.
+    func containsCGPoint(_ cgPoint: CGPoint) -> Bool {
+        guard isVisible, let panel = panel, panel.isVisible else { return false }
+        let cgFrame = MenuBarScanner.appKitToCGRect(panel.frame)
+        return cgFrame.insetBy(dx: -2, dy: -2).contains(cgPoint)
     }
 
     // MARK: - Anchored App Menu / Popover Lifecycle

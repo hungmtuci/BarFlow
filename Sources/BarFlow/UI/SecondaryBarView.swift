@@ -20,6 +20,158 @@ final class LocalHoverBox: ObservableObject {
     @Published var isHovered: Bool = false
 }
 
+/// Shared screen-level floating icon preview panel (`ignoresMouseEvents = true`) used during live drag-to-reorder
+/// in `Ctrl + B` and `AppSelectionView` so dragged icons follow the cursor smoothly at 120fps even across bars!
+@MainActor
+final class FloatingIconDragGhost {
+    static let shared = FloatingIconDragGhost()
+
+    private var panel: NSPanel?
+    private let hostView = GhostBadgeView(frame: NSRect(x: 0, y: 0, width: 160, height: 34))
+
+    private init() {}
+
+    func showOrUpdate(icon: NSImage, label: String?, screenPoint: NSPoint, showPinBadge: Bool = false) {
+        let p: NSPanel
+        if let existing = panel {
+            p = existing
+        } else {
+            let created = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 160, height: 34),
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            created.isFloatingPanel = true
+            created.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 6)
+            created.backgroundColor = .clear
+            created.isOpaque = false
+            created.hasShadow = true
+            created.ignoresMouseEvents = true
+            created.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+            created.contentView = hostView
+            self.panel = created
+            p = created
+        }
+
+        let size = hostView.configure(icon: icon, label: label, showPinBadge: showPinBadge)
+        let origin = NSPoint(x: screenPoint.x - size.width * 0.5, y: screenPoint.y - size.height * 0.5 + 6)
+        p.setFrame(NSRect(origin: origin, size: size), display: true)
+        if !p.isVisible {
+            p.orderFrontRegardless()
+        }
+    }
+
+    func hide() {
+        panel?.orderOut(nil)
+    }
+
+    private final class GhostBadgeView: NSView {
+        private var icon: NSImage?
+        private var label: String?
+        private var showPinBadge: Bool = false
+
+        func configure(icon: NSImage, label: String?, showPinBadge: Bool) -> NSSize {
+            self.icon = icon
+            self.label = label
+            self.showPinBadge = showPinBadge
+            needsDisplay = true
+
+            if let text = label, !text.isEmpty {
+                let font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+                let textWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+                let totalWidth = min(max(44, 32 + textWidth + (showPinBadge ? 18 : 0)), 220)
+                return NSSize(width: totalWidth, height: 30)
+            } else {
+                return NSSize(width: showPinBadge ? 42 : 34, height: 34)
+            }
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            let pillRect = bounds.insetBy(dx: 1, dy: 1)
+            let radius: CGFloat = label == nil ? 9 : 14
+            let path = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
+
+            NSColor.windowBackgroundColor.withAlphaComponent(0.94).setFill()
+            path.fill()
+
+            (showPinBadge ? NSColor.systemGreen : NSColor.controlAccentColor).withAlphaComponent(0.85).setStroke()
+            path.lineWidth = 1.5
+            path.stroke()
+
+            if let img = icon {
+                let iconSize: CGFloat = label == nil ? 21 : 17
+                let iconX: CGFloat = label == nil ? (bounds.width - iconSize) * 0.5 - (showPinBadge ? 3 : 0) : 8
+                let iconRect = NSRect(
+                    x: iconX,
+                    y: (bounds.height - iconSize) * 0.5,
+                    width: iconSize,
+                    height: iconSize
+                )
+                drawAppKitIcon(img, in: iconRect, alpha: 1.0, respectFlipped: isFlipped)
+            }
+
+            if let text = label, !text.isEmpty {
+                let font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: NSColor.labelColor
+                ]
+                let strSize = (text as NSString).size(withAttributes: attrs)
+                let maxW = bounds.width - 32 - (showPinBadge ? 16 : 0)
+                let textRect = NSRect(
+                    x: 29,
+                    y: (bounds.height - strSize.height) * 0.5,
+                    width: max(10, maxW),
+                    height: strSize.height
+                )
+                (text as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs)
+            }
+
+            if showPinBadge {
+                let badgeSize: CGFloat = 13
+                let badgeRect = NSRect(
+                    x: bounds.maxX - badgeSize - 3,
+                    y: bounds.maxY - badgeSize - 3,
+                    width: badgeSize,
+                    height: badgeSize
+                )
+                let circle = NSBezierPath(ovalIn: badgeRect)
+                NSColor.systemGreen.setFill()
+                circle.fill()
+
+                let plusAttrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+                    .foregroundColor: NSColor.white
+                ]
+                let pSize = ("+" as NSString).size(withAttributes: plusAttrs)
+                ("+" as NSString).draw(
+                    at: NSPoint(
+                        x: badgeRect.midX - pSize.width * 0.5,
+                        y: badgeRect.midY - pSize.height * 0.5 + 0.5
+                    ),
+                    withAttributes: plusAttrs
+                )
+            }
+        }
+    }
+}
+
+fileprivate func drawAppKitIcon(_ img: NSImage, in rect: NSRect, alpha: CGFloat, respectFlipped: Bool) {
+    if img.isTemplate, let cg = NSGraphicsContext.current?.cgContext {
+        cg.saveGState()
+        cg.beginTransparencyLayer(auxiliaryInfo: nil)
+        img.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: respectFlipped, hints: nil)
+        NSColor.labelColor.withAlphaComponent(alpha).setFill()
+        rect.fill(using: .sourceIn)
+        cg.endTransparencyLayer()
+        cg.restoreGState()
+    } else {
+        img.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: respectFlipped, hints: nil)
+    }
+}
+
 struct SecondaryBarView: View {
     @ObservedObject var barController: SecondaryBarController
     @ObservedObject var menuController: MenuBarController
@@ -71,24 +223,12 @@ struct SecondaryBarView: View {
                 .padding(.horizontal, 6)
                 .frame(height: 26)
             } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: SecondaryBarController.iconSpacing) {
-                        ForEach(Array(apps.enumerated()), id: \.element.id) { index, item in
-                            SecondaryBarIconSlotRepresentable(
-                                item: item,
-                                index: index,
-                                totalCount: apps.count,
-                                isActiveOpened: activeID == item.id,
-                                isBeingDragged: draggingID == item.id,
-                                menuController: menuController
-                            )
-                            .frame(
-                                width: SecondaryBarController.iconSlotSize,
-                                height: SecondaryBarController.iconSlotSize
-                            )
-                        }
-                    }
-                }
+                SecondaryBarStripRepresentable(
+                    items: apps,
+                    activeOpenedID: activeID,
+                    draggingID: draggingID,
+                    menuController: menuController
+                )
                 .frame(height: SecondaryBarController.iconSlotSize)
             }
 
@@ -139,95 +279,84 @@ private struct AutoHideHairlineBar: View {
     }
 }
 
-// MARK: - Native AppKit Icon Slot (Direct Left-Click & Right-Click to App + Live Drag Reordering)
+// MARK: - Unified Native AppKit Icon Strip (120fps Live Drag Reorder + 1x/2x Right-Click)
 
-private struct SecondaryBarIconSlotRepresentable: NSViewRepresentable {
-    let item: MenuBarAppItem
-    let index: Int
-    let totalCount: Int
-    let isActiveOpened: Bool
-    let isBeingDragged: Bool
+private struct SecondaryBarStripRepresentable: NSViewRepresentable {
+    let items: [MenuBarAppItem]
+    let activeOpenedID: String?
+    let draggingID: String?
     let menuController: MenuBarController
 
-    func makeNSView(context: Context) -> SecondaryBarSlotNSView {
-        let view = SecondaryBarSlotNSView()
-        view.configure(
-            item: item,
-            index: index,
-            totalCount: totalCount,
-            isActiveOpened: isActiveOpened,
-            isBeingDragged: isBeingDragged,
-            menuController: menuController
-        )
-        return view
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasHorizontalScroller = false
+        scroll.hasVerticalScroller = false
+        scroll.borderType = .noBorder
+        scroll.autohidesScrollers = true
+
+        let strip = SecondaryBarStripNSView()
+        scroll.documentView = strip
+        applyConfiguration(to: scroll, strip: strip)
+        return scroll
     }
 
-    func updateNSView(_ nsView: SecondaryBarSlotNSView, context: Context) {
-        nsView.configure(
-            item: item,
-            index: index,
-            totalCount: totalCount,
-            isActiveOpened: isActiveOpened,
-            isBeingDragged: isBeingDragged,
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let strip = nsView.documentView as? SecondaryBarStripNSView else { return }
+        applyConfiguration(to: nsView, strip: strip)
+    }
+
+    private func applyConfiguration(to scroll: NSScrollView, strip: SecondaryBarStripNSView) {
+        let count = items.count
+        let slotSize = SecondaryBarController.iconSlotSize
+        let spacing = SecondaryBarController.iconSpacing
+        let totalWidth = CGFloat(count) * slotSize + CGFloat(max(count - 1, 0)) * spacing
+
+        let targetFrame = NSRect(x: 0, y: 0, width: max(totalWidth, slotSize), height: slotSize)
+        if strip.frame != targetFrame {
+            strip.frame = targetFrame
+        }
+        strip.configure(
+            items: items,
+            activeOpenedID: activeOpenedID,
+            draggingID: draggingID,
             menuController: menuController
         )
     }
 }
 
 @MainActor
-final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
-    private var item: MenuBarAppItem?
-    private var slotIndex: Int = 0
-    private var totalCount: Int = 1
-    private var isActiveOpened: Bool = false
-    private var isBeingDragged: Bool = false
+final class SecondaryBarStripNSView: NSView {
+    private var items: [MenuBarAppItem] = []
+    private var activeOpenedID: String? = nil
+    private var draggingID: String? = nil
     private weak var menuController: MenuBarController?
 
-    private let imageView = NSImageView()
     private var trackingAreaRef: NSTrackingArea?
-    private var isHovered: Bool = false {
+    private var hoveredIndex: Int? = nil {
         didSet {
-            if isHovered != oldValue {
+            if hoveredIndex != oldValue {
+                updateHoveredToolTip()
                 needsDisplay = true
             }
         }
     }
 
-    private var mouseDownPoint: NSPoint? = nil
-    private var didStartDragSession: Bool = false
+    // Direct pointer-tracking drag state (works 100% inside non-activating panels without NSDraggingSession issues!)
+    private var pressedItem: MenuBarAppItem? = nil
+    private var mouseDownLocalPt: NSPoint? = nil
+    private var isDraggingIcon: Bool = false
+    private var isHoveringMainMenuBar: Bool = false
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        imageView.imageScaling = .scaleProportionallyUpOrDown
-        imageView.isEditable = false
-        imageView.unregisterDraggedTypes()
-        addSubview(imageView)
-        registerForDraggedTypes([.string])
-    }
+    // Single right-click (app menu) vs Double right-click (BarFlow management menu)
+    private var pendingSingleRightClickWork: DispatchWorkItem? = nil
+    private var lastRightClickTime: CFAbsoluteTime = 0
+    private var lastRightClickItemID: String? = nil
+    private var lastEmptyGapRightClickTime: CFAbsoluteTime = 0
 
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+    override var isFlipped: Bool { true }
 
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        frame.contains(point) ? self : nil
-    }
-
-    override func layout() {
-        super.layout()
-        let iconSize: CGFloat = 20.0
-        imageView.frame = NSRect(
-            x: (bounds.width - iconSize) * 0.5,
-            y: (bounds.height - iconSize) * 0.5,
-            width: iconSize,
-            height: iconSize
-        )
-    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -236,7 +365,7 @@ final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
         }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -245,249 +374,317 @@ final class SecondaryBarSlotNSView: NSView, NSDraggingSource {
     }
 
     func configure(
-        item: MenuBarAppItem,
-        index: Int,
-        totalCount: Int,
-        isActiveOpened: Bool,
-        isBeingDragged: Bool,
+        items: [MenuBarAppItem],
+        activeOpenedID: String?,
+        draggingID: String?,
         menuController: MenuBarController
     ) {
-        let iconChanged = self.item?.id != item.id || self.item?.appIcon !== item.appIcon
-        let stateChanged = self.isActiveOpened != isActiveOpened || self.isBeingDragged != isBeingDragged
-
-        self.item = item
-        self.slotIndex = index
-        self.totalCount = totalCount
-        self.isActiveOpened = isActiveOpened
-        self.isBeingDragged = isBeingDragged
+        let changed = self.items != items || self.activeOpenedID != activeOpenedID || self.draggingID != draggingID
+        self.items = items
+        self.activeOpenedID = activeOpenedID
+        self.draggingID = draggingID
         self.menuController = menuController
-
-        if iconChanged {
-            imageView.image = item.appIcon
-        }
-        alphaValue = isBeingDragged ? 0.42 : 1.0
-
-        let titleBase = item.statusTitle.isEmpty ? item.appName : "\(item.appName) (\(item.statusTitle))"
-        let newTip = "\(titleBase) • Click trái: mở ứng dụng • Click phải: mở menu / Thoát • Kéo thả: đổi thứ tự • ⌥+Click: tuỳ chọn BarFlow"
-        if toolTip != newTip {
-            toolTip = newTip
-        }
-
-        if stateChanged {
+        if changed {
             needsDisplay = true
         }
     }
 
+    private func slotRect(for index: Int) -> NSRect {
+        let slotSize = SecondaryBarController.iconSlotSize
+        let stride = slotSize + SecondaryBarController.iconSpacing
+        return NSRect(x: CGFloat(index) * stride, y: 0, width: slotSize, height: slotSize)
+    }
+
+    private func slotIndex(at localPoint: NSPoint, allowVerticalSlack: CGFloat = 4.0) -> Int? {
+        guard !items.isEmpty else { return nil }
+        guard localPoint.y >= -allowVerticalSlack && localPoint.y <= bounds.height + allowVerticalSlack else {
+            return nil
+        }
+        let slotSize = SecondaryBarController.iconSlotSize
+        let stride = slotSize + SecondaryBarController.iconSpacing
+        let rawIdx = Int(floor((localPoint.x + SecondaryBarController.iconSpacing * 0.5) / stride))
+        guard rawIdx >= 0 && rawIdx < items.count else { return nil }
+        let rect = slotRect(for: rawIdx).insetBy(dx: -2, dy: -allowVerticalSlack)
+        return rect.contains(localPoint) ? rawIdx : nil
+    }
+
+    private func clampedReorderTargetIndex(forLocalX x: CGFloat) -> Int {
+        guard !items.isEmpty else { return 0 }
+        let stride = SecondaryBarController.iconSlotSize + SecondaryBarController.iconSpacing
+        let raw = Int(floor(x / stride))
+        return min(max(0, raw), items.count - 1)
+    }
+
+    private func slotScreenRect(for index: Int) -> NSRect? {
+        guard let win = window, index >= 0, index < items.count else { return nil }
+        let rectInWin = convert(slotRect(for: index), to: nil)
+        return win.convertToScreen(rectInWin)
+    }
+
+    private func updateHoveredToolTip() {
+        guard let idx = hoveredIndex, idx >= 0, idx < items.count else {
+            toolTip = nil
+            return
+        }
+        let item = items[idx]
+        let titleBase = item.statusTitle.isEmpty ? item.appName : "\(item.appName) (\(item.statusTitle))"
+        toolTip = "\(titleBase) • Click trái: mở ứng dụng • Click phải 1 lần: menu \(item.appName) • Click phải 2 lần: menu quản lý BarFlow • Kéo thả: đổi vị trí (kéo lên trên để ghim lên Menu Bar)"
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard isActiveOpened || isHovered else { return }
+        let iconSize: CGFloat = 20.0
 
-        let bgPath = NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6)
-        if isActiveOpened {
-            NSColor.controlAccentColor.withAlphaComponent(0.24).setFill()
-        } else {
-            NSColor.labelColor.withAlphaComponent(0.14).setFill()
+        for (idx, item) in items.enumerated() {
+            let rect = slotRect(for: idx)
+            guard rect.intersects(dirtyRect) else { continue }
+
+            let isOpened = (activeOpenedID == item.id)
+            let isDragged = (draggingID == item.id)
+            let isHover = (hoveredIndex == idx) && !isDraggingIcon
+
+            if isDragged {
+                let dropHighlight = NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
+                NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
+                dropHighlight.fill()
+                NSColor.controlAccentColor.withAlphaComponent(0.55).setStroke()
+                dropHighlight.lineWidth = 1.2
+                dropHighlight.stroke()
+            } else if isOpened || isHover {
+                let bgPath = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+                if isOpened {
+                    NSColor.controlAccentColor.withAlphaComponent(0.24).setFill()
+                } else {
+                    NSColor.labelColor.withAlphaComponent(0.14).setFill()
+                }
+                bgPath.fill()
+            }
+
+            let iconRect = NSRect(
+                x: rect.minX + (rect.width - iconSize) * 0.5,
+                y: rect.minY + (rect.height - iconSize) * 0.5,
+                width: iconSize,
+                height: iconSize
+            )
+            drawAppKitIcon(
+                item.appIcon,
+                in: iconRect,
+                alpha: isDragged ? 0.30 : 1.0,
+                respectFlipped: true
+            )
         }
-        bgPath.fill()
+    }
+
+    // MARK: - Hover Tracking
+
+    override func mouseMoved(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        hoveredIndex = slotIndex(at: pt)
     }
 
     override func mouseEntered(with event: NSEvent) {
-        isHovered = true
+        let pt = convert(event.locationInWindow, from: nil)
+        hoveredIndex = slotIndex(at: pt)
     }
 
     override func mouseExited(with event: NSEvent) {
-        isHovered = false
+        hoveredIndex = nil
     }
 
-    // MARK: - Left Click, Right Click & Drag-to-Reorder
+    // MARK: - Left Mouse: Instant Click + Live 120fps Drag-to-Reorder (or Drag Up to Main Menu Bar!)
 
     override func mouseDown(with event: NSEvent) {
+        cancelPendingSingleRightClick()
         SecondaryBarController.shared.notifyUserInteraction()
-        mouseDownPoint = convert(event.locationInWindow, from: nil)
-        didStartDragSession = false
+
+        let pt = convert(event.locationInWindow, from: nil)
+        mouseDownLocalPt = pt
+        isDraggingIcon = false
+        isHoveringMainMenuBar = false
+        if let idx = slotIndex(at: pt), idx < items.count {
+            pressedItem = items[idx]
+        } else {
+            pressedItem = nil
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !didStartDragSession,
-              let start = mouseDownPoint,
-              let item = item else { return }
-        let cur = convert(event.locationInWindow, from: nil)
-        guard hypot(cur.x - start.x, cur.y - start.y) >= 4.0 else { return }
+        SecondaryBarController.shared.notifyUserInteraction()
+        guard let startPt = mouseDownLocalPt,
+              let dragged = pressedItem,
+              let menuController = menuController else { return }
 
-        didStartDragSession = true
-        menuController?.beginDraggingItem(item.id)
+        let curLocal = convert(event.locationInWindow, from: nil)
+        if !isDraggingIcon {
+            guard hypot(curLocal.x - startPt.x, curLocal.y - startPt.y) >= 3.5 else { return }
+            isDraggingIcon = true
+            hoveredIndex = nil
+            menuController.beginDraggingItem(dragged.id)
+            NSCursor.closedHand.push()
+        }
 
-        let pbItem = NSPasteboardItem()
-        pbItem.setString(item.id, forType: .string)
-        let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
-        let dragRect = NSRect(
-            x: (bounds.width - 20) * 0.5,
-            y: (bounds.height - 20) * 0.5,
-            width: 20,
-            height: 20
+        let screenPt = NSEvent.mouseLocation
+        let screen = window?.screen ?? MenuBarScanner.screenContainingMouse()
+        let barThickness = MenuBarScanner.effectiveMenuBarThickness(for: screen)
+        let overMainBar = screenPt.y >= (screen.frame.maxY - barThickness - 4.0)
+        isHoveringMainMenuBar = overMainBar
+
+        FloatingIconDragGhost.shared.showOrUpdate(
+            icon: dragged.appIcon,
+            label: overMainBar ? "Ghim \(dragged.appName) lên Menu Bar" : nil,
+            screenPoint: screenPt,
+            showPinBadge: overMainBar
         )
-        dragItem.setDraggingFrame(dragRect, contents: item.appIcon)
-        beginDraggingSession(with: [dragItem], event: event, source: self)
+
+        if !overMainBar {
+            let targetIdx = clampedReorderTargetIndex(forLocalX: curLocal.x)
+            let liveList = menuController.secondaryBarApps
+            if targetIdx >= 0 && targetIdx < liveList.count {
+                let targetID = liveList[targetIdx].id
+                if targetID != dragged.id {
+                    menuController.reorderSecondaryBarItem(draggedID: dragged.id, targetID: targetID)
+                }
+            }
+        }
+        needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
-        defer {
-            mouseDownPoint = nil
-            didStartDragSession = false
-        }
-        guard !didStartDragSession, let item = item else { return }
-        let localPt = convert(event.locationInWindow, from: nil)
-        guard bounds.insetBy(dx: -4, dy: -4).contains(localPt) else { return }
+        let wasDragging = isDraggingIcon
+        let wasOverMainBar = isHoveringMainMenuBar
+        let activePressed = pressedItem
 
+        pressedItem = nil
+        mouseDownLocalPt = nil
+        isDraggingIcon = false
+        isHoveringMainMenuBar = false
+
+        if wasDragging {
+            NSCursor.pop()
+            FloatingIconDragGhost.shared.hide()
+            if wasOverMainBar, let dragged = activePressed {
+                menuController?.promoteSecondaryItemToMainBarAtScreenPoint(
+                    dragged,
+                    screenPointAppKit: NSEvent.mouseLocation
+                )
+            }
+            menuController?.endDraggingSession()
+            let pt = convert(event.locationInWindow, from: nil)
+            hoveredIndex = slotIndex(at: pt)
+            needsDisplay = true
+            return
+        }
+
+        guard let item = activePressed, let menuController = menuController else { return }
+        let curLocal = convert(event.locationInWindow, from: nil)
+        guard let idx = slotIndex(at: curLocal, allowVerticalSlack: 6.0),
+              idx < items.count,
+              items[idx].id == item.id else { return }
+
+        let screenRect = slotScreenRect(for: idx)
         if event.modifierFlags.contains(.option) {
-            presentBarFlowQuickOptionsMenu(for: item)
+            let anchorPt = screenRect.map { NSPoint(x: $0.minX, y: $0.minY - 4) }
+            menuController.presentBarFlowManagementMenu(
+                for: item,
+                anchorView: nil,
+                anchorScreenPoint: anchorPt
+            )
             return
         }
 
         let isCtrlClick = event.modifierFlags.contains(.control)
-        let screenRect = currentScreenRect()
-        menuController?.activateAppFromSecondaryBar(
+        menuController.activateAppFromSecondaryBar(
             item,
             rightClick: isCtrlClick,
             anchorScreenRectAppKit: screenRect,
-            anchorView: self
+            anchorView: nil
         )
     }
 
+    // MARK: - Right Mouse: 1x Right-Click -> App Menu, 2x Right-Click -> BarFlow Management Menu
+
+    private func cancelPendingSingleRightClick() {
+        pendingSingleRightClickWork?.cancel()
+        pendingSingleRightClickWork = nil
+    }
+
     override func rightMouseDown(with event: NSEvent) {
-        // Consume rightMouseDown so SwiftUI/AppKit never shows a fallback context menu
         SecondaryBarController.shared.notifyUserInteraction()
     }
 
     override func rightMouseUp(with event: NSEvent) {
-        guard let item = item else { return }
-        let localPt = convert(event.locationInWindow, from: nil)
-        guard bounds.insetBy(dx: -4, dy: -4).contains(localPt) else { return }
+        SecondaryBarController.shared.notifyUserInteraction()
+        guard let menuController = menuController else { return }
 
-        if event.modifierFlags.contains(.option) {
-            presentBarFlowQuickOptionsMenu(for: item)
+        let curLocal = convert(event.locationInWindow, from: nil)
+        let now = CFAbsoluteTimeGetCurrent()
+
+        guard let idx = slotIndex(at: curLocal, allowVerticalSlack: 6.0), idx < items.count else {
+            // Clicked on empty gap between icons inside the strip: 2x right-click opens BarFlow Management Menu!
+            if event.clickCount >= 2 || (now - lastEmptyGapRightClickTime) <= 0.40 {
+                lastEmptyGapRightClickTime = 0
+                let panelMinY = window?.frame.minY ?? NSEvent.mouseLocation.y
+                menuController.presentBarFlowManagementMenu(
+                    for: nil,
+                    anchorView: nil,
+                    anchorScreenPoint: NSPoint(x: NSEvent.mouseLocation.x, y: panelMinY - 4)
+                )
+            } else {
+                lastEmptyGapRightClickTime = now
+            }
             return
         }
 
-        // Right-click directly opens THIS app's menu right underneath its icon!
-        let screenRect = currentScreenRect()
-        menuController?.activateAppFromSecondaryBar(
-            item,
-            rightClick: true,
-            anchorScreenRectAppKit: screenRect,
-            anchorView: self
-        )
-    }
+        let item = items[idx]
+        let screenRect = slotScreenRect(for: idx)
+        let anchorPt = screenRect.map { NSPoint(x: $0.minX, y: $0.minY - 4) } ?? NSEvent.mouseLocation
 
-    private func currentScreenRect() -> NSRect? {
-        guard let win = window else { return nil }
-        let rectInWin = convert(bounds, to: nil)
-        return win.convertToScreen(rectInWin)
-    }
+        if event.modifierFlags.contains(.option) {
+            cancelPendingSingleRightClick()
+            lastRightClickTime = 0
+            lastRightClickItemID = nil
+            menuController.presentBarFlowManagementMenu(
+                for: item,
+                anchorView: nil,
+                anchorScreenPoint: anchorPt
+            )
+            return
+        }
 
-    // MARK: - NSDraggingSource & NSDraggingDestination
+        let isDoubleRightClick = event.clickCount >= 2 ||
+            (lastRightClickItemID == item.id && (now - lastRightClickTime) <= 0.36)
 
-    func draggingSession(
-        _ session: NSDraggingSession,
-        sourceOperationMaskFor context: NSDraggingContext
-    ) -> NSDragOperation {
-        .move
-    }
+        if isDoubleRightClick {
+            cancelPendingSingleRightClick()
+            lastRightClickTime = 0
+            lastRightClickItemID = nil
+            menuController.presentBarFlowManagementMenu(
+                for: item,
+                anchorView: nil,
+                anchorScreenPoint: anchorPt
+            )
+        } else {
+            cancelPendingSingleRightClick()
+            lastRightClickTime = now
+            lastRightClickItemID = item.id
 
-    func draggingSession(
-        _ session: NSDraggingSession,
-        endedAt screenPoint: NSPoint,
-        operation: NSDragOperation
-    ) {
-        menuController?.endDraggingSession()
-    }
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let targetID = item?.id,
-              let menuController = menuController else { return [] }
-        let draggedID = menuController.draggingItemID
-            ?? sender.draggingPasteboard.string(forType: .string)
-        if let draggedID, draggedID != targetID {
-            withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
-                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetID)
+            let capturedItem = item
+            let capturedRect = screenRect
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.pendingSingleRightClickWork = nil
+                self.lastRightClickTime = 0
+                self.lastRightClickItemID = nil
+                self.menuController?.activateAppFromSecondaryBar(
+                    capturedItem,
+                    rightClick: true,
+                    anchorScreenRectAppKit: capturedRect,
+                    anchorView: nil
+                )
             }
+            pendingSingleRightClickWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.21, execute: work)
         }
-        return .move
-    }
-
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        .move
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        if let targetID = item?.id,
-           let menuController = menuController {
-            let draggedID = menuController.draggingItemID
-                ?? sender.draggingPasteboard.string(forType: .string)
-            if let draggedID, draggedID != targetID {
-                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetID)
-            }
-            menuController.endDraggingSession()
-        }
-        return true
-    }
-
-    // MARK: - Optional Power-User BarFlow Menu (`Option + Click` / `Option + Right-Click`)
-
-    private func presentBarFlowQuickOptionsMenu(for item: MenuBarAppItem) {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-
-        let header = NSMenuItem(title: "Tuỳ chọn BarFlow — \(item.appName)", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(.separator())
-
-        let pinItem = NSMenuItem(title: "Đưa lên Menu Bar chính", action: #selector(handlePinToMainBar), keyEquivalent: "")
-        pinItem.target = self
-        menu.addItem(pinItem)
-
-        let leftItem = NSMenuItem(title: "Di chuyển sang trái (◀)", action: #selector(handleMoveLeft), keyEquivalent: "")
-        leftItem.target = self
-        leftItem.isEnabled = slotIndex > 0
-        menu.addItem(leftItem)
-
-        let rightItem = NSMenuItem(title: "Di chuyển sang phải (▶)", action: #selector(handleMoveRight), keyEquivalent: "")
-        rightItem.target = self
-        rightItem.isEnabled = slotIndex < (totalCount - 1)
-        menu.addItem(rightItem)
-
-        if NSRunningApplication(processIdentifier: item.pid) != nil {
-            menu.addItem(.separator())
-            let activateItem = NSMenuItem(title: "Chuyển tới cửa sổ \(item.appName)", action: #selector(handleActivateAppWindow), keyEquivalent: "")
-            activateItem.target = self
-            menu.addItem(activateItem)
-        }
-
-        SecondaryBarController.shared.beginMirroredMenuSession(itemID: item.id)
-        _ = menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: self)
-        SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: false)
-    }
-
-    @objc private func handlePinToMainBar() {
-        guard let item = item else { return }
-        menuController?.setAppSelection(item, visibleOnMainBar: true)
-    }
-
-    @objc private func handleMoveLeft() {
-        guard let item = item else { return }
-        menuController?.moveSecondaryBarItem(id: item.id, direction: -1)
-    }
-
-    @objc private func handleMoveRight() {
-        guard let item = item else { return }
-        menuController?.moveSecondaryBarItem(id: item.id, direction: 1)
-    }
-
-    @objc private func handleActivateAppWindow() {
-        guard let item = item else { return }
-        SecondaryBarController.shared.hide()
-        NSRunningApplication(processIdentifier: item.pid)?.activate()
     }
 }
 
@@ -512,6 +709,6 @@ private struct SecondaryBarSettingsButton: View {
                 hover.isHovered = inside
             }
         }
-        .help("Chọn lọc & sắp xếp ứng dụng Menu Bar")
+        .help("Chọn lọc & sắp xếp ứng dụng Menu Bar (Click phải 2 lần để mở nhanh menu BarFlow)")
     }
 }

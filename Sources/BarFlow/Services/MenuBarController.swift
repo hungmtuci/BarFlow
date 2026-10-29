@@ -201,6 +201,14 @@ final class MenuBarController: ObservableObject {
     private var isUpdatingLaunchAtLoginInternally: Bool = false
     private var statusItemScrollMonitor: Any?
     private var lastScrollTriggerTime: CFAbsoluteTime = 0
+    private var menuBarRightClickTap: CFMachPort?
+    private var menuBarRightClickRunLoopSource: CFRunLoopSource?
+    private var globalRightClickMonitor: Any?
+    private var lastMenuBarRightDownTime: CFAbsoluteTime = 0
+    private var lastMenuBarRightDownCGPoint: CGPoint = .zero
+    private var pendingMenuBarDoubleRightClickPoint: CGPoint? = nil
+    private var lastHandledPhysicalRightDownTime: CFAbsoluteTime = 0
+    private var isPresentingManagementMenu: Bool = false
 
     private init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -277,6 +285,7 @@ final class MenuBarController: ObservableObject {
     func start() {
         syncLaunchAtLoginStatusFromSystem()
         setupStatusItems()
+        installMenuBarRightClickMonitorIfNeeded()
         observeMenuTrackingNotifications()
         observeWorkspaceNotifications()
 
@@ -308,6 +317,7 @@ final class MenuBarController: ObservableObject {
                 }
 
                 if changedTrust && trusted {
+                    self.installMenuBarRightClickMonitorIfNeeded()
                     self.refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
                     return
                 }
@@ -340,6 +350,18 @@ final class MenuBarController: ObservableObject {
         if let mon = statusItemScrollMonitor {
             NSEvent.removeMonitor(mon)
             statusItemScrollMonitor = nil
+        }
+        if let rMon = globalRightClickMonitor {
+            NSEvent.removeMonitor(rMon)
+            globalRightClickMonitor = nil
+        }
+        if let src = menuBarRightClickRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+            menuBarRightClickRunLoopSource = nil
+        }
+        if let tap = menuBarRightClickTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            menuBarRightClickTap = nil
         }
         let finalSnapshot = makePersistedSnapshot()
         let url = stateFileURL
@@ -472,7 +494,146 @@ final class MenuBarController: ObservableObject {
     func refreshMainStatusItemToolTip() {
         guard let button = mainStatusItem?.button else { return }
         let hoverNote = hoverToOpenEnabled ? " • Rê chuột / cuộn để mở nhanh" : " • Cuộn chuột để mở/đóng nhanh"
-        button.toolTip = "BarFlow — Click trái (hoặc \(hotKeyBinding.readableDisplay)) để hiện/ẩn thanh phụ\(hoverNote) • Click phải để mở tuỳ chọn"
+        button.toolTip = "BarFlow — Click trái (hoặc \(hotKeyBinding.readableDisplay)) để hiện/ẩn thanh phụ\(hoverNote) • Click phải (hoặc click phải 2 lần trên Menu Bar / Ctrl+B) để mở tuỳ chọn BarFlow"
+    }
+
+    // MARK: - Passive Menu Bar Double Right-Click Monitor (1x = App Menu, 2x = BarFlow Management Menu)
+
+    private func installMenuBarRightClickMonitorIfNeeded() {
+        if globalRightClickMonitor == nil {
+            globalRightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.rightMouseDown, .rightMouseUp]) { [weak self] event in
+                let isDown = (event.type == .rightMouseDown)
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    let cgPt = self.currentMouseCGLocation()
+                    self.handleObservedGlobalRightMouse(isDown: isDown, cgPoint: cgPt)
+                }
+            }
+        }
+
+        if menuBarRightClickTap == nil && AXIsProcessTrusted() {
+            let mask: CGEventMask = (1 << CGEventType.rightMouseDown.rawValue) | (1 << CGEventType.rightMouseUp.rawValue)
+            let callback: CGEventTapCallBack = { _, type, event, userInfo in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let userInfo {
+                        let ctrl = Unmanaged<MenuBarController>.fromOpaque(userInfo).takeUnretainedValue()
+                        Task { @MainActor in
+                            if let tap = ctrl.menuBarRightClickTap {
+                                CGEvent.tapEnable(tap: tap, enable: true)
+                            }
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+                guard type == .rightMouseDown || type == .rightMouseUp else {
+                    return Unmanaged.passUnretained(event)
+                }
+                let isDown = (type == .rightMouseDown)
+                let loc = event.location
+                Task { @MainActor in
+                    MenuBarController.shared.handleObservedGlobalRightMouse(isDown: isDown, cgPoint: loc)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+            if let tap = CGEvent.tapCreate(
+                tap: .cghidEventTap,
+                place: .headInsertEventTap,
+                options: .listenOnly,
+                eventsOfInterest: mask,
+                callback: callback,
+                userInfo: selfPtr
+            ) {
+                let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+                if let src {
+                    CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+                    self.menuBarRightClickRunLoopSource = src
+                }
+                CGEvent.tapEnable(tap: tap, enable: true)
+                self.menuBarRightClickTap = tap
+            }
+        }
+    }
+
+    private func handleObservedGlobalRightMouse(isDown: Bool, cgPoint: CGPoint) {
+        guard !isPresentingManagementMenu else { return }
+
+        // Ignore clicks on BarFlow's own `•••` status item (already opens BarFlow menu directly)
+        if let ownRect = mainStatusItemFrameCG(), ownRect.insetBy(dx: -2, dy: -4).contains(cgPoint) {
+            pendingMenuBarDoubleRightClickPoint = nil
+            return
+        }
+
+        // Ignore clicks inside the floating `Ctrl + B` panel (handled directly by SecondaryBarView / NonActivatingBarPanel)
+        if SecondaryBarController.shared.containsCGPoint(cgPoint) {
+            pendingMenuBarDoubleRightClickPoint = nil
+            return
+        }
+
+        // Restrict strictly to the macOS Menu Bar band across connected displays
+        let displays = MenuBarScanner.captureDisplayGeometries()
+        guard let hitDisplay = displays.first(where: { disp in
+            cgPoint.x >= disp.cgFrame.minX &&
+            cgPoint.x <= disp.cgFrame.maxX &&
+            cgPoint.y >= (disp.cgFrame.minY - 2.0) &&
+            cgPoint.y <= (disp.cgFrame.minY + disp.menuBarThickness + 3.0)
+        }) else {
+            if isDown {
+                pendingMenuBarDoubleRightClickPoint = nil
+            }
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if isDown {
+            // Deduplicate if both CGEventTap and NSEvent global monitor report the same physical press
+            guard (now - lastHandledPhysicalRightDownTime) >= 0.035 else { return }
+            lastHandledPhysicalRightDownTime = now
+
+            let dt = now - lastMenuBarRightDownTime
+            let dist = hypot(cgPoint.x - lastMenuBarRightDownCGPoint.x, cgPoint.y - lastMenuBarRightDownCGPoint.y)
+            if dt <= 0.44 && dist <= 24.0 {
+                // Double Right-Click on Menu Bar detected! Wait for rightMouseUp before popping menu cleanly.
+                pendingMenuBarDoubleRightClickPoint = cgPoint
+                lastMenuBarRightDownTime = 0
+            } else {
+                lastMenuBarRightDownTime = now
+                lastMenuBarRightDownCGPoint = cgPoint
+                pendingMenuBarDoubleRightClickPoint = nil
+            }
+        } else {
+            guard let triggerCG = pendingMenuBarDoubleRightClickPoint else { return }
+            pendingMenuBarDoubleRightClickPoint = nil
+
+            let candidates = allRunningApps
+            let ownPID = ProcessInfo.processInfo.processIdentifier
+            let anchorAppKitPt = NSPoint(
+                x: triggerCG.x,
+                y: hitDisplay.appKitFrame.maxY - hitDisplay.menuBarThickness - 4.0
+            )
+
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                let matchedItem = await withCheckedContinuation { (cont: CheckedContinuation<MenuBarAppItem?, Never>) in
+                    self.interactionQueue.async {
+                        let found = MenuBarScanner.shared.hitTestMenuBarAppAndCancelOpenMenu(
+                            at: triggerCG,
+                            among: candidates,
+                            ownPID: ownPID
+                        )
+                        cont.resume(returning: found)
+                    }
+                }
+                // Give HIToolbox 25ms to finish unwinding any cancelled 1st-click menu before presenting BarFlow's menu
+                try? await Task.sleep(nanoseconds: 25_000_000)
+                self.presentBarFlowManagementMenu(
+                    for: matchedItem,
+                    anchorView: nil,
+                    anchorScreenPoint: anchorAppKitPt
+                )
+            }
+        }
     }
 
     private func installStatusItemScrollMonitorIfNeeded() {
@@ -522,14 +683,150 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    private func showQuickContextMenu(from button: NSStatusBarButton) {
+    @MainActor
+    private final class ManagementMenuActionBox: NSObject {
+        var targetItem: MenuBarAppItem?
+        weak var controller: MenuBarController?
+
+        @objc func toggleItemBarResidency() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            ctrl.toggleAppSelection(item)
+        }
+
+        @objc func moveItemLeft() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            if ctrl.selectedMainBarIDs.contains(item.id) {
+                ctrl.moveMainBarItem(id: item.id, direction: -1)
+            } else {
+                ctrl.moveSecondaryBarItem(id: item.id, direction: -1)
+            }
+        }
+
+        @objc func moveItemRight() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            if ctrl.selectedMainBarIDs.contains(item.id) {
+                ctrl.moveMainBarItem(id: item.id, direction: 1)
+            } else {
+                ctrl.moveSecondaryBarItem(id: item.id, direction: 1)
+            }
+        }
+
+        @objc func moveItemFarLeft() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            if ctrl.selectedMainBarIDs.contains(item.id) {
+                ctrl.moveMainBarItemToEdge(id: item.id, toStart: true)
+            } else {
+                ctrl.moveSecondaryBarItemToEdge(id: item.id, toStart: true)
+            }
+        }
+
+        @objc func moveItemFarRight() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            if ctrl.selectedMainBarIDs.contains(item.id) {
+                ctrl.moveMainBarItemToEdge(id: item.id, toStart: false)
+            } else {
+                ctrl.moveSecondaryBarItemToEdge(id: item.id, toStart: false)
+            }
+        }
+
+        @objc func quitSpecificApp() {
+            guard let item = targetItem, let ctrl = controller else { return }
+            ctrl.quitTargetApplication(item)
+        }
+    }
+
+    private func buildBarFlowManagementMenu(
+        for targetItem: MenuBarAppItem?,
+        actionBox: ManagementMenuActionBox
+    ) -> NSMenu {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         let ver = UpdateCheckerService.shared.currentVersion
+
+        if let item = targetItem {
+            actionBox.targetItem = item
+            actionBox.controller = self
+
+            let isPinnedMain = selectedMainBarIDs.contains(item.id)
+            let zoneList = isPinnedMain ? mainBarApps : secondaryBarApps
+            let posIdx = zoneList.firstIndex(where: { $0.id == item.id }) ?? 0
+            let totalCount = zoneList.count
+
+            let appHeader = NSMenuItem(
+                title: "BarFlow — Thao tác cho \(item.appName)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            appHeader.isEnabled = false
+            menu.addItem(appHeader)
+            menu.addItem(.separator())
+
+            let transferTitle = isPinnedMain
+                ? "Chuyển \(item.appName) xuống thanh phụ (\(hotKeyBinding.readableDisplay))"
+                : "Đưa \(item.appName) lên Menu Bar chính"
+            let transferItem = NSMenuItem(
+                title: transferTitle,
+                action: #selector(ManagementMenuActionBox.toggleItemBarResidency),
+                keyEquivalent: ""
+            )
+            transferItem.target = actionBox
+            menu.addItem(transferItem)
+
+            let leftItem = NSMenuItem(
+                title: "Di chuyển sang trái (◀)",
+                action: #selector(ManagementMenuActionBox.moveItemLeft),
+                keyEquivalent: ""
+            )
+            leftItem.target = actionBox
+            leftItem.isEnabled = posIdx > 0
+            menu.addItem(leftItem)
+
+            let rightItem = NSMenuItem(
+                title: "Di chuyển sang phải (▶)",
+                action: #selector(ManagementMenuActionBox.moveItemRight),
+                keyEquivalent: ""
+            )
+            rightItem.target = actionBox
+            rightItem.isEnabled = posIdx < (totalCount - 1)
+            menu.addItem(rightItem)
+
+            let farLeftItem = NSMenuItem(
+                title: "Đưa sang ngoài cùng bên trái",
+                action: #selector(ManagementMenuActionBox.moveItemFarLeft),
+                keyEquivalent: ""
+            )
+            farLeftItem.target = actionBox
+            farLeftItem.isEnabled = posIdx > 0
+            menu.addItem(farLeftItem)
+
+            let farRightItem = NSMenuItem(
+                title: "Đưa sang ngoài cùng bên phải",
+                action: #selector(ManagementMenuActionBox.moveItemFarRight),
+                keyEquivalent: ""
+            )
+            farRightItem.target = actionBox
+            farRightItem.isEnabled = posIdx < (totalCount - 1)
+            menu.addItem(farRightItem)
+
+            if item.pid > 0 && !item.isSystemItem {
+                let quitAppItem = NSMenuItem(
+                    title: "Thoát \(item.appName)",
+                    action: #selector(ManagementMenuActionBox.quitSpecificApp),
+                    keyEquivalent: ""
+                )
+                quitAppItem.target = actionBox
+                menu.addItem(quitAppItem)
+            }
+
+            menu.addItem(.separator())
+        }
 
         let header = NSMenuItem(title: "BarFlow v\(ver) — Quản lý Menu Bar", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        menu.addItem(.separator())
+        if targetItem == nil {
+            menu.addItem(.separator())
+        }
 
         let toggleBar = NSMenuItem(
             title: "Hiện / Ẩn thanh ứng dụng phụ (\(hotKeyBinding.readableDisplay))",
@@ -543,7 +840,7 @@ final class MenuBarController: ObservableObject {
         menu.addItem(toggleBar)
 
         let openSelect = NSMenuItem(
-            title: "Chọn lọc ứng dụng trên Menu Bar chính...",
+            title: "Chọn lọc & sắp xếp ứng dụng Menu Bar...",
             action: #selector(menuOpenSelectionWindow),
             keyEquivalent: ","
         )
@@ -620,6 +917,43 @@ final class MenuBarController: ObservableObject {
         quitItem.target = self
         menu.addItem(quitItem)
 
+        return menu
+    }
+
+    /// Presents BarFlow's management action menu (`menu thao tác của BarFlow`) at a view or screen coordinate.
+    func presentBarFlowManagementMenu(
+        for targetItem: MenuBarAppItem? = nil,
+        anchorView: NSView? = nil,
+        anchorScreenPoint: NSPoint? = nil
+    ) {
+        guard !isPresentingManagementMenu else { return }
+        isPresentingManagementMenu = true
+        markUserInteraction()
+
+        let actionBox = ManagementMenuActionBox()
+        let menu = buildBarFlowManagementMenu(for: targetItem, actionBox: actionBox)
+
+        let barVisible = SecondaryBarController.shared.isVisible
+        if barVisible {
+            SecondaryBarController.shared.beginMirroredMenuSession(itemID: targetItem?.id ?? "BarFlow.Management")
+        }
+
+        if let view = anchorView, let win = view.window, win.isVisible {
+            _ = menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: view)
+        } else {
+            let pt = anchorScreenPoint ?? NSEvent.mouseLocation
+            _ = menu.popUp(positioning: nil, at: pt, in: nil)
+        }
+
+        isPresentingManagementMenu = false
+        if barVisible {
+            SecondaryBarController.shared.endMirroredMenuSession(didSelectAction: false)
+        }
+    }
+
+    private func showQuickContextMenu(from button: NSStatusBarButton) {
+        let actionBox = ManagementMenuActionBox()
+        let menu = buildBarFlowManagementMenu(for: nil, actionBox: actionBox)
         mainStatusItem?.menu = menu
         button.performClick(nil)
         mainStatusItem?.menu = nil
@@ -1134,6 +1468,64 @@ final class MenuBarController: ObservableObject {
         } else if !toMainBar && selectedMainBarIDs.contains(draggedID) {
             setAppSelection(item, visibleOnMainBar: false)
         }
+    }
+
+    /// Reorders an item in the unified "Tất cả" (`allAppsOrderIDs`) list AND synchronizes the corresponding
+    /// Main Menu Bar or Secondary Bar (`Ctrl + B`) Left -> Right order!
+    func reorderAllAppsItem(draggedID: String, targetID: String) {
+        guard draggedID != targetID else { return }
+        var activeAllIDs = stableAllApps.map(\.id)
+        guard let fromIdx = activeAllIDs.firstIndex(of: draggedID),
+              let toIdx = activeAllIDs.firstIndex(of: targetID),
+              fromIdx != toIdx else { return }
+
+        let moved = activeAllIDs.remove(at: fromIdx)
+        activeAllIDs.insert(moved, at: toIdx)
+
+        let activeAllSet = Set(activeAllIDs)
+        allAppsOrderIDs = activeAllIDs + allAppsOrderIDs.filter { !activeAllSet.contains($0) }
+
+        var needsMainSync = false
+        if selectedMainBarIDs.contains(draggedID) {
+            let newMainActive = activeAllIDs.filter { selectedMainBarIDs.contains($0) }
+            if newMainActive != mainBarApps.map(\.id) {
+                let mSet = Set(newMainActive)
+                mainBarOrderIDs = newMainActive + mainBarOrderIDs.filter { !mSet.contains($0) }
+                needsMainSync = true
+            }
+        } else {
+            let newSecActive = activeAllIDs.filter { !selectedMainBarIDs.contains($0) }
+            if newSecActive != secondaryBarApps.map(\.id) {
+                let sSet = Set(newSecActive)
+                secondaryBarOrderIDs = newSecActive + secondaryBarOrderIDs.filter { !sSet.contains($0) }
+            }
+        }
+
+        markUserInteraction()
+        rebuildDerivedLists()
+        scheduleSaveState()
+        if needsMainSync {
+            scheduleNativeMenuBarSync(delay: 0.22)
+        }
+    }
+
+    /// Promotes a Secondary Bar item directly onto the Main Menu Bar at the horizontal screen X coordinate where it was dropped.
+    func promoteSecondaryItemToMainBarAtScreenPoint(_ item: MenuBarAppItem, screenPointAppKit: NSPoint) {
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 1440
+        let dropCGX = screenPointAppKit.x
+        let _ = primaryHeight
+
+        var insertBeforeID: String? = nil
+        let sortedMainWithFrames = mainBarApps.compactMap { m -> (id: String, midX: CGFloat)? in
+            guard let f = m.slotFrame, f.width > 0 else { return nil }
+            return (m.id, f.midX)
+        }.sorted { $0.midX < $1.midX }
+
+        if let nextRight = sortedMainWithFrames.first(where: { $0.midX > dropCGX }) {
+            insertBeforeID = nextRight.id
+        }
+        setAppSelection(item, visibleOnMainBar: true, insertBeforeID: insertBeforeID)
+        statusMessage = "Đã đưa \(item.appName) lên Menu Bar chính!"
     }
 
     // MARK: - Permission & Installation Helpers

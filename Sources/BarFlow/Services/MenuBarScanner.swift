@@ -791,6 +791,98 @@ final class MenuBarScanner: @unchecked Sendable {
         return str
     }
 
+    /// Identifies which `MenuBarAppItem` (if any) sits at `cgPoint` on the native macOS Menu Bar (`< 4ms`),
+    /// and cancels any open status `AXMenu` from the first right-click before BarFlow opens its management menu.
+    func hitTestMenuBarAppAndCancelOpenMenu(
+        at cgPoint: CGPoint,
+        among candidates: [MenuBarAppItem],
+        ownPID: pid_t
+    ) -> MenuBarAppItem? {
+        let sysWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(sysWide, 0.12)
+
+        var hitRef: AXUIElement?
+        var hitPID: pid_t = 0
+        var hitIdentifier: String? = nil
+
+        if AXUIElementCopyElementAtPosition(sysWide, Float(cgPoint.x), Float(cgPoint.y), &hitRef) == .success,
+           let hitEl = hitRef {
+            AXUIElementSetMessagingTimeout(hitEl, 0.12)
+            AXUIElementGetPid(hitEl, &hitPID)
+            if hitPID == ownPID {
+                return nil
+            }
+
+            hitIdentifier = readAXString(hitEl, kAXIdentifierAttribute as CFString)
+
+            // Walk up parents briefly to cancel any open AXMenu triggered by click #1 and capture parent identifier
+            var cursor: AXUIElement? = hitEl
+            for _ in 0..<5 {
+                guard let cur = cursor else { break }
+                AXUIElementSetMessagingTimeout(cur, 0.10)
+                let role = readAXString(cur, kAXRoleAttribute as CFString) ?? ""
+                if role == kAXMenuRole as String {
+                    _ = AXUIElementPerformAction(cur, kAXCancelAction as CFString)
+                }
+                if hitIdentifier == nil {
+                    hitIdentifier = readAXString(cur, kAXIdentifierAttribute as CFString)
+                }
+                var parentRef: CFTypeRef?
+                if AXUIElementCopyAttributeValue(cur, kAXParentAttribute as CFString, &parentRef) == .success,
+                   let p = parentRef {
+                    cursor = (p as! AXUIElement)
+                } else {
+                    cursor = nil
+                }
+            }
+        }
+
+        // 1. Direct frame hit-test against known on-bar items (accurate to exact icon slot)
+        var matched: MenuBarAppItem? = candidates.first { item in
+            guard item.isCurrentlyOnBar, let rect = item.slotFrame, rect.width > 0 else { return false }
+            return rect.insetBy(dx: -3, dy: -10).contains(cgPoint)
+        }
+
+        // 2. Fallback to AXIdentifier / PID match (verifying X proximity when frame is available)
+        if matched == nil, let axID = hitIdentifier, !axID.isEmpty {
+            matched = candidates.first { $0.axIdentifier == axID }
+        }
+        if matched == nil, hitPID > 0 {
+            let pidMatches = candidates.filter { $0.pid == hitPID && $0.isCurrentlyOnBar }
+            if pidMatches.count == 1, let single = pidMatches.first {
+                if let rect = single.slotFrame, rect.width > 0 {
+                    if abs(rect.midX - cgPoint.x) <= max(rect.width, 42) {
+                        matched = single
+                    }
+                } else {
+                    matched = single
+                }
+            } else if pidMatches.count > 1 {
+                matched = pidMatches.min(by: {
+                    abs(($0.slotFrame?.midX ?? 0) - cgPoint.x) < abs(($1.slotFrame?.midX ?? 0) - cgPoint.x)
+                })
+            }
+        }
+
+        // 3. Ensure any open AXMenu attached to the matched status item is cancelled cleanly
+        if let matchedItem = matched,
+           let live = liveStatusElement(for: matchedItem, timeout: 0.12) {
+            AXUIElementSetMessagingTimeout(live.element, 0.10)
+            var chRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(live.element, kAXChildrenAttribute as CFString, &chRef) == .success,
+               let children = chRef as? [AXUIElement] {
+                for ch in children {
+                    AXUIElementSetMessagingTimeout(ch, 0.08)
+                    if readAXString(ch, kAXRoleAttribute as CFString) == (kAXMenuRole as String) {
+                        _ = AXUIElementPerformAction(ch, kAXCancelAction as CFString)
+                    }
+                }
+            }
+        }
+
+        return matched
+    }
+
     // MARK: - Live Slot Map for Physical ⌘-Drag Arrangement
 
     func readLiveSlotsForArrangement(

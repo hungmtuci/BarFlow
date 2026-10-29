@@ -480,10 +480,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         let hiddenItems = hidingEnabled ? allApps.filter { !effectiveSelectedIDs.contains($0.id) } : []
 
-        // Check whether any hidden app is STILL physically hosted on the Main Menu Bar right now
-        let hasLiveBarMismatch = hiddenItems.contains(where: { $0.isCurrentlyOnBar }) ||
-            visibleItems.contains(where: { !$0.isCurrentlyOnBar && !$0.isSystemItem })
-
         // 1. Update System Menu Extras FIRST so their CFPreferencesSynchronize calls flush cleanly BEFORE we SIGKILL cfprefsd!
         let changedSystemModules = updateSystemModulesPreferences(
             visibleItems: visibleItems,
@@ -516,7 +512,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         )
 
         let anyChanged = ccResult.didChange || changedSystemModules || changedPositions
-        let shouldReload = anyChanged || (forceReload && hasLiveBarMismatch)
+        let shouldReload = anyChanged || forceReload
 
         guard shouldReload else {
             return SyncOutcome(
@@ -1180,10 +1176,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                 let modulePos = Int(nextPos - 38.0)
                 for modKey in ccModuleKeys {
                     let prefKey = "NSStatusItem Preferred Position \(modKey)" as CFString
-                    if let existingCCPos = (CFPreferencesCopyValue(prefKey, ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? NSNumber)?.intValue,
-                       abs(existingCCPos - modulePos) >= 4 {
+                    let existingCCPos = (CFPreferencesCopyValue(prefKey, ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? NSNumber)?.intValue
+                    if existingCCPos == nil || abs((existingCCPos ?? 0) - modulePos) >= 4 {
                         CFPreferencesSetValue(prefKey, modulePos as CFNumber, ccDomain, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
                         ccDomainTouched = true
+                        didChange = true
                     }
                 }
             }
@@ -1463,8 +1460,26 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     }
 
     private func flushUserCfprefsdAndReloadMenuBarAgent() {
+        let menuBarURL = URL(fileURLWithPath: menuBarGroupPlistPath)
+        let savedMenuBarData = try? Data(contentsOf: menuBarURL)
+        let oldAgentPID = currentMenuBarAgentPID()
+
         flushUserCfprefsd()
         usleep(20_000)
         terminateMenuBarAgent()
+
+        // Guard against old MenuBarAgent flushing stale in-memory TrailingItemPreferredPositions during SIGTERM exit
+        if let oldPID = oldAgentPID, let expectedData = savedMenuBarData {
+            for _ in 0..<10 {
+                usleep(10_000)
+                if kill(oldPID, 0) != 0 {
+                    break
+                }
+            }
+            if let afterExitData = try? Data(contentsOf: menuBarURL), afterExitData != expectedData {
+                try? expectedData.write(to: menuBarURL, options: .atomic)
+                flushUserCfprefsd()
+            }
+        }
     }
 }

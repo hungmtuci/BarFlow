@@ -347,13 +347,7 @@ struct AppSelectionView: View {
                     .padding(.vertical, 7)
                     .frame(minHeight: 38)
                 }
-                .onDrop(
-                    of: [UTType.text, UTType.plainText],
-                    delegate: BarZoneContainerDropDelegate(
-                        toMainBar: true,
-                        menuController: menuController
-                    )
-                )
+                .background(ZoneBoundsProbeRepresentable(isMainZone: true))
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color.primary.opacity(0.04))
@@ -425,13 +419,7 @@ struct AppSelectionView: View {
                     .padding(.vertical, 7)
                     .frame(minHeight: 38)
                 }
-                .onDrop(
-                    of: [UTType.text, UTType.plainText],
-                    delegate: BarZoneContainerDropDelegate(
-                        toMainBar: false,
-                        menuController: menuController
-                    )
-                )
+                .background(ZoneBoundsProbeRepresentable(isMainZone: false))
                 .background(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(Color.blue.opacity(0.05))
@@ -543,7 +531,8 @@ struct AppSelectionView: View {
             secIdxMap[s.id] = idx
         }
 
-        let allowRowDrag = isSearchEmpty && (filterMode == .mainBar || filterMode == .secondaryBar)
+        let allowRowDrag = isSearchEmpty
+        let currentFilterMode = filterMode
         let draggingID = menuController.draggingItemID
 
         return ScrollView {
@@ -567,13 +556,15 @@ struct AppSelectionView: View {
                         let posIdx = isSelected ? (mainIdxMap[item.id] ?? 0) : (secIdxMap[item.id] ?? 0)
                         let zoneTotal = isSelected ? mainApps.count : secApps.count
 
-                        let row = AppSelectionRow(
+                        AppSelectionRow(
                             item: item,
                             isSelectedOnMainBar: isSelected,
                             positionIndex: posIdx,
                             zoneCount: zoneTotal,
                             isBeingDragged: draggingID == item.id,
                             showDragHandle: allowRowDrag,
+                            filterMode: currentFilterMode,
+                            menuController: menuController,
                             onToggle: { newValue in
                                 menuController.setAppSelection(item, visibleOnMainBar: newValue)
                             },
@@ -603,24 +594,6 @@ struct AppSelectionView: View {
                             }
                         )
                         .equatable()
-
-                        if allowRowDrag {
-                            row
-                                .onDrag {
-                                    menuController.beginDraggingItem(item.id)
-                                    return NSItemProvider(object: item.id as NSString)
-                                }
-                                .onDrop(
-                                    of: [UTType.text, UTType.plainText],
-                                    delegate: BarZoneChipDropDelegate(
-                                        targetItemID: item.id,
-                                        isMainZone: filterMode == .mainBar,
-                                        menuController: menuController
-                                    )
-                                )
-                        } else {
-                            row
-                        }
                     }
                 }
             }
@@ -801,7 +774,522 @@ struct AppSelectionView: View {
     }
 }
 
-// MARK: - Supporting Chip, Drop Delegates & Equatable Row Views
+// MARK: - Native AppKit Live Drag Coordinator (Chips Zone A / Zone B + All-Tabs App Rows)
+
+@MainActor
+private final class SelectionDragCoordinator {
+    static let shared = SelectionDragCoordinator()
+
+    private struct WeakViewBox {
+        weak var view: NSView?
+    }
+
+    private weak var mainZoneContainerView: NSView?
+    private weak var secondaryZoneContainerView: NSView?
+    private var mainChipViews: [String: WeakViewBox] = [:]
+    private var secondaryChipViews: [String: WeakViewBox] = [:]
+    private var rowViews: [String: WeakViewBox] = [:]
+
+    private var dragEventMonitor: Any?
+    private var activeItem: MenuBarAppItem?
+    private var activeFilterMode: AppFilterMode = .all
+    private var allowDragMovement: Bool = true
+    private var startScreenPt: NSPoint = .zero
+    private var isDragging: Bool = false
+    private weak var activeController: MenuBarController?
+    private var pendingTapAction: (() -> Void)?
+
+    private init() {}
+
+    func registerZoneContainer(_ view: NSView, isMainZone: Bool) {
+        if isMainZone {
+            mainZoneContainerView = view
+        } else {
+            secondaryZoneContainerView = view
+        }
+    }
+
+    func registerChipView(_ view: NSView, itemID: String, isMainZone: Bool) {
+        if isMainZone {
+            mainChipViews[itemID] = WeakViewBox(view: view)
+        } else {
+            secondaryChipViews[itemID] = WeakViewBox(view: view)
+        }
+    }
+
+    func unregisterChipView(_ view: NSView, itemID: String, isMainZone: Bool) {
+        if isMainZone {
+            if mainChipViews[itemID]?.view === view {
+                mainChipViews.removeValue(forKey: itemID)
+            }
+        } else {
+            if secondaryChipViews[itemID]?.view === view {
+                secondaryChipViews.removeValue(forKey: itemID)
+            }
+        }
+    }
+
+    func registerRowView(_ view: NSView, itemID: String) {
+        rowViews[itemID] = WeakViewBox(view: view)
+    }
+
+    func unregisterRowView(_ view: NSView, itemID: String) {
+        if rowViews[itemID]?.view === view {
+            rowViews.removeValue(forKey: itemID)
+        }
+    }
+
+    func beginPointerTracking(
+        item: MenuBarAppItem,
+        allowDrag: Bool,
+        filterMode: AppFilterMode,
+        menuController: MenuBarController,
+        startScreenPt: NSPoint,
+        onTap: @escaping () -> Void
+    ) {
+        cancelActiveMonitorIfNeeded()
+
+        self.activeItem = item
+        self.allowDragMovement = allowDrag
+        self.activeFilterMode = filterMode
+        self.activeController = menuController
+        self.startScreenPt = startScreenPt
+        self.isDragging = false
+        self.pendingTapAction = onTap
+
+        dragEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            guard let self = self else { return event }
+            if event.type == .leftMouseDragged {
+                self.handleMouseDragged()
+            } else if event.type == .leftMouseUp {
+                self.handleMouseUp()
+            }
+            return event
+        }
+    }
+
+    private func handleMouseDragged() {
+        guard allowDragMovement,
+              let dragged = activeItem,
+              let ctrl = activeController else { return }
+
+        let curScreen = NSEvent.mouseLocation
+        if !isDragging {
+            guard hypot(curScreen.x - startScreenPt.x, curScreen.y - startScreenPt.y) >= 3.5 else { return }
+            isDragging = true
+            ctrl.beginDraggingItem(dragged.id)
+            NSCursor.closedHand.push()
+        }
+
+        let overMainZone = screenRect(of: mainZoneContainerView)?.insetBy(dx: -4, dy: -4).contains(curScreen) == true
+        let overSecZone = !overMainZone && (screenRect(of: secondaryZoneContainerView)?.insetBy(dx: -4, dy: -4).contains(curScreen) == true)
+
+        FloatingIconDragGhost.shared.showOrUpdate(
+            icon: dragged.appIcon,
+            label: dragged.appName,
+            screenPoint: curScreen,
+            showPinBadge: overMainZone && !ctrl.selectedMainBarIDs.contains(dragged.id)
+        )
+
+        if overMainZone {
+            handleDropHoverInZone(isMainZone: true, draggedID: dragged.id, curScreen: curScreen, ctrl: ctrl)
+            return
+        }
+
+        if overSecZone {
+            handleDropHoverInZone(isMainZone: false, draggedID: dragged.id, curScreen: curScreen, ctrl: ctrl)
+            return
+        }
+
+        // Check app list rows by vertical band
+        for (rowItemID, box) in rowViews {
+            guard rowItemID != dragged.id,
+                  let view = box.view,
+                  let rect = screenRect(of: view) else { continue }
+            let expandedRowBand = NSRect(
+                x: rect.minX - 16,
+                y: rect.minY - 2,
+                width: max(rect.width + 320, 560),
+                height: rect.height + 4
+            )
+            if expandedRowBand.contains(curScreen) {
+                withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                    switch activeFilterMode {
+                    case .mainBar:
+                        ctrl.reorderMainBarItem(draggedID: dragged.id, targetID: rowItemID)
+                    case .secondaryBar:
+                        ctrl.reorderSecondaryBarItem(draggedID: dragged.id, targetID: rowItemID)
+                    case .all:
+                        ctrl.reorderAllAppsItem(draggedID: dragged.id, targetID: rowItemID)
+                    }
+                }
+                break
+            }
+        }
+    }
+
+    private func handleDropHoverInZone(
+        isMainZone: Bool,
+        draggedID: String,
+        curScreen: NSPoint,
+        ctrl: MenuBarController
+    ) {
+        let liveZoneApps = isMainZone ? ctrl.mainBarApps : ctrl.secondaryBarApps
+        if liveZoneApps.isEmpty {
+            withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                ctrl.dropItemIntoZone(draggedID: draggedID, toMainBar: isMainZone)
+            }
+            return
+        }
+
+        let map = isMainZone ? mainChipViews : secondaryChipViews
+        var closestTargetID: String? = nil
+        var bestDistance: CGFloat = .greatestFiniteMagnitude
+
+        for app in liveZoneApps {
+            guard let v = map[app.id]?.view, let r = screenRect(of: v) else { continue }
+            if r.insetBy(dx: -3, dy: -8).contains(curScreen) {
+                closestTargetID = app.id
+                bestDistance = 0
+                break
+            }
+            let d = abs(r.midX - curScreen.x)
+            if d < bestDistance {
+                bestDistance = d
+                closestTargetID = app.id
+            }
+        }
+
+        if let targetID = closestTargetID {
+            if targetID != draggedID {
+                withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                    if isMainZone {
+                        ctrl.reorderMainBarItem(draggedID: draggedID, targetID: targetID)
+                    } else {
+                        ctrl.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetID)
+                    }
+                }
+            }
+        } else {
+            withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                ctrl.dropItemIntoZone(draggedID: draggedID, toMainBar: isMainZone)
+            }
+        }
+    }
+
+    private func handleMouseUp() {
+        let wasDragging = isDragging
+        let tap = pendingTapAction
+        let ctrl = activeController
+
+        cancelActiveMonitorIfNeeded()
+        activeItem = nil
+        pendingTapAction = nil
+        isDragging = false
+
+        if wasDragging {
+            NSCursor.pop()
+            FloatingIconDragGhost.shared.hide()
+            ctrl?.endDraggingSession()
+        } else {
+            tap?()
+        }
+    }
+
+    private func cancelActiveMonitorIfNeeded() {
+        if let mon = dragEventMonitor {
+            NSEvent.removeMonitor(mon)
+            dragEventMonitor = nil
+        }
+    }
+
+    private func screenRect(of view: NSView?) -> NSRect? {
+        guard let view = view, let win = view.window, win.isVisible else { return nil }
+        let visibleInView = view.visibleRect
+        guard visibleInView.width > 1 && visibleInView.height > 1 else { return nil }
+        let inWin = view.convert(visibleInView, to: nil)
+        return win.convertToScreen(inWin)
+    }
+}
+
+private struct ZoneBoundsProbeRepresentable: NSViewRepresentable {
+    let isMainZone: Bool
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        SelectionDragCoordinator.shared.registerZoneContainer(v, isMainZone: isMainZone)
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        SelectionDragCoordinator.shared.registerZoneContainer(nsView, isMainZone: isMainZone)
+    }
+}
+
+private struct ChipPointerOverlayRepresentable: NSViewRepresentable {
+    let item: MenuBarAppItem
+    let isMainZone: Bool
+    let toolTipText: String
+    let hoverBox: LocalHoverBox
+    let menuController: MenuBarController
+    let onTap: () -> Void
+
+    func makeNSView(context: Context) -> ChipHitNSView {
+        let v = ChipHitNSView()
+        v.configure(
+            item: item,
+            isMainZone: isMainZone,
+            toolTipText: toolTipText,
+            hoverBox: hoverBox,
+            menuController: menuController,
+            onTap: onTap
+        )
+        return v
+    }
+
+    func updateNSView(_ nsView: ChipHitNSView, context: Context) {
+        nsView.configure(
+            item: item,
+            isMainZone: isMainZone,
+            toolTipText: toolTipText,
+            hoverBox: hoverBox,
+            menuController: menuController,
+            onTap: onTap
+        )
+    }
+}
+
+@MainActor
+private final class ChipHitNSView: NSView {
+    private var item: MenuBarAppItem?
+    private var registeredID: String?
+    private var isMainZone: Bool = false
+    private weak var hoverBox: LocalHoverBox?
+    private weak var menuController: MenuBarController?
+    private var onTap: (() -> Void)?
+    private var trackingRef: NSTrackingArea?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil, let id = registeredID {
+            SelectionDragCoordinator.shared.unregisterChipView(self, itemID: id, isMainZone: isMainZone)
+        } else if let id = item?.id {
+            SelectionDragCoordinator.shared.registerChipView(self, itemID: id, isMainZone: isMainZone)
+            registeredID = id
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingRef = area
+    }
+
+    func configure(
+        item: MenuBarAppItem,
+        isMainZone: Bool,
+        toolTipText: String,
+        hoverBox: LocalHoverBox,
+        menuController: MenuBarController,
+        onTap: @escaping () -> Void
+    ) {
+        if let prevID = registeredID, (prevID != item.id || self.isMainZone != isMainZone) {
+            SelectionDragCoordinator.shared.unregisterChipView(self, itemID: prevID, isMainZone: self.isMainZone)
+        }
+        self.item = item
+        self.isMainZone = isMainZone
+        self.hoverBox = hoverBox
+        self.menuController = menuController
+        self.onTap = onTap
+        self.registeredID = item.id
+        if toolTip != toolTipText {
+            toolTip = toolTipText
+        }
+        SelectionDragCoordinator.shared.registerChipView(self, itemID: item.id, isMainZone: isMainZone)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if hoverBox?.isHovered != true {
+            hoverBox?.isHovered = true
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if hoverBox?.isHovered != false {
+            hoverBox?.isHovered = false
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        super.scrollWheel(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let item = item, let ctrl = menuController, let onTap = onTap else { return }
+        SelectionDragCoordinator.shared.beginPointerTracking(
+            item: item,
+            allowDrag: true,
+            filterMode: isMainZone ? .mainBar : .secondaryBar,
+            menuController: ctrl,
+            startScreenPt: NSEvent.mouseLocation,
+            onTap: onTap
+        )
+    }
+
+    override func rightMouseDown(with event: NSEvent) {}
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let item = item, let ctrl = menuController else { return }
+        ctrl.presentBarFlowManagementMenu(for: item, anchorView: self, anchorScreenPoint: nil)
+    }
+}
+
+private struct RowPointerOverlayRepresentable: NSViewRepresentable {
+    let item: MenuBarAppItem
+    let allowDrag: Bool
+    let filterMode: AppFilterMode
+    let hoverBox: LocalHoverBox
+    let menuController: MenuBarController
+    let onTap: () -> Void
+
+    func makeNSView(context: Context) -> RowHitNSView {
+        let v = RowHitNSView()
+        v.configure(
+            item: item,
+            allowDrag: allowDrag,
+            filterMode: filterMode,
+            hoverBox: hoverBox,
+            menuController: menuController,
+            onTap: onTap
+        )
+        return v
+    }
+
+    func updateNSView(_ nsView: RowHitNSView, context: Context) {
+        nsView.configure(
+            item: item,
+            allowDrag: allowDrag,
+            filterMode: filterMode,
+            hoverBox: hoverBox,
+            menuController: menuController,
+            onTap: onTap
+        )
+    }
+}
+
+@MainActor
+private final class RowHitNSView: NSView {
+    private var item: MenuBarAppItem?
+    private var registeredID: String?
+    private var allowDrag: Bool = true
+    private var filterMode: AppFilterMode = .all
+    private weak var hoverBox: LocalHoverBox?
+    private weak var menuController: MenuBarController?
+    private var onTap: (() -> Void)?
+    private var trackingRef: NSTrackingArea?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil, let id = registeredID {
+            SelectionDragCoordinator.shared.unregisterRowView(self, itemID: id)
+        } else if let id = item?.id {
+            SelectionDragCoordinator.shared.registerRowView(self, itemID: id)
+            registeredID = id
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingRef {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingRef = area
+    }
+
+    func configure(
+        item: MenuBarAppItem,
+        allowDrag: Bool,
+        filterMode: AppFilterMode,
+        hoverBox: LocalHoverBox,
+        menuController: MenuBarController,
+        onTap: @escaping () -> Void
+    ) {
+        if let prevID = registeredID, prevID != item.id {
+            SelectionDragCoordinator.shared.unregisterRowView(self, itemID: prevID)
+        }
+        self.item = item
+        self.allowDrag = allowDrag
+        self.filterMode = filterMode
+        self.hoverBox = hoverBox
+        self.menuController = menuController
+        self.onTap = onTap
+        self.registeredID = item.id
+        let tip = allowDrag
+            ? "\(item.appName) • Kéo thả lên/xuống (hoặc kéo vào khung trên) để đổi vị trí • Click để chuyển thanh • Click phải để mở tuỳ chọn"
+            : "\(item.appName) • Click để chuyển giữa Menu Bar chính và thanh phụ"
+        if toolTip != tip {
+            toolTip = tip
+        }
+        SelectionDragCoordinator.shared.registerRowView(self, itemID: item.id)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if hoverBox?.isHovered != true {
+            hoverBox?.isHovered = true
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if hoverBox?.isHovered != false {
+            hoverBox?.isHovered = false
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        super.scrollWheel(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let item = item, let ctrl = menuController, let onTap = onTap else { return }
+        SelectionDragCoordinator.shared.beginPointerTracking(
+            item: item,
+            allowDrag: allowDrag,
+            filterMode: filterMode,
+            menuController: ctrl,
+            startScreenPt: NSEvent.mouseLocation,
+            onTap: onTap
+        )
+    }
+
+    override func rightMouseDown(with event: NSEvent) {}
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let item = item, let ctrl = menuController else { return }
+        ctrl.presentBarFlowManagementMenu(for: item, anchorView: self, anchorScreenPoint: nil)
+    }
+}
+
+// MARK: - Supporting Chip & Equatable Row Views
 
 private struct PreviewChipButton: View {
     let item: MenuBarAppItem
@@ -815,188 +1303,60 @@ private struct PreviewChipButton: View {
     @StateObject private var hover = LocalHoverBox()
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Text("\(positionNumber)")
-                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                    .foregroundStyle(isPinnedMain ? Color.green : Color.blue)
-                    .frame(minWidth: 14, minHeight: 14)
-                    .padding(.horizontal, 2)
-                    .background(
-                        (isPinnedMain ? Color.green : Color.blue).opacity(0.14),
-                        in: Capsule()
-                    )
+        let tipText = isPinnedMain
+            ? "Vị trí #\(positionNumber)/\(totalCount) trên Menu Bar chính • Kéo thả để đổi thứ tự (hoặc kéo xuống khung dưới) • Click để chuyển xuống Ctrl + B • Click phải để mở menu"
+            : "Vị trí #\(positionNumber)/\(totalCount) trên thanh phụ Ctrl + B • Kéo thả để đổi thứ tự (hoặc kéo lên khung trên) • Click để đưa lên Menu Bar chính • Click phải để mở menu"
 
-                Image(nsImage: item.appIcon)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 17, height: 17)
-
-                Text(item.appName)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .lineLimit(1)
-            }
-            .padding(.leading, 5)
-            .padding(.trailing, 8)
-            .padding(.vertical, 4)
-            .background(
-                Capsule()
-                    .fill(hover.isHovered
-                          ? (isPinnedMain ? Color.red.opacity(0.13) : Color.green.opacity(0.15))
-                          : Color(nsColor: .windowBackgroundColor))
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(
-                        isBeingDragged
-                            ? Color.accentColor
-                            : Color.primary.opacity(0.12),
-                        lineWidth: isBeingDragged ? 1.4 : 0.8
-                    )
-            )
-            .opacity(isBeingDragged ? 0.45 : 1.0)
-        }
-        .buttonStyle(.plain)
-        .onHover { inside in
-            if hover.isHovered != inside {
-                hover.isHovered = inside
-            }
-        }
-        .onDrag {
-            menuController.beginDraggingItem(item.id)
-            return NSItemProvider(object: item.id as NSString)
-        }
-        .onDrop(
-            of: [UTType.text, UTType.plainText],
-            delegate: BarZoneChipDropDelegate(
-                targetItemID: item.id,
-                isMainZone: isPinnedMain,
-                menuController: menuController
-            )
-        )
-        .contextMenu {
-            Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    if isPinnedMain {
-                        menuController.moveMainBarItem(id: item.id, direction: -1)
-                    } else {
-                        menuController.moveSecondaryBarItem(id: item.id, direction: -1)
-                    }
-                }
-            } label: {
-                Label("Di chuyển sang trái (◀)", systemImage: "arrow.left")
-            }
-            .disabled(positionNumber <= 1)
-
-            Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    if isPinnedMain {
-                        menuController.moveMainBarItem(id: item.id, direction: 1)
-                    } else {
-                        menuController.moveSecondaryBarItem(id: item.id, direction: 1)
-                    }
-                }
-            } label: {
-                Label("Di chuyển sang phải (▶)", systemImage: "arrow.right")
-            }
-            .disabled(positionNumber >= totalCount)
-
-            Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    if isPinnedMain {
-                        menuController.moveMainBarItemToEdge(id: item.id, toStart: true)
-                    } else {
-                        menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: true)
-                    }
-                }
-            } label: {
-                Label("Đưa sang ngoài cùng bên trái", systemImage: "arrow.left.to.line")
-            }
-            .disabled(positionNumber <= 1)
-
-            Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
-                    if isPinnedMain {
-                        menuController.moveMainBarItemToEdge(id: item.id, toStart: false)
-                    } else {
-                        menuController.moveSecondaryBarItemToEdge(id: item.id, toStart: false)
-                    }
-                }
-            } label: {
-                Label("Đưa sang ngoài cùng bên phải", systemImage: "arrow.right.to.line")
-            }
-            .disabled(positionNumber >= totalCount)
-
-            Divider()
-
-            Button(action: action) {
-                Label(
-                    isPinnedMain ? "Chuyển xuống thanh phụ Ctrl + B" : "Đưa lên Menu Bar chính",
-                    systemImage: isPinnedMain ? "arrow.down.circle" : "pin.fill"
+        return HStack(spacing: 5) {
+            Text("\(positionNumber)")
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .foregroundStyle(isPinnedMain ? Color.green : Color.blue)
+                .frame(minWidth: 14, minHeight: 14)
+                .padding(.horizontal, 2)
+                .background(
+                    (isPinnedMain ? Color.green : Color.blue).opacity(0.14),
+                    in: Capsule()
                 )
-            }
+
+            Image(nsImage: item.appIcon)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 17, height: 17)
+
+            Text(item.appName)
+                .font(.system(size: 11.5, weight: .medium))
+                .lineLimit(1)
         }
-        .help(
-            isPinnedMain
-                ? "Vị trí #\(positionNumber) trên Menu Bar chính • Kéo thả để đổi thứ tự • Click để chuyển xuống Ctrl + B"
-                : "Vị trí #\(positionNumber) trên thanh phụ Ctrl + B • Kéo thả để đổi thứ tự • Click để đưa lên Menu Bar chính"
+        .padding(.leading, 5)
+        .padding(.trailing, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(hover.isHovered
+                      ? (isPinnedMain ? Color.red.opacity(0.13) : Color.green.opacity(0.15))
+                      : Color(nsColor: .windowBackgroundColor))
         )
-    }
-}
-
-@MainActor
-private struct BarZoneChipDropDelegate: DropDelegate {
-    let targetItemID: String
-    let isMainZone: Bool
-    let menuController: MenuBarController
-
-    func dropEntered(info: DropInfo) {
-        guard let draggedID = menuController.draggingItemID,
-              draggedID != targetItemID else { return }
-        withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
-            if isMainZone {
-                menuController.reorderMainBarItem(draggedID: draggedID, targetID: targetItemID)
-            } else {
-                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
-            }
+        .overlay(
+            Capsule()
+                .strokeBorder(
+                    isBeingDragged
+                        ? Color.accentColor
+                        : Color.primary.opacity(0.12),
+                    lineWidth: isBeingDragged ? 1.4 : 0.8
+                )
+        )
+        .opacity(isBeingDragged ? 0.35 : 1.0)
+        .overlay {
+            ChipPointerOverlayRepresentable(
+                item: item,
+                isMainZone: isPinnedMain,
+                toolTipText: tipText,
+                hoverBox: hover,
+                menuController: menuController,
+                onTap: action
+            )
         }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        if let draggedID = menuController.draggingItemID, draggedID != targetItemID {
-            if isMainZone {
-                menuController.reorderMainBarItem(draggedID: draggedID, targetID: targetItemID)
-            } else {
-                menuController.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetItemID)
-            }
-        }
-        menuController.endDraggingSession()
-        return true
-    }
-}
-
-@MainActor
-private struct BarZoneContainerDropDelegate: DropDelegate {
-    let toMainBar: Bool
-    let menuController: MenuBarController
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        if let draggedID = menuController.draggingItemID {
-            withAnimation(.interactiveSpring(response: 0.20, dampingFraction: 0.84)) {
-                menuController.dropItemIntoZone(draggedID: draggedID, toMainBar: toMainBar)
-            }
-        }
-        menuController.endDraggingSession()
-        return true
     }
 }
 
@@ -1007,6 +1367,8 @@ private struct AppSelectionRow: View, Equatable {
     let zoneCount: Int
     let isBeingDragged: Bool
     let showDragHandle: Bool
+    let filterMode: AppFilterMode
+    let menuController: MenuBarController
     let onToggle: (Bool) -> Void
     let onRowTap: () -> Void
     let onMoveLeft: () -> Void
@@ -1021,20 +1383,20 @@ private struct AppSelectionRow: View, Equatable {
         lhs.positionIndex == rhs.positionIndex &&
         lhs.zoneCount == rhs.zoneCount &&
         lhs.isBeingDragged == rhs.isBeingDragged &&
-        lhs.showDragHandle == rhs.showDragHandle
+        lhs.showDragHandle == rhs.showDragHandle &&
+        lhs.filterMode == rhs.filterMode
     }
 
     var body: some View {
         HStack(spacing: 10) {
-            if showDragHandle {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 14)
-                    .help("Kéo thả lên/xuống để đổi thứ tự Trái → Phải")
-            }
-
             HStack(spacing: 11) {
+                if showDragHandle {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(hover.isHovered ? .secondary : .tertiary)
+                        .frame(width: 14)
+                }
+
                 Image(nsImage: item.appIcon)
                     .resizable()
                     .interpolation(.high)
@@ -1077,9 +1439,15 @@ private struct AppSelectionRow: View, Equatable {
 
                 Spacer(minLength: 6)
             }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                onRowTap()
+            .overlay {
+                RowPointerOverlayRepresentable(
+                    item: item,
+                    allowDrag: showDragHandle,
+                    filterMode: filterMode,
+                    hoverBox: hover,
+                    menuController: menuController,
+                    onTap: onRowTap
+                )
             }
 
             // Direct 1-click Left / Right order controls for whichever bar this app belongs to
@@ -1159,7 +1527,7 @@ private struct AppSelectionRow: View, Equatable {
                     lineWidth: isBeingDragged ? 1.4 : 1
                 )
         )
-        .opacity(isBeingDragged ? 0.48 : 1.0)
+        .opacity(isBeingDragged ? 0.38 : 1.0)
         .onHover { inside in
             if hover.isHovered != inside {
                 hover.isHovered = inside
