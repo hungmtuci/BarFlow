@@ -49,6 +49,9 @@ struct AppSelectionView: View {
             headerSection
             Divider()
 
+            startupOptionsStrip
+            Divider()
+
             if !menuController.isAccessibilityGranted || (menuController.requiresFullDiskAccess && !menuController.isFullDiskAccessGranted) {
                 permissionsOnboardingBanner
                 Divider()
@@ -183,6 +186,59 @@ struct AppSelectionView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - 1B. Top Startup & Visibility Options Strip
+
+    private var startupOptionsStrip: some View {
+        HStack(spacing: 12) {
+            StartupOptionCheckboxButton(
+                title: "Khởi động cùng macOS",
+                icon: "power.circle",
+                isOn: menuController.launchAtLogin,
+                tooltip: "Tự động chạy ngầm BarFlow ngay khi đăng nhập vào máy Mac"
+            ) {
+                menuController.launchAtLogin.toggle()
+            }
+
+            Divider()
+                .frame(height: 15)
+
+            StartupOptionCheckboxButton(
+                title: "Bật bảng này khi khởi động",
+                icon: "macwindow.badge.plus",
+                isOn: menuController.showSelectionOnLaunch,
+                tooltip: "Tự động mở cửa sổ Bảng quản lý ứng dụng này mỗi khi BarFlow khởi động"
+            ) {
+                menuController.showSelectionOnLaunch.toggle()
+            }
+
+            Spacer(minLength: 8)
+
+            StartupOptionCheckboxButton(
+                title: "Ẩn app không chọn khỏi Menu Bar",
+                icon: "eye.slash",
+                isOn: menuController.isMainBarHidingEnabled,
+                tooltip: "Tự động thu gọn các ứng dụng chưa chọn xuống thanh phụ Ctrl + B để giữ Menu Bar chính gọn gàng"
+            ) {
+                menuController.isMainBarHidingEnabled.toggle()
+            }
+
+            Divider()
+                .frame(height: 15)
+
+            StartupOptionCheckboxButton(
+                title: "Ẩn trên thanh Dock",
+                icon: "dock.rectangle",
+                isOn: menuController.hideFromDock,
+                tooltip: "Ẩn biểu tượng BarFlow khỏi thanh Dock của macOS (chỉ hiện nút ••• trên Menu Bar)"
+            ) {
+                menuController.hideFromDock.toggle()
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 7)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
     }
 
     // MARK: - 2. Permissions Onboarding Banner (Accessibility + Full Disk Access on macOS 26/27)
@@ -689,38 +745,9 @@ struct AppSelectionView: View {
 
                 footerUpdateButton
             }
-
-            Divider()
-                .opacity(0.55)
-
-            // Row 2: Main Bar Hiding + Launch at Login + Launch Window + Dock Visibility
-            HStack(spacing: 16) {
-                Toggle("Ẩn các app không chọn khỏi Menu Bar chính", isOn: $menuController.isMainBarHidingEnabled)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
-                    .fixedSize(horizontal: true, vertical: false)
-
-                Spacer(minLength: 8)
-
-                Toggle("Khởi động cùng macOS", isOn: $menuController.launchAtLogin)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 12, weight: .medium))
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Tự động chạy ngầm BarFlow ngay khi đăng nhập vào máy Mac")
-
-                Toggle("Hiện khi mở app", isOn: $menuController.showSelectionOnLaunch)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
-                    .fixedSize(horizontal: true, vertical: false)
-
-                Toggle("Ẩn khỏi Dock", isOn: $menuController.hideFromDock)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
-                    .fixedSize(horizontal: true, vertical: false)
-            }
         }
         .padding(.horizontal, 20)
-        .padding(.vertical, 10)
+        .padding(.vertical, 9)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
     }
 
@@ -1533,5 +1560,70 @@ private struct AppSelectionRow: View, Equatable {
                 hover.isHovered = inside
             }
         }
+    }
+}
+
+// MARK: - Crisp macOS Startup Option Checkbox Button
+
+private struct StartupOptionCheckboxButton: View {
+    let title: String
+    let icon: String
+    let isOn: Bool
+    let tooltip: String
+    let action: () -> Void
+
+    @StateObject private var hover = LocalHoverBox()
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(isOn ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                        .frame(width: 15, height: 15)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .strokeBorder(
+                                    isOn ? Color.accentColor : Color.primary.opacity(hover.isHovered ? 0.48 : 0.30),
+                                    lineWidth: 1.1
+                                )
+                        )
+
+                    if isOn {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                }
+
+                Image(systemName: icon)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(isOn ? Color.accentColor : Color.secondary)
+
+                Text(title)
+                    .font(.system(size: 12, weight: isOn ? .semibold : .medium))
+                    .foregroundStyle(isOn ? Color.primary : Color.primary.opacity(0.88))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(
+                        isOn
+                            ? Color.accentColor.opacity(hover.isHovered ? 0.14 : 0.08)
+                            : (hover.isHovered ? Color.primary.opacity(0.06) : Color.clear)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: true, vertical: false)
+        .onHover { inside in
+            if hover.isHovered != inside {
+                hover.isHovered = inside
+            }
+        }
+        .help(tooltip)
     }
 }

@@ -32,7 +32,7 @@ final class UpdateCheckerService: ObservableObject {
     @Published private(set) var state: UpdateState = .idle
 
     var currentVersion: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.0"
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.1"
     }
 
     private var lastAutoCheckTimestamp: CFAbsoluteTime = 0

@@ -78,6 +78,9 @@ final class MenuBarController: ObservableObject {
         didSet {
             guard showSelectionOnLaunch != oldValue else { return }
             scheduleSaveState()
+            statusMessage = showSelectionOnLaunch
+                ? "Đã bật: Tự mở bảng quản lý này mỗi khi khởi động BarFlow."
+                : "Đã tắt mở bảng khi khởi động — BarFlow sẽ khởi động êm trên thanh Menu Bar."
         }
     }
 
@@ -218,7 +221,9 @@ final class MenuBarController: ObservableObject {
         let fileURL = dirURL.appendingPathComponent("layout_state.json")
         self.stateFileURL = fileURL
 
-        let systemLaunchEnabled = (SMAppService.mainApp.status == .enabled)
+        let smStatus = SMAppService.mainApp.status
+        let fallbackAgentPath = NSHomeDirectory() + "/Library/LaunchAgents/com.hunglx.BarFlow.plist"
+        let systemLaunchEnabled = (smStatus == .enabled || smStatus == .requiresApproval || FileManager.default.fileExists(atPath: fallbackAgentPath))
 
         if let data = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode(PersistedLayoutState.self, from: data) {
@@ -382,16 +387,60 @@ final class MenuBarController: ObservableObject {
         NSApp.setActivationPolicy(hideFromDock ? .accessory : .regular)
     }
 
-    // MARK: - Launch at Login (`SMAppService.mainApp`)
+    // MARK: - Launch at Login (`SMAppService.mainApp` + LaunchAgents Fallback)
+
+    private var fallbackLaunchAgentURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/LaunchAgents/com.hunglx.BarFlow.plist")
+    }
+
+    private func isSystemLaunchAtLoginActive() -> Bool {
+        let status = SMAppService.mainApp.status
+        if status == .enabled || status == .requiresApproval {
+            return true
+        }
+        return FileManager.default.fileExists(atPath: fallbackLaunchAgentURL.path)
+    }
+
+    private func writeFallbackLaunchAgentPlist() -> Bool {
+        guard let execPath = Bundle.main.executablePath else { return false }
+        let dir = fallbackLaunchAgentURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dict: [String: Any] = [
+            "Label": "com.hunglx.BarFlow",
+            "ProgramArguments": [execPath],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive"
+        ]
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else {
+            return false
+        }
+        do {
+            try data.write(to: fallbackLaunchAgentURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func removeFallbackLaunchAgentPlistIfNeeded() {
+        if FileManager.default.fileExists(atPath: fallbackLaunchAgentURL.path) {
+            try? FileManager.default.removeItem(at: fallbackLaunchAgentURL)
+        }
+    }
 
     private func syncLaunchAtLoginStatusFromSystem() {
-        let currentStatus = SMAppService.mainApp.status
-        let actualEnabled = (currentStatus == .enabled)
+        let actualEnabled = isSystemLaunchAtLoginActive()
         if launchAtLogin != actualEnabled {
-            if launchAtLogin && currentStatus == .notRegistered {
-                try? SMAppService.mainApp.register()
+            if launchAtLogin && SMAppService.mainApp.status == .notRegistered {
+                do {
+                    try SMAppService.mainApp.register()
+                    removeFallbackLaunchAgentPlistIfNeeded()
+                } catch {
+                    _ = writeFallbackLaunchAgentPlist()
+                }
             }
-            let refreshed = (SMAppService.mainApp.status == .enabled)
+            let refreshed = isSystemLaunchAtLoginActive()
             isUpdatingLaunchAtLoginInternally = true
             launchAtLogin = refreshed
             isUpdatingLaunchAtLoginInternally = false
@@ -399,24 +448,32 @@ final class MenuBarController: ObservableObject {
     }
 
     private func applyLaunchAtLoginChange() {
-        do {
-            if launchAtLogin {
-                try SMAppService.mainApp.register()
+        if launchAtLogin {
+            do {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+                removeFallbackLaunchAgentPlistIfNeeded()
                 if SMAppService.mainApp.status == .requiresApproval {
                     statusMessage = "Hãy bật cho phép BarFlow trong System Settings → General → Login Items."
                     SMAppService.openSystemSettingsLoginItems()
                 } else {
                     statusMessage = "Đã bật Tự động khởi động cùng macOS!"
                 }
-            } else {
-                try SMAppService.mainApp.unregister()
-                statusMessage = "Đã tắt Tự động khởi động cùng macOS."
+            } catch {
+                if writeFallbackLaunchAgentPlist() {
+                    statusMessage = "Đã bật Tự động khởi động cùng macOS!"
+                } else {
+                    statusMessage = "Không thể cập nhật Khởi động cùng macOS: \(error.localizedDescription)"
+                    isUpdatingLaunchAtLoginInternally = true
+                    launchAtLogin = isSystemLaunchAtLoginActive()
+                    isUpdatingLaunchAtLoginInternally = false
+                }
             }
-        } catch {
-            statusMessage = "Không thể cập nhật Khởi động cùng macOS: \(error.localizedDescription)"
-            isUpdatingLaunchAtLoginInternally = true
-            launchAtLogin = (SMAppService.mainApp.status == .enabled)
-            isUpdatingLaunchAtLoginInternally = false
+        } else {
+            try? SMAppService.mainApp.unregister()
+            removeFallbackLaunchAgentPlistIfNeeded()
+            statusMessage = "Đã tắt Tự động khởi động cùng macOS."
         }
     }
 
@@ -877,6 +934,8 @@ final class MenuBarController: ObservableObject {
         hoverToggle.target = self
         menu.addItem(hoverToggle)
 
+        menu.addItem(.separator())
+
         let loginToggle = NSMenuItem(
             title: "Khởi động cùng macOS",
             action: #selector(menuToggleLaunchAtLogin),
@@ -885,6 +944,24 @@ final class MenuBarController: ObservableObject {
         loginToggle.state = launchAtLogin ? .on : .off
         loginToggle.target = self
         menu.addItem(loginToggle)
+
+        let showOnLaunchToggle = NSMenuItem(
+            title: "Bật bảng quản lý khi khởi động",
+            action: #selector(menuToggleShowSelectionOnLaunch),
+            keyEquivalent: ""
+        )
+        showOnLaunchToggle.state = showSelectionOnLaunch ? .on : .off
+        showOnLaunchToggle.target = self
+        menu.addItem(showOnLaunchToggle)
+
+        let dockToggle = NSMenuItem(
+            title: "Ẩn biểu tượng trên thanh Dock",
+            action: #selector(menuToggleHideFromDock),
+            keyEquivalent: ""
+        )
+        dockToggle.state = hideFromDock ? .on : .off
+        dockToggle.target = self
+        menu.addItem(dockToggle)
 
         menu.addItem(.separator())
 
@@ -983,6 +1060,14 @@ final class MenuBarController: ObservableObject {
 
     @objc private func menuToggleLaunchAtLogin() {
         launchAtLogin.toggle()
+    }
+
+    @objc private func menuToggleShowSelectionOnLaunch() {
+        showSelectionOnLaunch.toggle()
+    }
+
+    @objc private func menuToggleHideFromDock() {
+        hideFromDock.toggle()
     }
 
     @objc private func menuCheckForUpdates() {
