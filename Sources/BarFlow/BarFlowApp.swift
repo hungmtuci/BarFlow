@@ -145,11 +145,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             UpdateCheckerService.shared.checkSilentlyOnLaunchIfNeeded()
         }
 
-        if !AXIsProcessTrusted() {
+        let trusted = AXIsProcessTrusted()
+        if !trusted {
             MenuBarScanner.shared.promptForAccessibilityPermission()
         }
 
-        if menuController.showSelectionOnLaunch || !AXIsProcessTrusted() {
+        if menuController.showSelectionOnLaunch || !trusted {
             showSelectionWindow()
         }
     }
@@ -184,7 +185,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             win.isReleasedWhenClosed = false
             win.delegate = self
             win.setContentSize(NSSize(width: 850, height: 680))
-            win.center()
+            if !win.setFrameUsingName("BarFlow.SelectionWindow") {
+                win.center()
+            }
+            win.setFrameAutosaveName("BarFlow.SelectionWindow")
             self.selectionWindow = win
         }
 
@@ -197,6 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         if let closedWin = notification.object as? NSWindow, closedWin === selectionWindow {
+            HotKeyService.shared.cancelRecording()
+            SelectionDragCoordinator.shared.cancelActiveSession()
+            // Detach SwiftUI hosting hierarchy so closed window consumes 0 RAM & 0 Combine re-render cycles while idle!
+            closedWin.contentViewController = nil
+            closedWin.delegate = nil
+            self.selectionWindow = nil
+
             if MenuBarController.shared.hideFromDock {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     MenuBarController.shared.applyDockPolicy()

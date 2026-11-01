@@ -14,14 +14,9 @@ struct PersistedSystemItem: Codable, Equatable, Sendable {
 }
 
 /// Snapshot of the user's original macOS Control Center / Spotlight / Input Menu preference before BarFlow hid it.
-private struct SystemPrefBackup: Codable, Sendable {
-    var hadSpotlightPref: Bool?
+private struct SystemPrefBackup: Codable, Equatable, Sendable {
     var originalShowSpotlight: Bool?
-
-    var hadSiriPref: Bool?
     var originalShowSiri: Bool?
-
-    var hadTextInputVisible: Bool?
     var originalTextInputVisible: Bool?
     var originalTextInputAgentVisibleCC: Bool?
 
@@ -51,6 +46,10 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     @MainActor private var rawProcessCache: [pid_t: RawProcessSnapshot] = [:]
     private var outerBundleIDCache: [String: String] = [:]
 
+    private var cachedPersistedSystemItems: [PersistedSystemItem]?
+    private var cachedManagedTrackedKeys: Set<String>?
+    private var cachedSystemPrefBackup: SystemPrefBackup?
+
     private enum Keys {
         static let managedTrackedKeys = "BarFlow.ManagedHiddenTrackedLocationKeys"
         static let managedSystemItems = "BarFlow.ManagedHiddenSystemItems"
@@ -61,18 +60,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     private let minimumAgentUptimeBeforeReload: Double = 10.4
 
     private let homeDir: String = FileManager.default.homeDirectoryForCurrentUser.path
-    private var ccGroupPlistPath: String {
-        "\(homeDir)/Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist"
-    }
-    private var menuBarGroupPlistPath: String {
-        "\(homeDir)/Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar.plist"
-    }
+    private let ccGroupPlistPath: String
+    private let menuBarGroupPlistPath: String
 
-    /// Returns `true` on macOS 26/27+ where `MenuBarAgent` manages the Menu Bar.
-    var usesMenuBarAgentArchitecture: Bool {
-        let hasAgent = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").isEmpty
-        return hasAgent && FileManager.default.fileExists(atPath: ccGroupPlistPath)
-    }
+    /// Cached once at startup (`true` on macOS 26/27+ where `MenuBarAgent` manages the Menu Bar).
+    let usesMenuBarAgentArchitecture: Bool
 
     /// Returns `true` when `BarFlow` has TCC `Full Disk Access` (`kTCCServiceSystemPolicyAllFiles`) required by macOS
     /// to read and write `~/Library/Group Containers/group.com.apple.controlcenter/...` and `com.apple.MenuBar.plist`.
@@ -85,23 +77,39 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         return true
     }
 
-    private init() {}
+    private init() {
+        let ccPath = "\(homeDir)/Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist"
+        let mbPath = "\(homeDir)/Library/Group Containers/com.apple.MenuBar/Library/Preferences/com.apple.MenuBar.plist"
+        self.ccGroupPlistPath = ccPath
+        self.menuBarGroupPlistPath = mbPath
+        let hasAgent = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").isEmpty
+        self.usesMenuBarAgentArchitecture = hasAgent && FileManager.default.fileExists(atPath: ccPath)
+    }
 
-    // MARK: - Persisted Hidden System Items Access
+    // MARK: - Persisted Hidden System Items Access (In-Memory Cached, Write-on-Diff)
 
     func persistedHiddenSystemItems() -> [PersistedSystemItem] {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if let cached = cachedPersistedSystemItems {
+            return cached
+        }
         guard let data = UserDefaults.standard.data(forKey: Keys.managedSystemItems),
               let decoded = try? JSONDecoder().decode([PersistedSystemItem].self, from: data) else {
+            cachedPersistedSystemItems = []
             return []
         }
+        cachedPersistedSystemItems = decoded
         return decoded
     }
 
     private func savePersistedHiddenSystemItems(_ items: [PersistedSystemItem]) {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if cachedPersistedSystemItems == items {
+            return
+        }
+        cachedPersistedSystemItems = items
         if items.isEmpty {
             UserDefaults.standard.removeObject(forKey: Keys.managedSystemItems)
         } else if let data = try? JSONEncoder().encode(items) {
@@ -112,28 +120,47 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     private func loadManagedTrackedKeys() -> Set<String> {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return Set(UserDefaults.standard.stringArray(forKey: Keys.managedTrackedKeys) ?? [])
+        if let cached = cachedManagedTrackedKeys {
+            return cached
+        }
+        let loaded = Set(UserDefaults.standard.stringArray(forKey: Keys.managedTrackedKeys) ?? [])
+        cachedManagedTrackedKeys = loaded
+        return loaded
     }
 
     private func saveManagedTrackedKeys(_ keys: Set<String>) {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if cachedManagedTrackedKeys == keys {
+            return
+        }
+        cachedManagedTrackedKeys = keys
         UserDefaults.standard.set(Array(keys), forKey: Keys.managedTrackedKeys)
     }
 
     private func loadSystemPrefBackup() -> SystemPrefBackup {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if let cached = cachedSystemPrefBackup {
+            return cached
+        }
         guard let data = UserDefaults.standard.data(forKey: Keys.systemPrefBackup),
               let decoded = try? JSONDecoder().decode(SystemPrefBackup.self, from: data) else {
-            return SystemPrefBackup()
+            let empty = SystemPrefBackup()
+            cachedSystemPrefBackup = empty
+            return empty
         }
+        cachedSystemPrefBackup = decoded
         return decoded
     }
 
     private func saveSystemPrefBackup(_ backup: SystemPrefBackup) {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if cachedSystemPrefBackup == backup {
+            return
+        }
+        cachedSystemPrefBackup = backup
         if let data = try? JSONEncoder().encode(backup) {
             UserDefaults.standard.set(data, forKey: Keys.systemPrefBackup)
         }
@@ -212,7 +239,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                     orderedMainBarIDs: orderedMainBarIDs,
                     hidingEnabled: hidingEnabled,
                     processMeta: processMeta,
-                    allowImmediateReload: true,
                     forceReload: forceReload
                 )
                 continuation.resume(returning: outcome)
@@ -391,6 +417,9 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             rawProcessCache[pid] = snap
             map[pid] = snap
         }
+        if rawProcessCache.count > 256 {
+            rawProcessCache = rawProcessCache.filter { neededPIDs.contains($0.key) }
+        }
         return map
     }
 
@@ -404,6 +433,9 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                     outerBundleID = cached.isEmpty ? nil : cached
                 } else {
                     let resolved = Self.resolveOuterAppBundleID(fromPath: path)
+                    if outerBundleIDCache.count > 512 {
+                        outerBundleIDCache.removeAll(keepingCapacity: true)
+                    }
                     outerBundleIDCache[path] = resolved ?? ""
                     outerBundleID = resolved
                 }
@@ -444,7 +476,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         orderedMainBarIDs: [String],
         hidingEnabled: Bool,
         processMeta: [pid_t: ProcessIdentity],
-        allowImmediateReload: Bool,
         forceReload: Bool
     ) -> SyncOutcome {
         guard hasFullDiskAccess else {
@@ -525,18 +556,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             )
         }
 
-        guard allowImmediateReload else {
-            flushUserCfprefsd()
-            return SyncOutcome(
-                didModifyPreferences: anyChanged,
-                didReloadAgent: false,
-                deferredReloadDelay: nil,
-                hiddenCount: hiddenItems.count,
-                visibleCount: visibleItems.count,
-                errorReason: nil
-            )
-        }
-
         let remainingWait = remainingSecondsBeforeSafeReload()
         if remainingWait > 0.05 {
             flushUserCfprefsd()
@@ -595,7 +614,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         if isSpotlightHidden {
             let currentVal = (outer["showSpotlight"] as? Bool) ?? true
             if backup.originalShowSpotlight == nil {
-                backup.hadSpotlightPref = (outer["showSpotlight"] != nil)
                 backup.originalShowSpotlight = currentVal
                 postControlCenterStatusItemNotification(insert: false, identifiers: ["Spotlight", "com.apple.Spotlight", "com.apple.campo"])
             }
@@ -621,7 +639,6 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         if isSiriHidden {
             let currentVal = (outer["showSiri"] as? Bool) ?? true
             if backup.originalShowSiri == nil {
-                backup.hadSiriPref = (outer["showSiri"] != nil)
                 backup.originalShowSiri = currentVal
             }
             if currentVal != false {
@@ -867,13 +884,29 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         let symbolKey: String
     }
 
+    private static let allowedSystemModuleBundleIDs: Set<String> = [
+        "com.apple.controlcenter",
+        "com.apple.systemuiserver",
+        "com.apple.MenuBarAgent",
+        "com.apple.Spotlight",
+        "com.apple.campo",
+        "com.apple.Siri",
+        "com.apple.TextInputMenuAgent"
+    ]
+
     private func mappingForSystemItem(_ item: MenuBarAppItem) -> SystemExtraMapping? {
-        // Strictly restrict to genuine macOS System Menu Extras so third-party apps (e.g. Typinator -> "pin",
-        // BetterDisplay -> "display", SoundSource -> "sound") ALWAYS use `trackedApplications`!
+        // Strictly restrict to genuine macOS System Menu Extras so third-party or standalone Apple apps
+        // ALWAYS use `trackedApplications` rather than Control Center module keys!
         guard item.isSystemItem else { return nil }
         if item.bundleIdentifier == "com.apple.Passwords.MenuBarExtra" {
             return nil
         }
+        let isGenuineSystemModule =
+            (item.axIdentifier?.hasPrefix("com.apple.menuextra.") == true) ||
+            item.id.hasPrefix("systemextra:") ||
+            item.id.hasPrefix("com.apple.menuextra.") ||
+            (item.bundleIdentifier.map { Self.allowedSystemModuleBundleIDs.contains($0) } ?? false)
+        guard isGenuineSystemModule else { return nil }
 
         let key = ((item.axIdentifier ?? "") + " " + (item.bundleIdentifier ?? "") + " " + item.id + " " + item.appName).lowercased()
 
@@ -1372,6 +1405,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         guard actualBytes > 0 else { return [] }
         let count = Int(actualBytes) / MemoryLayout<pid_t>.stride
         let infoStride = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        let isLongName = processName.count >= Int(MAXCOMLEN)
         var matches: [pid_t] = []
         var nameBuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
 
@@ -1383,20 +1417,22 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                   info.pbi_uid == uid else {
                 continue
             }
-            let nameLen = proc_name(pid, &nameBuf, UInt32(nameBuf.count))
-            if nameLen > 0 {
-                let exeName = String(cString: nameBuf)
-                if exeName == processName {
-                    matches.append(pid)
-                    continue
-                }
-            }
             let comm = withUnsafePointer(to: &info.pbi_comm) {
                 $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
                     String(cString: $0)
                 }
             }
-            if comm == processName || (processName.count >= Int(MAXCOMLEN) && processName.hasPrefix(comm)) {
+            if !isLongName {
+                if comm == processName {
+                    matches.append(pid)
+                }
+                continue
+            }
+            guard processName.hasPrefix(comm) else { continue }
+            let nameLen = proc_name(pid, &nameBuf, UInt32(nameBuf.count))
+            if nameLen > 0, String(cString: nameBuf) == processName {
+                matches.append(pid)
+            } else if comm == processName {
                 matches.append(pid)
             }
         }
@@ -1466,7 +1502,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         flushUserCfprefsd()
         usleep(20_000)
-        terminateMenuBarAgent()
+        if let pid = oldAgentPID {
+            _ = kill(pid, SIGTERM)
+        } else {
+            terminateMenuBarAgent()
+        }
 
         // Guard against old MenuBarAgent flushing stale in-memory TrailingItemPreferredPositions during SIGTERM exit
         if let oldPID = oldAgentPID, let expectedData = savedMenuBarData {

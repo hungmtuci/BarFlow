@@ -70,6 +70,8 @@ final class SecondaryBarController: ObservableObject {
     private var trackedPopoverPID: pid_t = 0
     private var trackedPopoverBaselineWinIDs = Set<Int>()
     private var trackedPopoverOpenedAt: CFAbsoluteTime = 0
+    private var popoverCheckTickCounter: Int = 0
+    private var lastPopoverWindowPresent: Bool = true
 
     /// Layout constants matching `SecondaryBarView` single-row metrics
     static let panelHeight: CGFloat = 38.0
@@ -154,6 +156,7 @@ final class SecondaryBarController: ObservableObject {
             MenuBarController.shared.updateMainButtonAppearance(isSecondaryOpen: true)
         }
 
+        HotKeyService.shared.setEscapeMonitorsEnabled(true)
         startAutoHideMonitoring()
         installOutsideClickMonitor()
 
@@ -170,6 +173,8 @@ final class SecondaryBarController: ObservableObject {
 
         stopAutoHideMonitoring()
         removeOutsideClickMonitor()
+        HotKeyService.shared.setEscapeMonitorsEnabled(false)
+        FloatingIconDragGhost.shared.hide()
         isPresentingMirroredMenu = false
         trackedPopoverPID = 0
         trackedPopoverBaselineWinIDs.removeAll()
@@ -241,9 +246,14 @@ final class SecondaryBarController: ObservableObject {
         trackedPopoverPID = pid
         trackedPopoverBaselineWinIDs = baselineWinIDs
         trackedPopoverOpenedAt = CFAbsoluteTimeGetCurrent()
+        popoverCheckTickCounter = 0
+        lastPopoverWindowPresent = true
         lastInteractionDate = Date()
         if countdown.progress != 1.0 {
             countdown.progress = 1.0
+        }
+        if autoHideTimer == nil && isVisible {
+            startAutoHideMonitoring()
         }
     }
 
@@ -290,10 +300,17 @@ final class SecondaryBarController: ObservableObject {
     private func startAutoHideMonitoring() {
         stopAutoHideMonitoring()
         lastInteractionDate = Date()
-        countdown.progress = 1.0
+        if countdown.progress != 1.0 {
+            countdown.progress = 1.0
+        }
 
-        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] timer in
-            Task { @MainActor in
+        // Skip scheduling the 8.3Hz timer completely when Auto-Hide is disabled and no external popover is tracked!
+        guard MenuBarController.shared.autoHideDuration != .never || trackedPopoverPID > 0 else {
+            return
+        }
+
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
                 guard let self = self, self.isVisible else {
                     timer.invalidate()
                     return
@@ -308,10 +325,24 @@ final class SecondaryBarController: ObservableObject {
                     return
                 }
 
-                // 2. Keep bar anchored while the opened app's popover/panel window is still visible
+                // 2. Keep bar anchored while the opened app's popover/panel window is still visible (throttled to ~0.36s IPC)
                 if self.trackedPopoverPID > 0 {
                     let age = CFAbsoluteTimeGetCurrent() - self.trackedPopoverOpenedAt
-                    if age < 0.85 || self.hasOpenPopupWindow(for: self.trackedPopoverPID, baseline: self.trackedPopoverBaselineWinIDs) {
+                    let stillOpen: Bool
+                    if age < 0.85 {
+                        stillOpen = true
+                    } else {
+                        self.popoverCheckTickCounter += 1
+                        if self.popoverCheckTickCounter % 3 == 0 {
+                            self.lastPopoverWindowPresent = self.hasOpenPopupWindow(
+                                for: self.trackedPopoverPID,
+                                baseline: self.trackedPopoverBaselineWinIDs
+                            )
+                        }
+                        stillOpen = self.lastPopoverWindowPresent
+                    }
+
+                    if stillOpen {
                         self.lastInteractionDate = Date()
                         if self.countdown.progress != 1.0 {
                             self.countdown.progress = 1.0
@@ -330,6 +361,8 @@ final class SecondaryBarController: ObservableObject {
                     if self.countdown.progress != 1.0 {
                         self.countdown.progress = 1.0
                     }
+                    timer.invalidate()
+                    self.autoHideTimer = nil
                     return
                 }
 
@@ -358,6 +391,8 @@ final class SecondaryBarController: ObservableObject {
                 }
             }
         }
+        timer.tolerance = 0.03
+        autoHideTimer = timer
     }
 
     private func stopAutoHideMonitoring() {
@@ -368,7 +403,7 @@ final class SecondaryBarController: ObservableObject {
     private func installOutsideClickMonitor() {
         removeOutsideClickMonitor()
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 guard let self = self, self.isVisible, let panel = self.panel else { return }
                 guard !self.isPresentingMirroredMenu else { return }
 

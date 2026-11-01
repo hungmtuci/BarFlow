@@ -119,12 +119,12 @@ final class AXStatusMenuBridge: @unchecked Sendable {
 
         var menuBarRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXMenuBarAttribute as CFString, &menuBarRef) == .success,
-              let menuBar = menuBarRef else {
+              let menuBarEl = asAXUIElement(menuBarRef) else {
             return nil
         }
 
         var topItemsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &topItemsRef) == .success,
+        guard AXUIElementCopyAttributeValue(menuBarEl, kAXChildrenAttribute as CFString, &topItemsRef) == .success,
               let topItems = topItemsRef as? [AXUIElement],
               topItems.count >= 2 else {
             return nil
@@ -177,11 +177,28 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         return nil
     }
 
-    private func findDirectChildAXMenu(of itemEl: AXUIElement) -> AXUIElement? {
-        var subRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(itemEl, kAXChildrenAttribute as CFString, &subRef) == .success,
-              let subs = subRef as? [AXUIElement], !subs.isEmpty else {
-            return nil
+    private static let batchedMenuItemAttributes: CFArray = [
+        kAXSubroleAttribute as CFString,
+        kAXTitleAttribute as CFString,
+        kAXEnabledAttribute as CFString,
+        kAXChildrenAttribute as CFString,
+        kAXMenuItemMarkCharAttribute as CFString,
+        kAXMenuItemCmdCharAttribute as CFString,
+        kAXMenuItemCmdModifiersAttribute as CFString
+    ] as CFArray
+
+    private func findDirectChildAXMenu(in children: [AXUIElement]?, fallbackParent itemEl: AXUIElement, usedBatch: Bool) -> AXUIElement? {
+        let subs: [AXUIElement]
+        if usedBatch {
+            guard let children, !children.isEmpty else { return nil }
+            subs = children
+        } else {
+            var subRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(itemEl, kAXChildrenAttribute as CFString, &subRef) == .success,
+                  let fetched = subRef as? [AXUIElement], !fetched.isEmpty else {
+                return nil
+            }
+            subs = fetched
         }
         for sub in subs {
             AXUIElementSetMessagingTimeout(sub, 0.08)
@@ -192,8 +209,8 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         return nil
     }
 
-    /// Reads ONLY one `AXMenu` level with strict item count & wall-clock limits so large filesystem/cloud menus
-    /// never stall `BarFlow` or lock out other icons.
+    /// Reads ONLY one `AXMenu` level with batched `AXUIElementCopyMultipleAttributeValues` IPC (1 Mach call/item instead of 7)
+    /// and strict item count & wall-clock limits so large filesystem/cloud menus never stall `BarFlow`.
     fileprivate func readSingleMenuLevel(
         from axMenu: AXUIElement,
         table: AXElementTable,
@@ -221,9 +238,43 @@ final class AXStatusMenuBridge: @unchecked Sendable {
             }
 
             AXUIElementSetMessagingTimeout(itemEl, 0.08)
-            let subrole = axString(itemEl, kAXSubroleAttribute as CFString) ?? ""
-            let title = axString(itemEl, kAXTitleAttribute as CFString) ?? ""
-            let enabled = axBool(itemEl, kAXEnabledAttribute as CFString, defaultValue: true)
+
+            let subrole: String
+            let title: String
+            let enabled: Bool
+            let batchedChildren: [AXUIElement]?
+            let mark: String
+            let rawCmd: String
+            let cmdMods: Int
+            let didBatch: Bool
+
+            var multiRef: CFArray?
+            if AXUIElementCopyMultipleAttributeValues(
+                itemEl,
+                Self.batchedMenuItemAttributes,
+                AXCopyMultipleAttributeOptions(rawValue: 0),
+                &multiRef
+            ) == .success,
+               let arr = multiRef as? [AnyObject],
+               arr.count == 7 {
+                didBatch = true
+                subrole = (arr[0] as? String) ?? ""
+                title = (arr[1] as? String) ?? ""
+                enabled = decodeAXBool(arr[2], defaultValue: true)
+                batchedChildren = arr[3] as? [AXUIElement]
+                mark = (arr[4] as? String) ?? ""
+                rawCmd = (arr[5] as? String) ?? ""
+                cmdMods = (arr[6] as? NSNumber)?.intValue ?? 0
+            } else {
+                didBatch = false
+                subrole = axString(itemEl, kAXSubroleAttribute as CFString) ?? ""
+                title = axString(itemEl, kAXTitleAttribute as CFString) ?? ""
+                enabled = axBool(itemEl, kAXEnabledAttribute as CFString, defaultValue: true)
+                batchedChildren = nil
+                mark = axString(itemEl, kAXMenuItemMarkCharAttribute as CFString) ?? ""
+                rawCmd = axString(itemEl, kAXMenuItemCmdCharAttribute as CFString) ?? ""
+                cmdMods = axInt(itemEl, kAXMenuItemCmdModifiersAttribute as CFString) ?? 0
+            }
 
             if filterAppBoilerplate && !title.isEmpty {
                 let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -232,7 +283,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
                 }
             }
 
-            let childSubmenu = findDirectChildAXMenu(of: itemEl)
+            let childSubmenu = findDirectChildAXMenu(in: batchedChildren, fallbackParent: itemEl, usedBatch: didBatch)
             let submenuAXID = childSubmenu.map { table.register($0) } ?? 0
 
             let isSeparator = (subrole == "AXSeparatorMenuItem") ||
@@ -258,7 +309,6 @@ final class AXStatusMenuBridge: @unchecked Sendable {
                 continue
             }
 
-            let mark = axString(itemEl, kAXMenuItemMarkCharAttribute as CFString) ?? ""
             let stateRaw: Int
             if mark == "✓" || mark == "✔" || mark == "•" {
                 stateRaw = 1
@@ -268,8 +318,6 @@ final class AXStatusMenuBridge: @unchecked Sendable {
                 stateRaw = 0
             }
 
-            let rawCmd = axString(itemEl, kAXMenuItemCmdCharAttribute as CFString) ?? ""
-            let cmdMods = axInt(itemEl, kAXMenuItemCmdModifiersAttribute as CFString) ?? 0
             let (keyEq, modMask) = decodeShortcut(cmdChar: rawCmd, carbonModifiers: cmdMods)
 
             let nodeID = table.register(itemEl)
@@ -562,6 +610,18 @@ final class AXStatusMenuBridge: @unchecked Sendable {
 
     // MARK: - Low-Level AX Attribute Readers
 
+    private func asAXUIElement(_ ref: CFTypeRef?) -> AXUIElement? {
+        guard let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+
+    private func decodeAXBool(_ val: CFTypeRef, defaultValue: Bool) -> Bool {
+        if CFGetTypeID(val) == CFBooleanGetTypeID() {
+            return CFBooleanGetValue(unsafeBitCast(val, to: CFBoolean.self))
+        }
+        return (val as? NSNumber)?.boolValue ?? defaultValue
+    }
+
     private func axRole(of el: AXUIElement) -> String? {
         axString(el, kAXRoleAttribute as CFString)
     }
@@ -577,10 +637,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         guard AXUIElementCopyAttributeValue(el, attr, &ref) == .success, let val = ref else {
             return defaultValue
         }
-        if CFGetTypeID(val) == CFBooleanGetTypeID() {
-            return CFBooleanGetValue((val as! CFBoolean))
-        }
-        return (val as? NSNumber)?.boolValue ?? defaultValue
+        return decodeAXBool(val, defaultValue: defaultValue)
     }
 
     private func axInt(_ el: AXUIElement, _ attr: CFString) -> Int? {
@@ -588,7 +645,7 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         guard AXUIElementCopyAttributeValue(el, attr, &ref) == .success, let num = ref else {
             return nil
         }
-        return num.intValue
+        return (num as? NSNumber)?.intValue
     }
 }
 

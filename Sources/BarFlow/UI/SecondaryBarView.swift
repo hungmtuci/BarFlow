@@ -54,15 +54,20 @@ final class FloatingIconDragGhost {
             p = created
         }
 
-        let size = hostView.configure(icon: icon, label: label, showPinBadge: showPinBadge)
+        let (size, didContentChange) = hostView.configure(icon: icon, label: label, showPinBadge: showPinBadge)
         let origin = NSPoint(x: screenPoint.x - size.width * 0.5, y: screenPoint.y - size.height * 0.5 + 6)
-        p.setFrame(NSRect(origin: origin, size: size), display: true)
+        if p.frame.size == size && !didContentChange {
+            p.setFrameOrigin(origin)
+        } else {
+            p.setFrame(NSRect(origin: origin, size: size), display: true)
+        }
         if !p.isVisible {
             p.orderFrontRegardless()
         }
     }
 
     func hide() {
+        hostView.reset()
         panel?.orderOut(nil)
     }
 
@@ -70,21 +75,34 @@ final class FloatingIconDragGhost {
         private var icon: NSImage?
         private var label: String?
         private var showPinBadge: Bool = false
+        private var cachedSize: NSSize = NSSize(width: 34, height: 34)
 
-        func configure(icon: NSImage, label: String?, showPinBadge: Bool) -> NSSize {
+        func reset() {
+            icon = nil
+            label = nil
+            showPinBadge = false
+        }
+
+        func configure(icon: NSImage, label: String?, showPinBadge: Bool) -> (size: NSSize, didChange: Bool) {
+            if self.icon === icon && self.label == label && self.showPinBadge == showPinBadge {
+                return (cachedSize, false)
+            }
             self.icon = icon
             self.label = label
             self.showPinBadge = showPinBadge
             needsDisplay = true
 
+            let computed: NSSize
             if let text = label, !text.isEmpty {
                 let font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
                 let textWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
                 let totalWidth = min(max(44, 32 + textWidth + (showPinBadge ? 18 : 0)), 220)
-                return NSSize(width: totalWidth, height: 30)
+                computed = NSSize(width: totalWidth, height: 30)
             } else {
-                return NSSize(width: showPinBadge ? 42 : 34, height: 34)
+                computed = NSSize(width: showPinBadge ? 42 : 34, height: 34)
             }
+            cachedSize = computed
+            return (computed, true)
         }
 
         override func draw(_ dirtyRect: NSRect) {
@@ -174,19 +192,27 @@ fileprivate func drawAppKitIcon(_ img: NSImage, in rect: NSRect, alpha: CGFloat,
 
 struct SecondaryBarView: View {
     @ObservedObject var barController: SecondaryBarController
-    @ObservedObject var menuController: MenuBarController
+    let menuController: MenuBarController
 
     var body: some View {
         if !barController.isVisible {
-            // Zero layout & rendering overhead while the Ctrl + B panel is hidden
+            // Unmounts SecondaryBarVisibleContentView completely when hidden so MenuBarController has 0 Combine subscribers!
             Color.clear
                 .frame(maxWidth: .infinity, minHeight: 34, maxHeight: 34)
         } else {
-            visibleBarContent
+            SecondaryBarVisibleContentView(
+                barController: barController,
+                menuController: menuController
+            )
         }
     }
+}
 
-    private var visibleBarContent: some View {
+private struct SecondaryBarVisibleContentView: View {
+    @ObservedObject var barController: SecondaryBarController
+    @ObservedObject var menuController: MenuBarController
+
+    var body: some View {
         let apps = menuController.secondaryBarApps
         let activeID = barController.activeOpenedItemID
         let draggingID = menuController.draggingItemID
@@ -265,14 +291,12 @@ private struct AutoHideHairlineBar: View {
     @ObservedObject var countdown: SecondaryBarCountdownModel
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .trailing) {
-                Capsule()
-                    .fill(Color.primary.opacity(0.06))
-                Capsule()
-                    .fill(Color.accentColor.opacity(0.75))
-                    .frame(width: max(0, geo.size.width * countdown.progress))
-            }
+        ZStack(alignment: .trailing) {
+            Capsule()
+                .fill(Color.primary.opacity(0.06))
+            Capsule()
+                .fill(Color.accentColor.opacity(0.75))
+                .scaleEffect(x: max(0.0, min(1.0, countdown.progress)), y: 1.0, anchor: .trailing)
         }
         .frame(height: 1.5)
         .allowsHitTesting(false)
@@ -358,6 +382,22 @@ final class SecondaryBarStripNSView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            cancelPendingSingleRightClick()
+            if isDraggingIcon {
+                isDraggingIcon = false
+                pressedItem = nil
+                mouseDownLocalPt = nil
+                isHoveringMainMenuBar = false
+                NSCursor.pop()
+                FloatingIconDragGhost.shared.hide()
+                menuController?.endDraggingSession()
+            }
+        }
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let existing = trackingAreaRef {
@@ -379,12 +419,17 @@ final class SecondaryBarStripNSView: NSView {
         draggingID: String?,
         menuController: MenuBarController
     ) {
-        let changed = self.items != items || self.activeOpenedID != activeOpenedID || self.draggingID != draggingID
+        let iconsChanged = self.items.count != items.count ||
+            !zip(self.items, items).allSatisfy { $0.isIconStripEqual(to: $1) }
+        let stateChanged = self.activeOpenedID != activeOpenedID || self.draggingID != draggingID
         self.items = items
         self.activeOpenedID = activeOpenedID
         self.draggingID = draggingID
         self.menuController = menuController
-        if changed {
+        if hoveredIndex != nil {
+            updateHoveredToolTip()
+        }
+        if iconsChanged || stateChanged {
             needsDisplay = true
         }
     }

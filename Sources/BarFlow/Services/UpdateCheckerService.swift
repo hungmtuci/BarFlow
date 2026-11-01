@@ -20,7 +20,6 @@ final class UpdateCheckerService: ObservableObject {
     private struct GitHubReleaseResponse: Decodable, Sendable {
         let tag_name: String
         let html_url: String
-        let body: String?
         let assets: [GitHubAsset]
     }
 
@@ -31,15 +30,15 @@ final class UpdateCheckerService: ObservableObject {
 
     @Published private(set) var state: UpdateState = .idle
 
-    var currentVersion: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.1"
-    }
+    let currentVersion: String
 
     private var lastAutoCheckTimestamp: CFAbsoluteTime = 0
     private let latestReleaseAPI = URL(string: "https://api.github.com/repos/hungmtuci/BarFlow/releases/latest")!
     private let releasesPageFallback = URL(string: "https://github.com/hungmtuci/BarFlow/releases/latest")!
 
-    private init() {}
+    private init() {
+        self.currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.2"
+    }
 
     /// Performs a quiet background check at most once every 6 hours without disturbing the user on network errors.
     func checkSilentlyOnLaunchIfNeeded() {
@@ -102,7 +101,7 @@ final class UpdateCheckerService: ObservableObject {
                 if manual {
                     MenuBarController.shared.statusMessage = "Đã có bản mới BarFlow v\(remoteVersion)! Bấm 'Cập nhật v\(remoteVersion)' để tự động cài đặt."
                 }
-            } else {
+            } else if manual || state != .idle {
                 state = .upToDate(version: localVer)
                 if manual {
                     MenuBarController.shared.statusMessage = "Bạn đang sử dụng phiên bản BarFlow mới nhất (v\(localVer))."
@@ -198,30 +197,35 @@ final class UpdateCheckerService: ObservableObject {
         extractDirPath: String
     ) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                proc.arguments = ["-x", "-k", zipPath, extractDirPath]
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    guard proc.terminationStatus == 0 else {
-                        throw NSError(domain: "BarFlowUpdate", code: Int(proc.terminationStatus), userInfo: [
-                            NSLocalizedDescriptionKey: "Giải nén gói cập nhật thất bại (mã \(proc.terminationStatus))"
-                        ])
-                    }
-
-                    let candidateApp = URL(fileURLWithPath: extractDirPath).appendingPathComponent("BarFlow.app")
-                    let binaryPath = candidateApp.appendingPathComponent("Contents/MacOS/BarFlow").path
-                    guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
-                        throw NSError(domain: "BarFlowUpdate", code: -2, userInfo: [
-                            NSLocalizedDescriptionKey: "Không tìm thấy BarFlow.app hợp lệ trong gói tải về"
-                        ])
-                    }
-                    continuation.resume(returning: candidateApp)
-                } catch {
-                    continuation.resume(throwing: error)
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            proc.arguments = ["-x", "-k", zipPath, extractDirPath]
+            proc.terminationHandler = { finished in
+                guard finished.terminationStatus == 0 else {
+                    continuation.resume(throwing: NSError(
+                        domain: "BarFlowUpdate",
+                        code: Int(finished.terminationStatus),
+                        userInfo: [NSLocalizedDescriptionKey: "Giải nén gói cập nhật thất bại (mã \(finished.terminationStatus))"]
+                    ))
+                    return
                 }
+                let candidateApp = URL(fileURLWithPath: extractDirPath).appendingPathComponent("BarFlow.app")
+                let binaryPath = candidateApp.appendingPathComponent("Contents/MacOS/BarFlow").path
+                guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
+                    continuation.resume(throwing: NSError(
+                        domain: "BarFlowUpdate",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "Không tìm thấy BarFlow.app hợp lệ trong gói tải về"]
+                    ))
+                    return
+                }
+                continuation.resume(returning: candidateApp)
+            }
+            do {
+                try proc.run()
+            } catch {
+                proc.terminationHandler = nil
+                continuation.resume(throwing: error)
             }
         }
     }

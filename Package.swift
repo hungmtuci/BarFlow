@@ -19,8 +19,8 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("CoreGraphics"),
-                .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("ServiceManagement")
+                .linkedFramework("ServiceManagement"),
+                .unsafeFlags(["-Xlinker", "-dead_strip", "-Xlinker", "-dead_strip_dylibs"])
             ]
         )
     ]

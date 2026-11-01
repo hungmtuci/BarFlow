@@ -24,6 +24,7 @@ final class HotKeyService: ObservableObject {
     private var globalKeyMonitor: Any?
     private var localKeyMonitor: Any?
     private var recordingLocalMonitor: Any?
+    private var resignActiveObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -34,7 +35,6 @@ final class HotKeyService: ObservableObject {
 
         installCarbonEventHandlerIfNeeded()
         registerCarbonToggleHotKey(for: currentBinding)
-        installEscapeMonitorsIfNeeded()
     }
 
     func updateBinding(_ newBinding: HotKeyBinding) {
@@ -96,27 +96,42 @@ final class HotKeyService: ObservableObject {
             self.finishRecording(with: recorded)
             return nil
         }
+
+        resignActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.cancelRecording()
+            }
+        }
     }
 
     func cancelRecording() {
         guard isRecordingShortcut else { return }
         isRecordingShortcut = false
-        if let mon = recordingLocalMonitor {
-            NSEvent.removeMonitor(mon)
-            recordingLocalMonitor = nil
-        }
+        cleanupRecordingMonitors()
         registerCarbonToggleHotKey(for: currentBinding)
     }
 
     private func finishRecording(with newBinding: HotKeyBinding) {
         isRecordingShortcut = false
+        cleanupRecordingMonitors()
+        currentBinding = newBinding
+        registerCarbonToggleHotKey(for: newBinding)
+        onShortcutRecorded?(newBinding)
+    }
+
+    private func cleanupRecordingMonitors() {
         if let mon = recordingLocalMonitor {
             NSEvent.removeMonitor(mon)
             recordingLocalMonitor = nil
         }
-        currentBinding = newBinding
-        registerCarbonToggleHotKey(for: newBinding)
-        onShortcutRecorded?(newBinding)
+        if let obs = resignActiveObserver {
+            NotificationCenter.default.removeObserver(obs)
+            resignActiveObserver = nil
+        }
     }
 
     // MARK: - Low-Level Carbon Hotkey Registration
@@ -176,47 +191,59 @@ final class HotKeyService: ObservableObject {
         )
     }
 
-    private func installEscapeMonitorsIfNeeded() {
-        if globalKeyMonitor == nil {
-            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
-                if event.keyCode == UInt16(kVK_Escape) {
-                    Task { @MainActor in
+    /// Enables global & local `Escape` key monitors strictly while `SecondaryBarController` (`Ctrl + B`) is visible,
+    /// avoiding 24/7 WindowServer keystroke IPC when BarFlow is idle in the background.
+    func setEscapeMonitorsEnabled(_ enabled: Bool) {
+        if enabled {
+            if globalKeyMonitor == nil {
+                globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+                    guard event.keyCode == UInt16(kVK_Escape) else { return }
+                    MainActor.assumeIsolated {
                         if HotKeyService.shared.isSecondaryBarVisible?() == true {
                             HotKeyService.shared.onEscapePressed?()
                         }
                     }
                 }
             }
-        }
 
-        if localKeyMonitor == nil {
-            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                if HotKeyService.shared.isRecordingShortcut {
-                    return event
+            if localKeyMonitor == nil {
+                localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    guard event.keyCode == UInt16(kVK_Escape) else { return event }
+                    let shouldConsume = MainActor.assumeIsolated { () -> Bool in
+                        if HotKeyService.shared.isRecordingShortcut {
+                            return false
+                        }
+                        if HotKeyService.shared.isSecondaryBarVisible?() == true {
+                            HotKeyService.shared.onEscapePressed?()
+                            return true
+                        }
+                        return false
+                    }
+                    return shouldConsume ? nil : event
                 }
-                if event.keyCode == UInt16(kVK_Escape),
-                   HotKeyService.shared.isSecondaryBarVisible?() == true {
-                    HotKeyService.shared.onEscapePressed?()
-                    return nil
-                }
-                return event
+            }
+        } else {
+            if let monitor = globalKeyMonitor {
+                NSEvent.removeMonitor(monitor)
+                globalKeyMonitor = nil
+            }
+            if let monitor = localKeyMonitor {
+                NSEvent.removeMonitor(monitor)
+                localKeyMonitor = nil
             }
         }
     }
 
     func unregisterHotKeys() {
         cancelRecording()
+        setEscapeMonitorsEnabled(false)
         if let ref = toggleHotKeyRef {
             UnregisterEventHotKey(ref)
             toggleHotKeyRef = nil
         }
-        if let monitor = globalKeyMonitor {
-            NSEvent.removeMonitor(monitor)
-            globalKeyMonitor = nil
-        }
-        if let monitor = localKeyMonitor {
-            NSEvent.removeMonitor(monitor)
-            localKeyMonitor = nil
+        if let handler = eventHandlerRef {
+            RemoveEventHandler(handler)
+            eventHandlerRef = nil
         }
     }
 }

@@ -148,7 +148,7 @@ struct HotKeyBinding: Codable, Equatable, Sendable {
 }
 
 /// Represents a running application (or individual status item / system extra) on the macOS Menu Bar.
-struct MenuBarAppItem: Identifiable, Equatable {
+struct MenuBarAppItem: Identifiable, Equatable, Hashable {
     /// Stable unique identifier across scans and app launches.
     let id: String
     /// Process identifier of the owning application or container agent.
@@ -177,18 +177,70 @@ struct MenuBarAppItem: Identifiable, Equatable {
     let isSystemItem: Bool
     /// Whether macOS allows moving/hiding this item via Command-drag.
     let isMovable: Bool
+    /// Pre-lowercased composite index string for O(1)-pass instant search filtering.
+    let searchIndexText: String
+
+    init(
+        id: String,
+        pid: pid_t,
+        appName: String,
+        bundleIdentifier: String?,
+        axIdentifier: String?,
+        axChildIndex: Int,
+        appIcon: NSImage,
+        statusTitle: String,
+        statusDescription: String,
+        slotFrame: CGRect?,
+        isCurrentlyOnBar: Bool,
+        axElement: AXUIElement?,
+        isSystemItem: Bool,
+        isMovable: Bool
+    ) {
+        self.id = id
+        self.pid = pid
+        self.appName = appName
+        self.bundleIdentifier = bundleIdentifier
+        self.axIdentifier = axIdentifier
+        self.axChildIndex = axChildIndex
+        self.appIcon = appIcon
+        self.statusTitle = statusTitle
+        self.statusDescription = statusDescription
+        self.slotFrame = slotFrame
+        self.isCurrentlyOnBar = isCurrentlyOnBar
+        self.axElement = axElement
+        self.isSystemItem = isSystemItem
+        self.isMovable = isMovable
+        self.searchIndexText = "\(appName)\n\(bundleIdentifier ?? "")\n\(statusTitle)\n\(statusDescription)".lowercased()
+    }
 
     /// Effective X coordinate for sorting right-to-left on the menu bar.
     var sortX: CGFloat {
         slotFrame?.minX ?? -99999
     }
 
+    /// Fast equality check for `SecondaryBarStripNSView` so live clock/CPU text ticks do not trigger icon strip redraws.
+    func isIconStripEqual(to other: MenuBarAppItem) -> Bool {
+        id == other.id && appIcon === other.appIcon
+    }
+
     static func == (lhs: MenuBarAppItem, rhs: MenuBarAppItem) -> Bool {
         lhs.id == rhs.id &&
-        lhs.pid == rhs.pid &&
         lhs.appName == rhs.appName &&
+        lhs.bundleIdentifier == rhs.bundleIdentifier &&
         lhs.statusTitle == rhs.statusTitle &&
-        lhs.isCurrentlyOnBar == rhs.isCurrentlyOnBar
+        lhs.statusDescription == rhs.statusDescription &&
+        lhs.isSystemItem == rhs.isSystemItem &&
+        lhs.appIcon === rhs.appIcon
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(appName)
+        hasher.combine(bundleIdentifier)
+        hasher.combine(statusTitle)
+        hasher.combine(statusDescription)
+        hasher.combine(isSystemItem)
+        hasher.combine(ObjectIdentifier(appIcon))
     }
 }
 
@@ -210,14 +262,7 @@ enum AutoHideDuration: Int, CaseIterable, Identifiable {
         case .eightSeconds: return "8 giây"
         case .twelveSeconds: return "12 giây"
         case .twentySeconds: return "20 giây"
-        case .never: return "Không tự ẩn (chỉ ẩn khi bấm lại Ctrl+B hoặc click ra ngoài)"
-        }
-    }
-
-    var shortLabel: String {
-        switch self {
-        case .never: return "Thủ công"
-        default: return "\(rawValue)s"
+        case .never: return "Không tự ẩn"
         }
     }
 }

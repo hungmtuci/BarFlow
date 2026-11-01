@@ -57,11 +57,18 @@ final class MenuBarScanner: @unchecked Sendable {
     private var negativePIDCache: [pid_t: CFAbsoluteTime] = [:]
     private let negativeCacheTTL: CFAbsoluteTime = 15.0
 
-    /// MainActor-owned pre-rendered `32x32` (@2x) icon cache keyed by PID or symbol key.
+    /// MainActor-owned pre-rendered `32x32` (@2x) icon cache keyed by stable bundleID/execPath or symbol key.
     @MainActor private var scaledIconCache: [String: NSImage] = [:]
+    @MainActor private var cachedSystemSymbolIcons: [String: NSImage]?
     /// MainActor-owned cached `CandidateProcess` per PID so warm scans do zero LaunchServices/icon work on MainActor.
     @MainActor private var candidateProcessCache: [pid_t: CandidateProcess] = [:]
     @MainActor private var skippedDaemonPIDs = Set<pid_t>()
+
+    /// Screen geometry cache invalidated automatically on `NSApplication.didChangeScreenParametersNotification`.
+    @MainActor private static var cachedDisplays: [DisplayGeometry]?
+    @MainActor private static var cachedPrimaryScreenHeight: CGFloat = 1440
+    @MainActor private static var cachedMaxMenuBarBottomCGY: CGFloat = 44
+    @MainActor private static var didInstallScreenObserver = false
 
     private let systemExtrasContainerBundleIDs: Set<String> = [
         "com.apple.MenuBarAgent",
@@ -80,10 +87,6 @@ final class MenuBarScanner: @unchecked Sendable {
     private init() {}
 
     // MARK: - Accessibility Permission Helpers
-
-    var isAccessibilityTrusted: Bool {
-        AXIsProcessTrusted()
-    }
 
     @MainActor
     func promptForAccessibilityPermission(openSystemSettings: Bool = false) {
@@ -141,15 +144,19 @@ final class MenuBarScanner: @unchecked Sendable {
         let runningApps = NSWorkspace.shared.runningApplications
         var candidatesByPID: [pid_t: CandidateProcess] = [:]
         candidatesByPID.reserveCapacity(runningApps.count)
+        var livePIDs = Set<pid_t>()
+        livePIDs.reserveCapacity(runningApps.count)
 
         for app in runningApps {
             let pid = app.processIdentifier
             guard pid > 0, pid != ownPID else { continue }
+            livePIDs.insert(pid)
 
             if skippedDaemonPIDs.contains(pid) {
                 continue
             }
-            if let cachedCandidate = candidateProcessCache[pid] {
+            if let cachedCandidate = candidateProcessCache[pid],
+               cachedCandidate.bundleID == app.bundleIdentifier {
                 candidatesByPID[pid] = cachedCandidate
                 continue
             }
@@ -162,12 +169,15 @@ final class MenuBarScanner: @unchecked Sendable {
             }
 
             let isContainer = bundleID.map { systemExtrasContainerBundleIDs.contains($0) } ?? false
-            let cacheKey = "pid:\(pid)"
+            let cacheKey = bundleID ?? app.executableURL?.path ?? "pid:\(pid)"
             let icon: NSImage
             if let cached = scaledIconCache[cacheKey] {
                 icon = cached
             } else {
                 let rendered = preScaleIcon(bestRawIcon(for: app), pointSize: 32)
+                if scaledIconCache.count > 320 {
+                    scaledIconCache = scaledIconCache.filter { $0.key.hasPrefix("sym:") }
+                }
                 scaledIconCache[cacheKey] = rendered
                 icon = rendered
             }
@@ -187,6 +197,15 @@ final class MenuBarScanner: @unchecked Sendable {
             candidatesByPID[pid] = candidate
         }
 
+        // Prune dead transient XPC / helper PIDs so caches stay bounded and immune to PID wrap-around reuse!
+        if candidateProcessCache.count > livePIDs.count {
+            candidateProcessCache = candidateProcessCache.filter { livePIDs.contains($0.key) }
+        }
+        if skippedDaemonPIDs.count > livePIDs.count {
+            skippedDaemonPIDs.formIntersection(livePIDs)
+        }
+
+        let livePIDSnapshot = livePIDs
         return await withCheckedContinuation { continuation in
             scanQueue.async { [weak self] in
                 guard let self = self else {
@@ -195,6 +214,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 }
                 let items = self.performBackgroundScan(
                     ownPID: ownPID,
+                    livePIDs: livePIDSnapshot,
                     initialCandidatesByPID: candidatesByPID,
                     displays: displays,
                     symbolIcons: symbolIcons,
@@ -208,6 +228,7 @@ final class MenuBarScanner: @unchecked Sendable {
 
     private func performBackgroundScan(
         ownPID: pid_t,
+        livePIDs: Set<pid_t>,
         initialCandidatesByPID: [pid_t: CandidateProcess],
         displays: [DisplayGeometry],
         symbolIcons: [String: NSImage],
@@ -400,8 +421,12 @@ final class MenuBarScanner: @unchecked Sendable {
             }
         }
 
-        // Update positive & negative caches safely
+        // Update positive & negative caches safely & prune exited transient PIDs
         cacheLock.lock()
+        if !livePIDs.isEmpty {
+            knownMenuBarPIDs = knownMenuBarPIDs.filter { livePIDs.contains($0) || candidatesByPID[$0] != nil }
+            negativePIDCache = negativePIDCache.filter { (livePIDs.contains($0.key) || candidatesByPID[$0.key] != nil) && (now - $0.value) < negativeCacheTTL }
+        }
         for pid in newlyPositivePIDs {
             knownMenuBarPIDs.insert(pid)
             negativePIDCache.removeValue(forKey: pid)
@@ -452,10 +477,9 @@ final class MenuBarScanner: @unchecked Sendable {
             var extras: [MenuBarAppItem] = []
             for (idx, rawChild) in rawChildren.enumerated() {
                 let playable = unwrapPlayableMenuBarElement(rawChild, timeout: 0.25)
-                let (title, desc, innerFrame) = readAXMetadata(playable, timeout: 0.25)
+                let (title, desc, innerFrame, innerID) = readAXMetadataAndIdentifier(playable, timeout: 0.25)
                 let frame = innerFrame ?? readAXFrame(rawChild)
-                let axID = readAXString(playable, kAXIdentifierAttribute as CFString)
-                    ?? readAXString(rawChild, kAXIdentifierAttribute as CFString)
+                let axID = innerID ?? readAXString(rawChild, kAXIdentifierAttribute as CFString)
 
                 // Exclude permanently locked Clock & Control Center corner anchors
                 if Self.isImmovableCornerSystemExtra(axID: axID, title: title, desc: desc) {
@@ -468,7 +492,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 if let axID, !axID.isEmpty {
                     stableID = axID
                 } else {
-                    let cleanKey = desc.isEmpty ? (title.isEmpty ? "\(idx)" : title) : desc
+                    let cleanKey = !desc.isEmpty ? desc : "item-\(idx)"
                     stableID = "systemextra:\(proc.bundleID ?? "macos"):\(cleanKey)"
                 }
 
@@ -496,7 +520,7 @@ final class MenuBarScanner: @unchecked Sendable {
         }
 
         // Case B: Standard, Helper, or `.prohibited` Tray Application (1 or MULTIPLE Menu Bar icons!)
-        let baseID = proc.bundleID ?? "pid:\(proc.pid):\(proc.localizedName ?? "App")"
+        let baseID = proc.bundleID ?? "exec:\(proc.localizedName ?? "App")"
         var items: [MenuBarAppItem] = []
         items.reserveCapacity(rawChildren.count)
 
@@ -505,9 +529,8 @@ final class MenuBarScanner: @unchecked Sendable {
 
         for (idx, rawChild) in rawChildren.enumerated() {
             let playable = unwrapPlayableMenuBarElement(rawChild, timeout: 0.25)
-            let (axTitle, axDesc, innerFrame) = readAXMetadata(playable, timeout: 0.25)
+            let (axTitle, axDesc, innerFrame, axID) = readAXMetadataAndIdentifier(playable, timeout: 0.25)
             let axFrame = innerFrame ?? readAXFrame(rawChild)
-            let axID = readAXString(playable, kAXIdentifierAttribute as CFString)
             let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(axFrame, displays: displays)
 
             let baseAppName = Self.friendlyAppName(
@@ -524,8 +547,14 @@ final class MenuBarScanner: @unchecked Sendable {
                 finalID = baseID
                 finalName = baseAppName
             } else {
+                // Never include live `axTitle` (e.g. "CPU 14%" -> "CPU 19%") in `finalID` so IDs stay 100% stable across scans!
+                let stableDescKey: String? = {
+                    guard !axDesc.isEmpty, axDesc.rangeOfCharacter(from: .decimalDigits) == nil else { return nil }
+                    return axDesc
+                }()
                 let disambiguator = (axID?.isEmpty == false ? axID! : nil)
-                    ?? (!axDesc.isEmpty ? axDesc : (!axTitle.isEmpty ? axTitle : "\(idx + 1)"))
+                    ?? stableDescKey
+                    ?? "item-\(idx)"
                 finalID = (idx == 0) ? baseID : "\(baseID)#\(disambiguator)"
                 let labelSuffix = !axDesc.isEmpty ? axDesc : (!axTitle.isEmpty ? axTitle : "#\(idx + 1)")
                 finalName = (labelSuffix.localizedCaseInsensitiveContains(baseAppName))
@@ -567,8 +596,7 @@ final class MenuBarScanner: @unchecked Sendable {
         let err = AXUIElementCopyAttributeValue(axApp, "AXExtrasMenuBar" as CFString, &barRef)
         switch err {
         case .success:
-            guard let bar = barRef else { return .definitelyEmpty }
-            let barEl = bar as! AXUIElement
+            guard let barEl = Self.asAXUIElement(barRef) else { return .definitelyEmpty }
             AXUIElementSetMessagingTimeout(barEl, timeout)
             var childrenRef: CFTypeRef?
             let chErr = AXUIElementCopyAttributeValue(barEl, kAXChildrenAttribute as CFString, &childrenRef)
@@ -603,7 +631,6 @@ final class MenuBarScanner: @unchecked Sendable {
         }
 
         var byPID: [pid_t: [AXUIElement]] = [:]
-        // Inspect up to 2 display windows (covers primary + secondary displays quickly in ~8ms)
         for win in windows.prefix(2) {
             var slotsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(win, kAXChildrenAttribute as CFString, &slotsRef) == .success,
@@ -619,13 +646,17 @@ final class MenuBarScanner: @unchecked Sendable {
                     byPID[spid] = [content]
                 }
             }
+            if !byPID.isEmpty {
+                break
+            }
         }
         return byPID
     }
 
     /// Unwraps container groups (`AXHostingView` in `MenuBarAgent` or `AXApplication` -> `AXMenuBar` -> `AXMenuBarItem`)
     /// down to the interactive `AXMenuBarItem` that responds to `AXPress`.
-    private func unwrapPlayableMenuBarElement(_ element: AXUIElement, timeout: Float) -> AXUIElement {
+    private func unwrapPlayableMenuBarElement(_ element: AXUIElement, timeout: Float, maxDepth: Int = 5) -> AXUIElement {
+        guard maxDepth > 0 else { return element }
         AXUIElementSetMessagingTimeout(element, timeout)
         let role = readAXString(element, kAXRoleAttribute as CFString) ?? ""
 
@@ -635,10 +666,10 @@ final class MenuBarScanner: @unchecked Sendable {
                let children = chRef as? [AXUIElement], !children.isEmpty {
                 // For AXApplication, prefer the AXExtrasMenuBar or last AXMenuBar child (not the Apple main menu bar)
                 if role == "AXApplication", let lastBar = children.last {
-                    return unwrapPlayableMenuBarElement(lastBar, timeout: timeout)
+                    return unwrapPlayableMenuBarElement(lastBar, timeout: timeout, maxDepth: maxDepth - 1)
                 }
                 if let first = children.first {
-                    return unwrapPlayableMenuBarElement(first, timeout: timeout)
+                    return unwrapPlayableMenuBarElement(first, timeout: timeout, maxDepth: maxDepth - 1)
                 }
             }
         }
@@ -757,28 +788,77 @@ final class MenuBarScanner: @unchecked Sendable {
         return children
     }
 
+    private static let batchedStatusItemAttributes: CFArray = [
+        kAXTitleAttribute as CFString,
+        kAXDescriptionAttribute as CFString,
+        kAXPositionAttribute as CFString,
+        kAXSizeAttribute as CFString,
+        kAXIdentifierAttribute as CFString
+    ] as CFArray
+
+    nonisolated static func asAXUIElement(_ ref: CFTypeRef?) -> AXUIElement? {
+        guard let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(ref, to: AXUIElement.self)
+    }
+
+    nonisolated static func asAXValue(_ ref: CFTypeRef?) -> AXValue? {
+        guard let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
+        return unsafeBitCast(ref, to: AXValue.self)
+    }
+
     func readAXFrame(_ element: AXUIElement) -> CGRect? {
         var posRef: CFTypeRef?
         var sizeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
               AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
-              let posVal = posRef,
-              let sizeVal = sizeRef else {
+              let posVal = Self.asAXValue(posRef),
+              let sizeVal = Self.asAXValue(sizeRef) else {
             return nil
         }
         var pt = CGPoint.zero
         var sz = CGSize.zero
-        AXValueGetValue(posVal as! AXValue, .cgPoint, &pt)
-        AXValueGetValue(sizeVal as! AXValue, .cgSize, &sz)
+        guard AXValueGetValue(posVal, .cgPoint, &pt),
+              AXValueGetValue(sizeVal, .cgSize, &sz) else {
+            return nil
+        }
         return CGRect(origin: pt, size: sz)
     }
 
-    private func readAXMetadata(_ element: AXUIElement, timeout: Float) -> (title: String, desc: String, frame: CGRect?) {
+    /// Reads Title, Description, Position, Size, and Identifier in 1 single cross-process Mach IPC call instead of 5.
+    private func readAXMetadataAndIdentifier(
+        _ element: AXUIElement,
+        timeout: Float
+    ) -> (title: String, desc: String, frame: CGRect?, identifier: String?) {
         AXUIElementSetMessagingTimeout(element, timeout)
+        var multiRef: CFArray?
+        if AXUIElementCopyMultipleAttributeValues(
+            element,
+            Self.batchedStatusItemAttributes,
+            AXCopyMultipleAttributeOptions(rawValue: 0),
+            &multiRef
+        ) == .success,
+           let arr = multiRef as? [AnyObject],
+           arr.count == 5 {
+            let title = (arr[0] as? String) ?? ""
+            let desc = (arr[1] as? String) ?? ""
+            let frame: CGRect? = {
+                guard let pVal = Self.asAXValue(arr[2]),
+                      let sVal = Self.asAXValue(arr[3]) else { return nil }
+                var pt = CGPoint.zero
+                var sz = CGSize.zero
+                guard AXValueGetValue(pVal, .cgPoint, &pt),
+                      AXValueGetValue(sVal, .cgSize, &sz) else { return nil }
+                return CGRect(origin: pt, size: sz)
+            }()
+            let rawID = (arr[4] as? String) ?? ""
+            return (title, desc, frame, rawID.isEmpty ? nil : rawID)
+        }
+
         let title = readAXString(element, kAXTitleAttribute as CFString) ?? ""
         let desc = readAXString(element, kAXDescriptionAttribute as CFString) ?? ""
         let frame = readAXFrame(element)
-        return (title, desc, frame)
+        let axID = readAXString(element, kAXIdentifierAttribute as CFString)
+        return (title, desc, frame, axID)
     }
 
     private func readAXString(_ element: AXUIElement, _ attr: CFString) -> String? {
@@ -829,8 +909,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 }
                 var parentRef: CFTypeRef?
                 if AXUIElementCopyAttributeValue(cur, kAXParentAttribute as CFString, &parentRef) == .success,
-                   let p = parentRef {
-                    cursor = (p as! AXUIElement)
+                   let parentEl = Self.asAXUIElement(parentRef) {
+                    cursor = parentEl
                 } else {
                     cursor = nil
                 }
@@ -1057,6 +1137,9 @@ final class MenuBarScanner: @unchecked Sendable {
 
     @MainActor
     private func prepareSystemSymbolIconMap() -> [String: NSImage] {
+        if let existing = cachedSystemSymbolIcons {
+            return existing
+        }
         let specs: [(String, String)] = [
             ("wifi", "wifi"),
             ("battery", "battery.100percent"),
@@ -1074,6 +1157,7 @@ final class MenuBarScanner: @unchecked Sendable {
             ("default", "menubar.rectangle")
         ]
         var map: [String: NSImage] = [:]
+        map.reserveCapacity(specs.count)
         for (key, sfName) in specs {
             let cacheKey = "sym:\(key)"
             if let cached = scaledIconCache[cacheKey] {
@@ -1086,6 +1170,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 map[key] = configured
             }
         }
+        cachedSystemSymbolIcons = map
         return map
     }
 
@@ -1181,9 +1266,37 @@ final class MenuBarScanner: @unchecked Sendable {
     }
 
     @MainActor
+    static var maxMenuBarBandMaxY: CGFloat {
+        if cachedDisplays == nil {
+            _ = captureDisplayGeometries()
+        }
+        return cachedMaxMenuBarBottomCGY
+    }
+
+    @MainActor
     static func captureDisplayGeometries() -> [DisplayGeometry] {
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 1440
-        return NSScreen.screens.compactMap { screen in
+        if !didInstallScreenObserver {
+            didInstallScreenObserver = true
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { _ in
+                MainActor.assumeIsolated {
+                    cachedDisplays = nil
+                }
+            }
+        }
+        if let cached = cachedDisplays {
+            return cached
+        }
+
+        let screens = NSScreen.screens
+        let primaryHeight = screens.first?.frame.height ?? 1440
+        cachedPrimaryScreenHeight = primaryHeight
+
+        var maxBottomY: CGFloat = 40.0
+        let built: [DisplayGeometry] = screens.compactMap { screen in
             guard let id = displayID(for: screen) else { return nil }
             let f = screen.frame
             let cgRect = CGRect(
@@ -1193,6 +1306,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 height: f.height
             )
             let thickness = effectiveMenuBarThickness(for: screen)
+            maxBottomY = max(maxBottomY, cgRect.minY + thickness + 4.0)
             return DisplayGeometry(
                 displayID: id,
                 appKitFrame: f,
@@ -1200,15 +1314,19 @@ final class MenuBarScanner: @unchecked Sendable {
                 menuBarThickness: thickness
             )
         }
+        cachedMaxMenuBarBottomCGY = maxBottomY
+        cachedDisplays = built
+        return built
     }
 
     @MainActor
     static func displayGeometryContainingMouse() -> DisplayGeometry? {
+        let displays = captureDisplayGeometries()
         let screen = screenContainingMouse()
         guard let targetID = displayID(for: screen) else {
-            return captureDisplayGeometries().first
+            return displays.first
         }
-        return captureDisplayGeometries().first(where: { $0.displayID == targetID })
+        return displays.first(where: { $0.displayID == targetID })
     }
 
     @MainActor
@@ -1232,19 +1350,16 @@ final class MenuBarScanner: @unchecked Sendable {
 
     @MainActor
     static func appKitToCGRect(_ rect: NSRect) -> CGRect {
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 1440
+        if cachedDisplays == nil {
+            _ = captureDisplayGeometries()
+        }
+        let primaryHeight = cachedPrimaryScreenHeight
         return CGRect(
             x: rect.origin.x,
             y: primaryHeight - rect.maxY,
             width: rect.width,
             height: rect.height
         )
-    }
-
-    @MainActor
-    static func cgToAppKitPoint(_ point: CGPoint) -> NSPoint {
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 1440
-        return NSPoint(x: point.x, y: primaryHeight - point.y)
     }
 
     @MainActor

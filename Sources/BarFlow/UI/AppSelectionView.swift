@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 enum AppFilterMode: String, CaseIterable, Identifiable {
     case all = "all"
@@ -10,39 +9,21 @@ enum AppFilterMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+@MainActor
+final class SelectionFilterState: ObservableObject {
+    @Published var searchText: String = ""
+    @Published var filterModeRaw: String = AppFilterMode.all.rawValue
+
+    var filterMode: AppFilterMode {
+        AppFilterMode(rawValue: filterModeRaw) ?? .all
+    }
+}
+
 struct AppSelectionView: View {
     @ObservedObject var menuController: MenuBarController
-    @ObservedObject var barController: SecondaryBarController
-    @ObservedObject var hotKeyService: HotKeyService
-    @ObservedObject var updateService: UpdateCheckerService
-
-    private var filterMode: AppFilterMode {
-        AppFilterMode(rawValue: menuController.filterModeRaw) ?? .all
-    }
-
-    private var isSearchEmpty: Bool {
-        menuController.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var filteredApps: [MenuBarAppItem] {
-        let base: [MenuBarAppItem]
-        switch filterMode {
-        case .all:
-            base = menuController.stableAllApps
-        case .mainBar:
-            base = menuController.mainBarApps
-        case .secondaryBar:
-            base = menuController.secondaryBarApps
-        }
-        let trimmed = menuController.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return base }
-        return base.filter { item in
-            item.appName.localizedCaseInsensitiveContains(trimmed) ||
-            (item.bundleIdentifier?.localizedCaseInsensitiveContains(trimmed) ?? false) ||
-            item.statusTitle.localizedCaseInsensitiveContains(trimmed) ||
-            item.statusDescription.localizedCaseInsensitiveContains(trimmed)
-        }
-    }
+    let barController: SecondaryBarController
+    let hotKeyService: HotKeyService
+    let updateService: UpdateCheckerService
 
     var body: some View {
         VStack(spacing: 0) {
@@ -60,10 +41,7 @@ struct AppSelectionView: View {
             liveZonesPreviewSection
             Divider()
 
-            filterAndBulkActionToolbar
-            Divider()
-
-            appListSection
+            FilterableAppListSection(menuController: menuController)
             Divider()
 
             footerSettingsBar
@@ -75,7 +53,9 @@ struct AppSelectionView: View {
     // MARK: - 1. Top Header
 
     private var headerSection: some View {
-        HStack(spacing: 14) {
+        let shortcutCompact = menuController.hotKeyBinding.compactDisplay
+
+        return HStack(spacing: 14) {
             ZStack {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
@@ -103,25 +83,12 @@ struct AppSelectionView: View {
                         .padding(.vertical, 2)
                         .background(Color.primary.opacity(0.07), in: Capsule())
 
-                    Button {
-                        hotKeyService.toggleRecording()
-                    } label: {
-                        Text(hotKeyService.isRecordingShortcut
-                             ? "Bấm phím mới..."
-                             : menuController.hotKeyBinding.readableDisplay)
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.blue)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
-                            .background(
-                                (hotKeyService.isRecordingShortcut ? Color.orange : Color.blue).opacity(0.14),
-                                in: Capsule()
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .help("Bấm để đổi phím tắt mở nhanh thanh ứng dụng phụ")
+                    HeaderShortcutBadgeButton(
+                        menuController: menuController,
+                        hotKeyService: hotKeyService
+                    )
                 }
-                Text("Chọn lọc & kéo thả sắp xếp thứ tự Trái → Phải cho cả Menu Bar chính lẫn thanh phụ \(menuController.hotKeyBinding.compactDisplay)")
+                Text("Chọn lọc & kéo thả sắp xếp thứ tự Trái → Phải cho cả Menu Bar chính lẫn thanh phụ \(shortcutCompact)")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -131,17 +98,7 @@ struct AppSelectionView: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 8) {
-                if case let .available(newVer, _, _) = updateService.state {
-                    Button {
-                        updateService.installAvailableUpdate()
-                    } label: {
-                        Label("Cập nhật v\(newVer)", systemImage: "arrow.down.circle.fill")
-                            .font(.system(size: 12.5, weight: .semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .help("Tự động tải và cài đặt BarFlow v\(newVer) từ GitHub Releases")
-                }
+                HeaderUpdateAvailableButton(updateService: updateService)
 
                 Button {
                     menuController.refreshAndSyncManually()
@@ -152,14 +109,10 @@ struct AppSelectionView: View {
                 .buttonStyle(.bordered)
                 .help("Quét lại toàn bộ ứng dụng và tiện ích đang chạy trên Menu Bar")
 
-                Button {
-                    barController.toggle()
-                } label: {
-                    let shortcut = menuController.hotKeyBinding.compactDisplay
-                    Label(barController.isVisible ? "Ẩn thanh phụ (\(shortcut))" : "Hiện thử (\(shortcut))", systemImage: "menubar.arrow.down.rectangle")
-                        .font(.system(size: 12.5, weight: .medium))
-                }
-                .buttonStyle(.bordered)
+                HeaderSecondaryBarToggleButton(
+                    barController: barController,
+                    shortcutCompact: shortcutCompact
+                )
 
                 Button {
                     Task {
@@ -340,6 +293,10 @@ struct AppSelectionView: View {
     private var liveZonesPreviewSection: some View {
         let mainApps = menuController.mainBarApps
         let secApps = menuController.secondaryBarApps
+        let zonePositions = menuController.zonePositionByID
+        let draggingID = menuController.draggingItemID
+        let shortcutReadable = menuController.hotKeyBinding.readableDisplay
+        let shortcutCompact = menuController.hotKeyBinding.compactDisplay
 
         return VStack(alignment: .leading, spacing: 10) {
             // Zone A: Main Menu Bar Preview
@@ -373,29 +330,31 @@ struct AppSelectionView: View {
                     .controlSize(.small)
                     .tint(.blue)
                     .disabled(mainApps.isEmpty)
-                    .help("Đưa toàn bộ ứng dụng đang ở Menu Bar chính xuống thanh phụ Ctrl + B")
+                    .help("Đưa toàn bộ ứng dụng đang ở Menu Bar chính xuống thanh phụ \(shortcutReadable)")
                 }
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if mainApps.isEmpty {
-                            Text("Đã chuyển toàn bộ xuống thanh phụ Ctrl + B — kéo thả icon vào đây hoặc bật công tắc để giữ trên Menu Bar chính")
+                            Text("Đã chuyển toàn bộ xuống thanh phụ \(shortcutReadable) — kéo thả icon vào đây hoặc bật công tắc để giữ trên Menu Bar chính")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(Array(mainApps.enumerated()), id: \.element.id) { index, item in
+                            ForEach(mainApps) { item in
                                 PreviewChipButton(
                                     item: item,
-                                    positionNumber: index + 1,
+                                    positionNumber: (zonePositions[item.id] ?? 0) + 1,
                                     totalCount: mainApps.count,
                                     isPinnedMain: true,
-                                    isBeingDragged: menuController.draggingItemID == item.id,
+                                    isBeingDragged: draggingID == item.id,
+                                    shortcutCompact: shortcutCompact,
                                     menuController: menuController,
                                     action: {
                                         menuController.toggleAppSelection(item)
                                     }
                                 )
+                                .equatable()
                             }
                         }
                     }
@@ -417,7 +376,7 @@ struct AppSelectionView: View {
             // Zone B: Secondary Bar Preview
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Label("Thanh phụ bên phải khi bấm \(menuController.hotKeyBinding.readableDisplay) (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
+                    Label("Thanh phụ bên phải khi bấm \(shortcutReadable) (\(secApps.count))", systemImage: "menubar.arrow.down.rectangle")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.blue)
 
@@ -445,29 +404,31 @@ struct AppSelectionView: View {
                     .controlSize(.small)
                     .tint(.green)
                     .disabled(secApps.isEmpty)
-                    .help("Đưa toàn bộ ứng dụng từ thanh phụ Ctrl + B lên lại Menu Bar chính")
+                    .help("Đưa toàn bộ ứng dụng từ thanh phụ \(shortcutReadable) lên lại Menu Bar chính")
                 }
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         if secApps.isEmpty {
-                            Text("Không có ứng dụng ẩn — kéo thả icon vào đây hoặc bấm 'Chuyển toàn bộ xuống phụ' để đưa vào Ctrl + B")
+                            Text("Không có ứng dụng ẩn — kéo thả icon vào đây hoặc bấm 'Chuyển toàn bộ xuống phụ' để đưa vào \(shortcutReadable)")
                                 .font(.system(size: 11.5))
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 6)
                         } else {
-                            ForEach(Array(secApps.enumerated()), id: \.element.id) { index, item in
+                            ForEach(secApps) { item in
                                 PreviewChipButton(
                                     item: item,
-                                    positionNumber: index + 1,
+                                    positionNumber: (zonePositions[item.id] ?? 0) + 1,
                                     totalCount: secApps.count,
                                     isPinnedMain: false,
-                                    isBeingDragged: menuController.draggingItemID == item.id,
+                                    isBeingDragged: draggingID == item.id,
+                                    shortcutCompact: shortcutCompact,
                                     menuController: menuController,
                                     action: {
                                         menuController.toggleAppSelection(item)
                                     }
                                 )
+                                .equatable()
                             }
                         }
                     }
@@ -503,256 +464,176 @@ struct AppSelectionView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
     }
 
-    // MARK: - 4. Filter, Search & Direct Bulk Transfer Toolbar
-
-    private var filterAndBulkActionToolbar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Tìm ứng dụng Menu Bar...", text: $menuController.searchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12.5))
-                if !menuController.searchText.isEmpty {
-                    Button {
-                        menuController.searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .frame(minWidth: 170, maxWidth: 220)
-            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-
-            Picker("", selection: $menuController.filterModeRaw) {
-                Text("Tất cả (\(menuController.stableAllApps.count))").tag(AppFilterMode.all.rawValue)
-                Text("Menu Bar chính (\(menuController.mainBarApps.count))").tag(AppFilterMode.mainBar.rawValue)
-                Text("Thanh phụ \(menuController.hotKeyBinding.compactDisplay) (\(menuController.secondaryBarApps.count))").tag(AppFilterMode.secondaryBar.rawValue)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 330)
-
-            Spacer(minLength: 4)
-
-            HStack(spacing: 6) {
-                Button {
-                    menuController.moveAllToSecondaryBar()
-                } label: {
-                    Label("Toàn bộ xuống phụ", systemImage: "arrow.down.to.line")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(menuController.mainBarApps.isEmpty)
-                .help("Chuyển toàn bộ ứng dụng xuống thanh phụ Ctrl + B")
-
-                Button {
-                    menuController.selectAllForMainBar()
-                } label: {
-                    Label("Toàn bộ lên chính", systemImage: "arrow.up.to.line")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(menuController.secondaryBarApps.isEmpty)
-                .help("Chuyển toàn bộ ứng dụng lên lại Menu Bar chính")
-            }
-            .fixedSize(horizontal: true, vertical: false)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 9)
-    }
-
-    // MARK: - 5. Running Menu Bar Apps List (Equatable Rows + ◀/▶ Ordering + Tab Drag & Drop)
-
-    private var appListSection: some View {
-        let apps = filteredApps
-        let mainApps = menuController.mainBarApps
-        let secApps = menuController.secondaryBarApps
-
-        var mainIdxMap: [String: Int] = [:]
-        mainIdxMap.reserveCapacity(mainApps.count)
-        for (idx, m) in mainApps.enumerated() {
-            mainIdxMap[m.id] = idx
-        }
-
-        var secIdxMap: [String: Int] = [:]
-        secIdxMap.reserveCapacity(secApps.count)
-        for (idx, s) in secApps.enumerated() {
-            secIdxMap[s.id] = idx
-        }
-
-        let allowRowDrag = isSearchEmpty
-        let currentFilterMode = filterMode
-        let draggingID = menuController.draggingItemID
-
-        return ScrollView {
-            LazyVStack(spacing: 5) {
-                if apps.isEmpty {
-                    VStack(spacing: 10) {
-                        Image(systemName: "menubar.rectangle")
-                            .font(.system(size: 32))
-                            .foregroundStyle(.tertiary)
-                        Text(menuController.isAccessibilityGranted
-                             ? "Không tìm thấy ứng dụng phù hợp."
-                             : "Hãy cấp quyền Trợ năng ở thanh thông báo phía trên để hiển thị danh sách ứng dụng.")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 48)
-                } else {
-                    ForEach(apps) { item in
-                        let isSelected = menuController.selectedMainBarIDs.contains(item.id)
-                        let posIdx = isSelected ? (mainIdxMap[item.id] ?? 0) : (secIdxMap[item.id] ?? 0)
-                        let zoneTotal = isSelected ? mainApps.count : secApps.count
-
-                        AppSelectionRow(
-                            item: item,
-                            isSelectedOnMainBar: isSelected,
-                            positionIndex: posIdx,
-                            zoneCount: zoneTotal,
-                            isBeingDragged: draggingID == item.id,
-                            showDragHandle: allowRowDrag,
-                            filterMode: currentFilterMode,
-                            menuController: menuController,
-                            onToggle: { newValue in
-                                menuController.setAppSelection(item, visibleOnMainBar: newValue)
-                            },
-                            onRowTap: {
-                                menuController.toggleAppSelection(item)
-                            },
-                            onMoveLeft: {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    if isSelected {
-                                        menuController.moveMainBarItem(id: item.id, direction: -1)
-                                    } else {
-                                        menuController.moveSecondaryBarItem(id: item.id, direction: -1)
-                                    }
-                                }
-                            },
-                            onMoveRight: {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    if isSelected {
-                                        menuController.moveMainBarItem(id: item.id, direction: 1)
-                                    } else {
-                                        menuController.moveSecondaryBarItem(id: item.id, direction: 1)
-                                    }
-                                }
-                            },
-                            onTestTrigger: {
-                                menuController.activateAppFromSecondaryBar(item, rightClick: false)
-                            }
-                        )
-                        .equatable()
-                    }
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-        }
-    }
-
-    // MARK: - 6. Bottom Settings Bar (Custom Hotkey, Hover/Scroll, Launch at Login & 1-Click Auto-Update)
+    // MARK: - 4. Bottom Settings Bar (Custom Hotkey, Auto-Hide, Hover/Scroll & 1-Click Auto-Update)
 
     private var footerSettingsBar: some View {
-        VStack(spacing: 8) {
-            // Row 1: Shortcut Recorder + Auto-Hide + Hover Trigger + Update Checker
-            HStack(spacing: 12) {
-                HStack(spacing: 6) {
-                    Image(systemName: "keyboard")
-                        .foregroundStyle(.secondary)
-                    Text("Phím tắt:")
-                        .font(.system(size: 12, weight: .medium))
-                        .fixedSize()
+        HStack(spacing: 12) {
+            FooterShortcutRecorderControl(
+                menuController: menuController,
+                hotKeyService: hotKeyService
+            )
 
-                    Button {
-                        hotKeyService.toggleRecording()
-                    } label: {
-                        Text(hotKeyService.isRecordingShortcut
-                             ? "Bấm tổ hợp phím... (Esc huỷ)"
-                             : menuController.hotKeyBinding.compactDisplay)
-                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.primary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3.5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(hotKeyService.isRecordingShortcut
-                                          ? Color.orange.opacity(0.16)
-                                          : Color.primary.opacity(0.08))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .strokeBorder(
-                                        hotKeyService.isRecordingShortcut ? Color.orange : Color.primary.opacity(0.15),
-                                        lineWidth: 0.9
-                                    )
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .help("Bấm vào đây rồi nhấn tổ hợp phím mới (cần kèm Ctrl / Option / Cmd, hoặc nhấn Delete để về mặc định Ctrl + B)")
+            Divider()
+                .frame(height: 16)
 
-                    if !menuController.hotKeyBinding.isDefault && !hotKeyService.isRecordingShortcut {
-                        Button {
-                            menuController.hotKeyBinding = .defaultCtrlB
-                            menuController.statusMessage = "Đã khôi phục phím tắt mặc định Ctrl + B!"
-                        } label: {
-                            Image(systemName: "arrow.counterclockwise")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Khôi phục phím tắt mặc định Ctrl + B")
+            HStack(spacing: 6) {
+                Image(systemName: "timer")
+                    .foregroundStyle(.secondary)
+                Text("Tự ẩn:")
+                    .font(.system(size: 12, weight: .medium))
+                    .fixedSize()
+                Picker("", selection: $menuController.autoHideDuration) {
+                    ForEach(AutoHideDuration.allCases) { option in
+                        Text(option.title).tag(option)
                     }
                 }
-                .fixedSize(horizontal: true, vertical: false)
-
-                Divider()
-                    .frame(height: 16)
-
-                HStack(spacing: 6) {
-                    Image(systemName: "timer")
-                        .foregroundStyle(.secondary)
-                    Text("Tự ẩn:")
-                        .font(.system(size: 12, weight: .medium))
-                        .fixedSize()
-                    Picker("", selection: $menuController.autoHideDuration) {
-                        ForEach(AutoHideDuration.allCases) { option in
-                            Text(option.shortLabel == "Thủ công" ? "Không tự ẩn" : option.title).tag(option)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 110)
-                }
-                .fixedSize(horizontal: true, vertical: false)
-
-                Divider()
-                    .frame(height: 16)
-
-                Toggle("Rê chuột vào ••• để mở", isOn: $menuController.hoverToOpenEnabled)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 12))
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help("Tự động bung thanh phụ khi rê chuột dừng 0.2s trên nút ••• (ngoài ra luôn hỗ trợ cuộn chuột 2 ngón trên •••)")
-
-                Spacer(minLength: 6)
-
-                footerUpdateButton
+                .labelsHidden()
+                .frame(width: 110)
             }
+            .fixedSize(horizontal: true, vertical: false)
+
+            Divider()
+                .frame(height: 16)
+
+            Toggle("Rê chuột vào ••• để mở", isOn: $menuController.hoverToOpenEnabled)
+                .toggleStyle(.checkbox)
+                .font(.system(size: 12))
+                .fixedSize(horizontal: true, vertical: false)
+                .help("Tự động bung thanh phụ khi rê chuột dừng 0.2s trên nút ••• (ngoài ra luôn hỗ trợ cuộn chuột 2 ngón trên •••)")
+
+            Spacer(minLength: 6)
+
+            FooterUpdateStatusView(updateService: updateService)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 9)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
     }
+}
 
-    @ViewBuilder
-    private var footerUpdateButton: some View {
+// MARK: - Granular Leaf Observers (Prevents Full-Window Re-Evaluation on HotKey / Update / Bar State Changes)
+
+private struct HeaderShortcutBadgeButton: View {
+    @ObservedObject var menuController: MenuBarController
+    @ObservedObject var hotKeyService: HotKeyService
+
+    var body: some View {
+        Button {
+            hotKeyService.toggleRecording()
+        } label: {
+            Text(hotKeyService.isRecordingShortcut
+                 ? "Bấm phím mới..."
+                 : menuController.hotKeyBinding.readableDisplay)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.blue)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(
+                    (hotKeyService.isRecordingShortcut ? Color.orange : Color.blue).opacity(0.14),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(.plain)
+        .help("Bấm để đổi phím tắt mở nhanh thanh ứng dụng phụ")
+    }
+}
+
+private struct HeaderUpdateAvailableButton: View {
+    @ObservedObject var updateService: UpdateCheckerService
+
+    var body: some View {
+        if case let .available(newVer, _, _) = updateService.state {
+            Button {
+                updateService.installAvailableUpdate()
+            } label: {
+                Label("Cập nhật v\(newVer)", systemImage: "arrow.down.circle.fill")
+                    .font(.system(size: 12.5, weight: .semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .help("Tự động tải và cài đặt BarFlow v\(newVer) từ GitHub Releases")
+        }
+    }
+}
+
+private struct HeaderSecondaryBarToggleButton: View {
+    @ObservedObject var barController: SecondaryBarController
+    let shortcutCompact: String
+
+    var body: some View {
+        Button {
+            barController.toggle()
+        } label: {
+            Label(
+                barController.isVisible ? "Ẩn thanh phụ (\(shortcutCompact))" : "Hiện thử (\(shortcutCompact))",
+                systemImage: "menubar.arrow.down.rectangle"
+            )
+            .font(.system(size: 12.5, weight: .medium))
+        }
+        .buttonStyle(.bordered)
+    }
+}
+
+private struct FooterShortcutRecorderControl: View {
+    @ObservedObject var menuController: MenuBarController
+    @ObservedObject var hotKeyService: HotKeyService
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "keyboard")
+                .foregroundStyle(.secondary)
+            Text("Phím tắt:")
+                .font(.system(size: 12, weight: .medium))
+                .fixedSize()
+
+            Button {
+                hotKeyService.toggleRecording()
+            } label: {
+                Text(hotKeyService.isRecordingShortcut
+                     ? "Bấm tổ hợp phím... (Esc huỷ)"
+                     : menuController.hotKeyBinding.compactDisplay)
+                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(hotKeyService.isRecordingShortcut ? Color.orange : Color.primary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(hotKeyService.isRecordingShortcut
+                                  ? Color.orange.opacity(0.16)
+                                  : Color.primary.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(
+                                hotKeyService.isRecordingShortcut ? Color.orange : Color.primary.opacity(0.15),
+                                lineWidth: 0.9
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Bấm vào đây rồi nhấn tổ hợp phím mới (cần kèm Ctrl / Option / Cmd, hoặc nhấn Delete để về mặc định Ctrl + B)")
+
+            if !menuController.hotKeyBinding.isDefault && !hotKeyService.isRecordingShortcut {
+                Button {
+                    menuController.hotKeyBinding = .defaultCtrlB
+                    menuController.statusMessage = "Đã khôi phục phím tắt mặc định Ctrl + B!"
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Khôi phục phím tắt mặc định Ctrl + B")
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+private struct FooterUpdateStatusView: View {
+    @ObservedObject var updateService: UpdateCheckerService
+
+    var body: some View {
         switch updateService.state {
         case .checking:
             HStack(spacing: 5) {
@@ -801,10 +682,177 @@ struct AppSelectionView: View {
     }
 }
 
+// MARK: - Isolated Search / Filter Toolbar + Lazy App List Section
+
+private struct FilterableAppListSection: View {
+    @ObservedObject var menuController: MenuBarController
+    @StateObject private var filterState = SelectionFilterState()
+
+    var body: some View {
+        let currentFilterMode = filterState.filterMode
+        let trimmedQuery = filterState.searchText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let isSearchEmpty = trimmedQuery.isEmpty
+
+        let baseApps: [MenuBarAppItem]
+        switch currentFilterMode {
+        case .all:
+            baseApps = menuController.stableAllApps
+        case .mainBar:
+            baseApps = menuController.mainBarApps
+        case .secondaryBar:
+            baseApps = menuController.secondaryBarApps
+        }
+
+        let apps = isSearchEmpty
+            ? baseApps
+            : baseApps.filter { $0.searchIndexText.contains(trimmedQuery) }
+
+        let mainCount = menuController.mainBarApps.count
+        let secCount = menuController.secondaryBarApps.count
+        let zonePositions = menuController.zonePositionByID
+        let draggingID = menuController.draggingItemID
+        let shortcutCompact = menuController.hotKeyBinding.compactDisplay
+
+        return VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Tìm ứng dụng Menu Bar...", text: $filterState.searchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12.5))
+                    if !filterState.searchText.isEmpty {
+                        Button {
+                            filterState.searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(minWidth: 170, maxWidth: 220)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+
+                Picker("", selection: $filterState.filterModeRaw) {
+                    Text("Tất cả (\(menuController.stableAllApps.count))").tag(AppFilterMode.all.rawValue)
+                    Text("Menu Bar chính (\(mainCount))").tag(AppFilterMode.mainBar.rawValue)
+                    Text("Thanh phụ \(shortcutCompact) (\(secCount))").tag(AppFilterMode.secondaryBar.rawValue)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 330)
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 6) {
+                    Button {
+                        menuController.moveAllToSecondaryBar()
+                    } label: {
+                        Label("Toàn bộ xuống phụ", systemImage: "arrow.down.to.line")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(mainCount == 0)
+                    .help("Chuyển toàn bộ ứng dụng xuống thanh phụ \(shortcutCompact)")
+
+                    Button {
+                        menuController.selectAllForMainBar()
+                    } label: {
+                        Label("Toàn bộ lên chính", systemImage: "arrow.up.to.line")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(secCount == 0)
+                    .help("Chuyển toàn bộ ứng dụng lên lại Menu Bar chính")
+                }
+                .fixedSize(horizontal: true, vertical: false)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 9)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 5) {
+                    if apps.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "menubar.rectangle")
+                                .font(.system(size: 32))
+                                .foregroundStyle(.tertiary)
+                            Text(menuController.isAccessibilityGranted
+                                 ? "Không tìm thấy ứng dụng phù hợp."
+                                 : "Hãy cấp quyền Trợ năng ở thanh thông báo phía trên để hiển thị danh sách ứng dụng.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 48)
+                    } else {
+                        ForEach(apps) { item in
+                            let isSelected = menuController.selectedMainBarIDs.contains(item.id)
+                            let posIdx = zonePositions[item.id] ?? 0
+                            let zoneTotal = isSelected ? mainCount : secCount
+
+                            AppSelectionRow(
+                                item: item,
+                                isSelectedOnMainBar: isSelected,
+                                positionIndex: posIdx,
+                                zoneCount: zoneTotal,
+                                isBeingDragged: draggingID == item.id,
+                                showDragHandle: isSearchEmpty,
+                                filterMode: currentFilterMode,
+                                shortcutCompact: shortcutCompact,
+                                menuController: menuController,
+                                onToggle: { newValue in
+                                    menuController.setAppSelection(item, visibleOnMainBar: newValue)
+                                },
+                                onRowTap: {
+                                    menuController.toggleAppSelection(item)
+                                },
+                                onMoveLeft: {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        if isSelected {
+                                            menuController.moveMainBarItem(id: item.id, direction: -1)
+                                        } else {
+                                            menuController.moveSecondaryBarItem(id: item.id, direction: -1)
+                                        }
+                                    }
+                                },
+                                onMoveRight: {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        if isSelected {
+                                            menuController.moveMainBarItem(id: item.id, direction: 1)
+                                        } else {
+                                            menuController.moveSecondaryBarItem(id: item.id, direction: 1)
+                                        }
+                                    }
+                                },
+                                onTestTrigger: {
+                                    menuController.activateAppFromSecondaryBar(item, rightClick: false)
+                                }
+                            )
+                            .equatable()
+                        }
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+            }
+        }
+    }
+}
+
 // MARK: - Native AppKit Live Drag Coordinator (Chips Zone A / Zone B + All-Tabs App Rows)
 
 @MainActor
-private final class SelectionDragCoordinator {
+final class SelectionDragCoordinator {
     static let shared = SelectionDragCoordinator()
 
     private struct WeakViewBox {
@@ -823,6 +871,7 @@ private final class SelectionDragCoordinator {
     private var allowDragMovement: Bool = true
     private var startScreenPt: NSPoint = .zero
     private var isDragging: Bool = false
+    private var lastSwapTargetID: String?
     private weak var activeController: MenuBarController?
     private var pendingTapAction: (() -> Void)?
 
@@ -874,7 +923,7 @@ private final class SelectionDragCoordinator {
         startScreenPt: NSPoint,
         onTap: @escaping () -> Void
     ) {
-        cancelActiveMonitorIfNeeded()
+        cancelActiveSession()
 
         self.activeItem = item
         self.allowDragMovement = allowDrag
@@ -882,6 +931,7 @@ private final class SelectionDragCoordinator {
         self.activeController = menuController
         self.startScreenPt = startScreenPt
         self.isDragging = false
+        self.lastSwapTargetID = nil
         self.pendingTapAction = onTap
 
         dragEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] event in
@@ -892,6 +942,23 @@ private final class SelectionDragCoordinator {
                 self.handleMouseUp()
             }
             return event
+        }
+    }
+
+    func cancelActiveSession() {
+        let wasDragging = isDragging
+        let ctrl = activeController
+
+        cancelActiveMonitorIfNeeded()
+        activeItem = nil
+        pendingTapAction = nil
+        lastSwapTargetID = nil
+        isDragging = false
+
+        if wasDragging {
+            NSCursor.pop()
+            FloatingIconDragGhost.shared.hide()
+            ctrl?.endDraggingSession()
         }
     }
 
@@ -928,7 +995,8 @@ private final class SelectionDragCoordinator {
             return
         }
 
-        // Check app list rows by vertical band
+        // Check app list rows by vertical band with mid-spring hysteresis
+        var matchedRowID: String?
         for (rowItemID, box) in rowViews {
             guard rowItemID != dragged.id,
                   let view = box.view,
@@ -940,18 +1008,26 @@ private final class SelectionDragCoordinator {
                 height: rect.height + 4
             )
             if expandedRowBand.contains(curScreen) {
-                withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
-                    switch activeFilterMode {
-                    case .mainBar:
-                        ctrl.reorderMainBarItem(draggedID: dragged.id, targetID: rowItemID)
-                    case .secondaryBar:
-                        ctrl.reorderSecondaryBarItem(draggedID: dragged.id, targetID: rowItemID)
-                    case .all:
-                        ctrl.reorderAllAppsItem(draggedID: dragged.id, targetID: rowItemID)
-                    }
-                }
+                matchedRowID = rowItemID
                 break
             }
+        }
+
+        if let rowItemID = matchedRowID {
+            guard lastSwapTargetID != rowItemID else { return }
+            lastSwapTargetID = rowItemID
+            withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                switch activeFilterMode {
+                case .mainBar:
+                    ctrl.reorderMainBarItem(draggedID: dragged.id, targetID: rowItemID)
+                case .secondaryBar:
+                    ctrl.reorderSecondaryBarItem(draggedID: dragged.id, targetID: rowItemID)
+                case .all:
+                    ctrl.reorderAllAppsItem(draggedID: dragged.id, targetID: rowItemID)
+                }
+            }
+        } else {
+            lastSwapTargetID = nil
         }
     }
 
@@ -963,6 +1039,7 @@ private final class SelectionDragCoordinator {
     ) {
         let liveZoneApps = isMainZone ? ctrl.mainBarApps : ctrl.secondaryBarApps
         if liveZoneApps.isEmpty {
+            lastSwapTargetID = nil
             withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
                 ctrl.dropItemIntoZone(draggedID: draggedID, toMainBar: isMainZone)
             }
@@ -970,7 +1047,7 @@ private final class SelectionDragCoordinator {
         }
 
         let map = isMainZone ? mainChipViews : secondaryChipViews
-        var closestTargetID: String? = nil
+        var closestTargetID: String?
         var bestDistance: CGFloat = .greatestFiniteMagnitude
 
         for app in liveZoneApps {
@@ -989,6 +1066,8 @@ private final class SelectionDragCoordinator {
 
         if let targetID = closestTargetID {
             if targetID != draggedID {
+                guard lastSwapTargetID != targetID else { return }
+                lastSwapTargetID = targetID
                 withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
                     if isMainZone {
                         ctrl.reorderMainBarItem(draggedID: draggedID, targetID: targetID)
@@ -996,8 +1075,11 @@ private final class SelectionDragCoordinator {
                         ctrl.reorderSecondaryBarItem(draggedID: draggedID, targetID: targetID)
                     }
                 }
+            } else {
+                lastSwapTargetID = nil
             }
         } else {
+            lastSwapTargetID = nil
             withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
                 ctrl.dropItemIntoZone(draggedID: draggedID, toMainBar: isMainZone)
             }
@@ -1012,6 +1094,7 @@ private final class SelectionDragCoordinator {
         cancelActiveMonitorIfNeeded()
         activeItem = nil
         pendingTapAction = nil
+        lastSwapTargetID = nil
         isDragging = false
 
         if wasDragging {
@@ -1100,9 +1183,15 @@ private final class ChipHitNSView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil, let id = registeredID {
-            SelectionDragCoordinator.shared.unregisterChipView(self, itemID: id, isMainZone: isMainZone)
-        } else if let id = item?.id {
+        if window == nil {
+            if let id = registeredID {
+                SelectionDragCoordinator.shared.unregisterChipView(self, itemID: id, isMainZone: isMainZone)
+                registeredID = nil
+            }
+            if hoverBox?.isHovered == true {
+                hoverBox?.isHovered = false
+            }
+        } else if let id = item?.id, registeredID != id {
             SelectionDragCoordinator.shared.registerChipView(self, itemID: id, isMainZone: isMainZone)
             registeredID = id
         }
@@ -1131,19 +1220,23 @@ private final class ChipHitNSView: NSView {
         menuController: MenuBarController,
         onTap: @escaping () -> Void
     ) {
-        if let prevID = registeredID, (prevID != item.id || self.isMainZone != isMainZone) {
+        let zoneChanged = (self.isMainZone != isMainZone)
+        if let prevID = registeredID, (prevID != item.id || zoneChanged) {
             SelectionDragCoordinator.shared.unregisterChipView(self, itemID: prevID, isMainZone: self.isMainZone)
+            registeredID = nil
         }
         self.item = item
         self.isMainZone = isMainZone
         self.hoverBox = hoverBox
         self.menuController = menuController
         self.onTap = onTap
-        self.registeredID = item.id
         if toolTip != toolTipText {
             toolTip = toolTipText
         }
-        SelectionDragCoordinator.shared.registerChipView(self, itemID: item.id, isMainZone: isMainZone)
+        if window != nil && registeredID != item.id {
+            SelectionDragCoordinator.shared.registerChipView(self, itemID: item.id, isMainZone: isMainZone)
+            registeredID = item.id
+        }
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -1156,10 +1249,6 @@ private final class ChipHitNSView: NSView {
         if hoverBox?.isHovered != false {
             hoverBox?.isHovered = false
         }
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        super.scrollWheel(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1186,7 +1275,6 @@ private struct RowPointerOverlayRepresentable: NSViewRepresentable {
     let item: MenuBarAppItem
     let allowDrag: Bool
     let filterMode: AppFilterMode
-    let hoverBox: LocalHoverBox
     let menuController: MenuBarController
     let onTap: () -> Void
 
@@ -1196,7 +1284,6 @@ private struct RowPointerOverlayRepresentable: NSViewRepresentable {
             item: item,
             allowDrag: allowDrag,
             filterMode: filterMode,
-            hoverBox: hoverBox,
             menuController: menuController,
             onTap: onTap
         )
@@ -1208,7 +1295,6 @@ private struct RowPointerOverlayRepresentable: NSViewRepresentable {
             item: item,
             allowDrag: allowDrag,
             filterMode: filterMode,
-            hoverBox: hoverBox,
             menuController: menuController,
             onTap: onTap
         )
@@ -1221,79 +1307,50 @@ private final class RowHitNSView: NSView {
     private var registeredID: String?
     private var allowDrag: Bool = true
     private var filterMode: AppFilterMode = .all
-    private weak var hoverBox: LocalHoverBox?
     private weak var menuController: MenuBarController?
     private var onTap: (() -> Void)?
-    private var trackingRef: NSTrackingArea?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil, let id = registeredID {
-            SelectionDragCoordinator.shared.unregisterRowView(self, itemID: id)
-        } else if let id = item?.id {
+        if window == nil {
+            if let id = registeredID {
+                SelectionDragCoordinator.shared.unregisterRowView(self, itemID: id)
+                registeredID = nil
+            }
+        } else if let id = item?.id, registeredID != id {
             SelectionDragCoordinator.shared.registerRowView(self, itemID: id)
             registeredID = id
         }
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let existing = trackingRef {
-            removeTrackingArea(existing)
-        }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingRef = area
     }
 
     func configure(
         item: MenuBarAppItem,
         allowDrag: Bool,
         filterMode: AppFilterMode,
-        hoverBox: LocalHoverBox,
         menuController: MenuBarController,
         onTap: @escaping () -> Void
     ) {
         if let prevID = registeredID, prevID != item.id {
             SelectionDragCoordinator.shared.unregisterRowView(self, itemID: prevID)
+            registeredID = nil
         }
         self.item = item
         self.allowDrag = allowDrag
         self.filterMode = filterMode
-        self.hoverBox = hoverBox
         self.menuController = menuController
         self.onTap = onTap
-        self.registeredID = item.id
         let tip = allowDrag
             ? "\(item.appName) • Kéo thả lên/xuống (hoặc kéo vào khung trên) để đổi vị trí • Click để chuyển thanh • Click phải để mở tuỳ chọn"
             : "\(item.appName) • Click để chuyển giữa Menu Bar chính và thanh phụ"
         if toolTip != tip {
             toolTip = tip
         }
-        SelectionDragCoordinator.shared.registerRowView(self, itemID: item.id)
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        if hoverBox?.isHovered != true {
-            hoverBox?.isHovered = true
+        if window != nil && registeredID != item.id {
+            SelectionDragCoordinator.shared.registerRowView(self, itemID: item.id)
+            registeredID = item.id
         }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        if hoverBox?.isHovered != false {
-            hoverBox?.isHovered = false
-        }
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        super.scrollWheel(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1316,23 +1373,33 @@ private final class RowHitNSView: NSView {
     }
 }
 
-// MARK: - Supporting Chip & Equatable Row Views
+// MARK: - Supporting Equatable Chip & Row Views
 
-private struct PreviewChipButton: View {
+private struct PreviewChipButton: View, Equatable {
     let item: MenuBarAppItem
     let positionNumber: Int
     let totalCount: Int
     let isPinnedMain: Bool
     let isBeingDragged: Bool
+    let shortcutCompact: String
     let menuController: MenuBarController
     let action: () -> Void
 
     @StateObject private var hover = LocalHoverBox()
 
+    static func == (lhs: PreviewChipButton, rhs: PreviewChipButton) -> Bool {
+        lhs.item == rhs.item &&
+        lhs.positionNumber == rhs.positionNumber &&
+        lhs.totalCount == rhs.totalCount &&
+        lhs.isPinnedMain == rhs.isPinnedMain &&
+        lhs.isBeingDragged == rhs.isBeingDragged &&
+        lhs.shortcutCompact == rhs.shortcutCompact
+    }
+
     var body: some View {
         let tipText = isPinnedMain
-            ? "Vị trí #\(positionNumber)/\(totalCount) trên Menu Bar chính • Kéo thả để đổi thứ tự (hoặc kéo xuống khung dưới) • Click để chuyển xuống Ctrl + B • Click phải để mở menu"
-            : "Vị trí #\(positionNumber)/\(totalCount) trên thanh phụ Ctrl + B • Kéo thả để đổi thứ tự (hoặc kéo lên khung trên) • Click để đưa lên Menu Bar chính • Click phải để mở menu"
+            ? "Vị trí #\(positionNumber)/\(totalCount) trên Menu Bar chính • Kéo thả để đổi thứ tự (hoặc kéo xuống khung dưới) • Click để chuyển xuống \(shortcutCompact) • Click phải để mở menu"
+            : "Vị trí #\(positionNumber)/\(totalCount) trên thanh phụ \(shortcutCompact) • Kéo thả để đổi thứ tự (hoặc kéo lên khung trên) • Click để đưa lên Menu Bar chính • Click phải để mở menu"
 
         return HStack(spacing: 5) {
             Text("\(positionNumber)")
@@ -1395,6 +1462,7 @@ private struct AppSelectionRow: View, Equatable {
     let isBeingDragged: Bool
     let showDragHandle: Bool
     let filterMode: AppFilterMode
+    let shortcutCompact: String
     let menuController: MenuBarController
     let onToggle: (Bool) -> Void
     let onRowTap: () -> Void
@@ -1411,16 +1479,19 @@ private struct AppSelectionRow: View, Equatable {
         lhs.zoneCount == rhs.zoneCount &&
         lhs.isBeingDragged == rhs.isBeingDragged &&
         lhs.showDragHandle == rhs.showDragHandle &&
-        lhs.filterMode == rhs.filterMode
+        lhs.filterMode == rhs.filterMode &&
+        lhs.shortcutCompact == rhs.shortcutCompact
     }
 
     var body: some View {
-        HStack(spacing: 10) {
+        let zoneLabel = isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ \(shortcutCompact)"
+
+        return HStack(spacing: 10) {
             HStack(spacing: 11) {
                 if showDragHandle {
                     Image(systemName: "line.3.horizontal")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(hover.isHovered ? .secondary : .tertiary)
+                        .foregroundStyle(hover.isHovered ? Color.secondary : Color.secondary.opacity(0.45))
                         .frame(width: 14)
                 }
 
@@ -1471,7 +1542,6 @@ private struct AppSelectionRow: View, Equatable {
                     item: item,
                     allowDrag: showDragHandle,
                     filterMode: filterMode,
-                    hoverBox: hover,
                     menuController: menuController,
                     onTap: onRowTap
                 )
@@ -1488,13 +1558,13 @@ private struct AppSelectionRow: View, Equatable {
                 .buttonStyle(.plain)
                 .disabled(positionIndex <= 0)
                 .opacity(positionIndex <= 0 ? 0.28 : 0.88)
-                .help("Đẩy sang trái 1 vị trí trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+                .help("Đẩy sang trái 1 vị trí trên \(zoneLabel)")
 
                 Text("#\(positionIndex + 1)")
                     .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                     .foregroundStyle(isSelectedOnMainBar ? Color.green : Color.blue)
                     .frame(minWidth: 24)
-                    .help("Vị trí thứ \(positionIndex + 1) (tính từ trái sang phải) trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+                    .help("Vị trí thứ \(positionIndex + 1) (tính từ trái sang phải) trên \(zoneLabel)")
 
                 Button(action: onMoveRight) {
                     Image(systemName: "chevron.right")
@@ -1505,7 +1575,7 @@ private struct AppSelectionRow: View, Equatable {
                 .buttonStyle(.plain)
                 .disabled(positionIndex >= zoneCount - 1)
                 .opacity(positionIndex >= zoneCount - 1 ? 0.28 : 0.88)
-                .help("Đẩy sang phải 1 vị trí trên \(isSelectedOnMainBar ? "Menu Bar chính" : "thanh phụ Ctrl + B")")
+                .help("Đẩy sang phải 1 vị trí trên \(zoneLabel)")
             }
             .padding(.horizontal, 4)
             .padding(.vertical, 2)
@@ -1521,10 +1591,11 @@ private struct AppSelectionRow: View, Equatable {
             .help("Mở ngay menu của \(item.appName)")
 
             HStack(spacing: 8) {
-                Text(isSelectedOnMainBar ? "Menu Bar chính" : "Thanh phụ ⌃B")
+                Text(isSelectedOnMainBar ? "Menu Bar chính" : "Thanh phụ \(shortcutCompact)")
                     .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(isSelectedOnMainBar ? .green : .blue)
-                    .frame(width: 92, alignment: .trailing)
+                    .foregroundStyle(isSelectedOnMainBar ? Color.green : Color.blue)
+                    .frame(width: 98, alignment: .trailing)
+                    .lineLimit(1)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         onRowTap()

@@ -7,28 +7,38 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.9.1"
+VERSION="1.9.2"
+BUILD_NUMBER="13"
+UNIVERSAL="${UNIVERSAL:-1}"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
-CONTENTS_DIR="$APP_BUNDLE/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
-RESOURCES_DIR="$CONTENTS_DIR/Resources"
 DIST_DIR="$PROJECT_DIR/dist"
 
-echo "==> [1/6] Đang biên dịch $APP_NAME (Universal Binary arm64 + x86_64 Release)..."
-if swift build -c release --product "$APP_NAME" --arch arm64 --arch x86_64 2>/dev/null; then
-    BIN_PATH="$(swift build -c release --product "$APP_NAME" --arch arm64 --arch x86_64 --show-bin-path)/$APP_NAME"
+if [ "$UNIVERSAL" = "1" ]; then
+    echo "==> [1/6] Đang biên dịch $APP_NAME v$VERSION (Universal Binary arm64 + x86_64 Release)..."
+    if swift build -c release --product "$APP_NAME" --arch arm64 --arch x86_64; then
+        BIN_PATH="$(swift build -c release --product "$APP_NAME" --arch arm64 --arch x86_64 --show-bin-path)/$APP_NAME"
+    else
+        echo "    (Fallback biên dịch kiến trúc bản địa...)"
+        swift build -c release --product "$APP_NAME"
+        BIN_PATH="$(swift build -c release --product "$APP_NAME" --show-bin-path)/$APP_NAME"
+    fi
 else
+    echo "==> [1/6] Đang biên dịch $APP_NAME v$VERSION (Native Release)..."
     swift build -c release --product "$APP_NAME"
     BIN_PATH="$(swift build -c release --product "$APP_NAME" --show-bin-path)/$APP_NAME"
 fi
 
-echo "==> [2/6] Đang tạo biểu tượng ứng dụng (AppIcon.icns)..."
-ICONSET_DIR="$PROJECT_DIR/.build/AppIcon.iconset"
-rm -rf "$ICONSET_DIR"
-mkdir -p "$ICONSET_DIR"
+CACHED_ICNS="$PROJECT_DIR/.build/AppIcon.icns"
+if [ -s "$CACHED_ICNS" ]; then
+    echo "==> [2/6] Sử dụng biểu tượng ứng dụng đã lưu cache ($CACHED_ICNS)..."
+else
+    echo "==> [2/6] Đang tạo biểu tượng ứng dụng (AppIcon.icns)..."
+    ICONSET_DIR="$PROJECT_DIR/.build/AppIcon.iconset"
+    rm -rf "$ICONSET_DIR"
+    mkdir -p "$ICONSET_DIR"
 
-swift - "$ICONSET_DIR" << 'SWIFT_ICON'
+    swift - "$ICONSET_DIR" << 'SWIFT_ICON'
 import AppKit
 
 let outDir = CommandLine.arguments[1]
@@ -95,7 +105,10 @@ for (px, name) in sizes {
 }
 SWIFT_ICON
 
-echo "==> [3/6] Đang đóng gói $APP_NAME.app..."
+    iconutil -c icns "$ICONSET_DIR" -o "$CACHED_ICNS" || true
+fi
+
+echo "==> [3/6] Đang đóng gói & tối ưu dung lượng nhị phân $APP_NAME.app..."
 STAGE_ROOT="$(mktemp -d /tmp/BarFlowBuildStage.XXXXXX)"
 trap 'rm -rf "$STAGE_ROOT"' EXIT
 STAGE_APP="$STAGE_ROOT/$APP_NAME.app"
@@ -106,8 +119,11 @@ mkdir -p "$STAGE_MACOS" "$STAGE_RESOURCES"
 
 cp -X "$BIN_PATH" "$STAGE_MACOS/$APP_NAME"
 chmod +x "$STAGE_MACOS/$APP_NAME"
+strip -rSTx "$STAGE_MACOS/$APP_NAME"
 
-iconutil -c icns "$ICONSET_DIR" -o "$STAGE_RESOURCES/AppIcon.icns" || true
+if [ -s "$CACHED_ICNS" ]; then
+    cp -X "$CACHED_ICNS" "$STAGE_RESOURCES/AppIcon.icns"
+fi
 
 cat > "$STAGE_CONTENTS/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -133,7 +149,7 @@ cat > "$STAGE_CONTENTS/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key>
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>12</string>
+    <string>${BUILD_NUMBER}</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
@@ -144,8 +160,8 @@ EOF
 
 echo "==> [4/6] Đang ký số (Ad-hoc Codesign)..."
 xattr -cr "$STAGE_APP" 2>/dev/null || true
-codesign --force --deep --sign - "$STAGE_APP"
-codesign --verify --deep --strict "$STAGE_APP"
+codesign --force --sign - "$STAGE_APP"
+codesign --verify --strict "$STAGE_APP"
 
 rm -rf "$APP_BUNDLE"
 ditto --noextattr "$STAGE_APP" "$APP_BUNDLE"
@@ -171,7 +187,7 @@ echo "===================================================="
 echo "  Đang cài đặt BarFlow vào /Applications..."
 echo "===================================================="
 
-pkill -f BarFlow 2>/dev/null || true
+pkill -x BarFlow 2>/dev/null || true
 rm -rf "$APP_DST"
 ditto --noextattr "$APP_SRC" "$APP_DST"
 
@@ -194,7 +210,7 @@ xattr -cr "$DMG_STAGING" 2>/dev/null || true
 DMG_PATH="$DIST_DIR/${APP_NAME}-Installer-v${VERSION}.dmg"
 hdiutil create -volname "${APP_NAME} Installer" \
     -srcfolder "$DMG_STAGING" \
-    -ov -format UDZO \
+    -ov -format ULFO \
     "$DMG_PATH" >/dev/null
 
 ZIP_PATH="$DIST_DIR/${APP_NAME}-v${VERSION}-macOS.zip"
