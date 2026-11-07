@@ -572,6 +572,9 @@ final class SecondaryBarStripNSView: NSView {
         let screen = window?.screen ?? MenuBarScanner.screenContainingMouse()
         let barThickness = MenuBarScanner.effectiveMenuBarThickness(for: screen)
         let overMainBar = screenPt.y >= (screen.frame.maxY - barThickness - 4.0)
+            && screenPt.y <= (screen.frame.maxY + 4.0)
+            && screenPt.x >= screen.frame.minX
+            && screenPt.x <= screen.frame.maxX
         isHoveringMainMenuBar = overMainBar
 
         FloatingIconDragGhost.shared.showOrUpdate(

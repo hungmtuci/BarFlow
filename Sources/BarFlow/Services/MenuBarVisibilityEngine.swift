@@ -686,6 +686,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             var matchedHiddenBundles = Set<String>()
             var matchedHiddenExecs = Set<String>()
 
+            if arr.count % 2 != 0 {
+                arr.removeLast()
+                trackedModified = true
+            }
+
             for idx in stride(from: 0, to: arr.count - 1, by: 2) {
                 guard let keyDict = arr[idx] as? [String: Any],
                       var valDict = arr[idx + 1] as? [String: Any] else {
@@ -850,6 +855,10 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                format: nil
            )) as? [Any] {
             var trackedModified = false
+            if arr.count % 2 != 0 {
+                arr.removeLast()
+                trackedModified = true
+            }
             for idx in stride(from: 0, to: arr.count - 1, by: 2) {
                 guard let keyDict = arr[idx] as? [String: Any],
                       var valDict = arr[idx + 1] as? [String: Any] else { continue }

@@ -37,7 +37,7 @@ final class UpdateCheckerService: ObservableObject {
     private let releasesPageFallback = URL(string: "https://github.com/hungmtuci/BarFlow/releases/latest")!
 
     private init() {
-        self.currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.2"
+        self.currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.3"
     }
 
     /// Performs a quiet background check at most once every 6 hours without disturbing the user on network errors.
@@ -211,7 +211,9 @@ final class UpdateCheckerService: ObservableObject {
                 }
                 let candidateApp = URL(fileURLWithPath: extractDirPath).appendingPathComponent("BarFlow.app")
                 let binaryPath = candidateApp.appendingPathComponent("Contents/MacOS/BarFlow").path
-                guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
+                let candidateBundleID = Bundle(url: candidateApp)?.bundleIdentifier
+                guard FileManager.default.isExecutableFile(atPath: binaryPath),
+                      candidateBundleID == "com.hunglx.BarFlow" else {
                     continuation.resume(throwing: NSError(
                         domain: "BarFlowUpdate",
                         code: -2,
@@ -245,10 +247,22 @@ final class UpdateCheckerService: ObservableObject {
             kill -0 "$OLD_PID" 2>/dev/null || break
             sleep 0.2
         done
-        rm -rf "$DST_APP"
-        /usr/bin/ditto --noextattr "$SRC_APP" "$DST_APP"
-        /usr/bin/xattr -cr "$DST_APP" 2>/dev/null || true
-        /usr/bin/open "$DST_APP"
+        DST_PARENT="$(dirname "$DST_APP")"
+        SWAP_OK=0
+        if [ -w "$DST_PARENT" ] && { [ ! -e "$DST_APP" ] || [ -w "$DST_APP" ]; } && rm -rf "$DST_APP" 2>/dev/null && /usr/bin/ditto --noextattr "$SRC_APP" "$DST_APP" 2>/dev/null; then
+            /usr/bin/xattr -cr "$DST_APP" 2>/dev/null || true
+            SWAP_OK=1
+        else
+            if SRC_APP="$SRC_APP" DST_APP="$DST_APP" /usr/bin/osascript \
+                -e 'set srcPath to system attribute "SRC_APP"' \
+                -e 'set dstPath to system attribute "DST_APP"' \
+                -e 'do shell script "/bin/rm -rf " & quoted form of dstPath & " && /usr/bin/ditto --noextattr " & quoted form of srcPath & " " & quoted form of dstPath & " && /usr/bin/xattr -cr " & quoted form of dstPath with administrator privileges' >/dev/null 2>&1; then
+                SWAP_OK=1
+            fi
+        fi
+        if [ "$SWAP_OK" -eq 1 ] && [ -d "$DST_APP" ]; then
+            /usr/bin/open "$DST_APP"
+        fi
         rm -rf "$STAGE_DIR"
         """
 
@@ -278,8 +292,10 @@ final class UpdateCheckerService: ObservableObject {
     }
 
     nonisolated static func isVersion(_ candidate: String, newerThan current: String) -> Bool {
-        let lhs = cleanVersionString(candidate).split(separator: ".").map { Int($0) ?? 0 }
-        let rhs = cleanVersionString(current).split(separator: ".").map { Int($0) ?? 0 }
+        let lhsBase = cleanVersionString(candidate).split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+        let rhsBase = cleanVersionString(current).split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+        let lhs = lhsBase.split(separator: ".").map { Int($0.prefix(while: \.isNumber)) ?? 0 }
+        let rhs = rhsBase.split(separator: ".").map { Int($0.prefix(while: \.isNumber)) ?? 0 }
         let count = max(lhs.count, rhs.count)
         for i in 0..<count {
             let a = i < lhs.count ? lhs[i] : 0

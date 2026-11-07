@@ -96,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let bundleID = Bundle.main.bundleIdentifier {
             let ownPID = ProcessInfo.processInfo.processIdentifier
             let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-                .filter { $0.processIdentifier != ownPID }
+                .filter { $0.processIdentifier != ownPID && !$0.isTerminated }
             if let existing = others.first {
                 existing.activate()
                 NSApp.terminate(nil)

@@ -7,8 +7,8 @@ cd "$PROJECT_DIR"
 
 APP_NAME="BarFlow"
 BUNDLE_ID="com.hunglx.BarFlow"
-VERSION="1.9.2"
-BUILD_NUMBER="13"
+VERSION="1.9.3"
+BUILD_NUMBER="14"
 UNIVERSAL="${UNIVERSAL:-1}"
 APP_BUNDLE="$PROJECT_DIR/$APP_NAME.app"
 ROOT_APP_BUNDLE="$ROOT_WORKSPACE_DIR/$APP_NAME.app"
@@ -29,13 +29,15 @@ else
     BIN_PATH="$(swift build -c release --product "$APP_NAME" --show-bin-path)/$APP_NAME"
 fi
 
+STAGE_ROOT="$(mktemp -d /tmp/BarFlowBuildStage.XXXXXX)"
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+
 CACHED_ICNS="$PROJECT_DIR/.build/AppIcon.icns"
 if [ -s "$CACHED_ICNS" ]; then
     echo "==> [2/6] Sử dụng biểu tượng ứng dụng đã lưu cache ($CACHED_ICNS)..."
 else
     echo "==> [2/6] Đang tạo biểu tượng ứng dụng (AppIcon.icns)..."
-    ICONSET_DIR="$PROJECT_DIR/.build/AppIcon.iconset"
-    rm -rf "$ICONSET_DIR"
+    ICONSET_DIR="$STAGE_ROOT/AppIcon.iconset"
     mkdir -p "$ICONSET_DIR"
 
     swift - "$ICONSET_DIR" << 'SWIFT_ICON'
@@ -105,12 +107,10 @@ for (px, name) in sizes {
 }
 SWIFT_ICON
 
-    iconutil -c icns "$ICONSET_DIR" -o "$CACHED_ICNS" || true
+    iconutil -c icns "$ICONSET_DIR" -o "$CACHED_ICNS"
 fi
 
 echo "==> [3/6] Đang đóng gói & tối ưu dung lượng nhị phân $APP_NAME.app..."
-STAGE_ROOT="$(mktemp -d /tmp/BarFlowBuildStage.XXXXXX)"
-trap 'rm -rf "$STAGE_ROOT"' EXIT
 STAGE_APP="$STAGE_ROOT/$APP_NAME.app"
 STAGE_CONTENTS="$STAGE_APP/Contents"
 STAGE_MACOS="$STAGE_CONTENTS/MacOS"
@@ -160,11 +160,13 @@ EOF
 
 echo "==> [4/6] Đang ký số (Ad-hoc Codesign)..."
 xattr -cr "$STAGE_APP" 2>/dev/null || true
-codesign --force --sign - "$STAGE_APP"
-codesign --verify --strict "$STAGE_APP"
+codesign --force --deep --sign - "$STAGE_APP"
+codesign --verify --deep --strict "$STAGE_APP"
 
 rm -rf "$APP_BUNDLE"
-ditto --noextattr "$STAGE_APP" "$APP_BUNDLE"
+ditto --norsrc --noextattr "$STAGE_APP" "$APP_BUNDLE"
+xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
+xattr -d com.apple.ResourceFork "$APP_BUNDLE" 2>/dev/null || true
 
 echo "==> [5/6] Đang tạo bộ cài đặt .DMG và .ZIP tại thư mục dist/..."
 rm -rf "$DIST_DIR"
@@ -173,7 +175,7 @@ mkdir -p "$DIST_DIR"
 DMG_STAGING="$STAGE_ROOT/dmg_staging"
 mkdir -p "$DMG_STAGING"
 
-ditto --noextattr "$STAGE_APP" "$DMG_STAGING/$APP_NAME.app"
+ditto --norsrc --noextattr "$STAGE_APP" "$DMG_STAGING/$APP_NAME.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 cat > "$DMG_STAGING/Cai_Dat_BarFlow.command" << 'INSTALLER_EOF'
@@ -189,7 +191,7 @@ echo "===================================================="
 
 pkill -x BarFlow 2>/dev/null || true
 rm -rf "$APP_DST"
-ditto --noextattr "$APP_SRC" "$APP_DST"
+ditto --norsrc --noextattr "$APP_SRC" "$APP_DST"
 
 # Gỡ cờ cách ly Gatekeeper (Quarantine) và làm mới quyền Accessibility khi nâng cấp phiên bản
 xattr -cr "$APP_DST" 2>/dev/null || true
@@ -219,7 +221,9 @@ ditto -c -k --norsrc --noextattr --keepParent "$STAGE_APP" "$ZIP_PATH"
 echo "==> [6/6] Đồng bộ $ROOT_APP_BUNDLE..."
 if [ "$ROOT_WORKSPACE_DIR" != "$PROJECT_DIR" ] && [ -d "$ROOT_WORKSPACE_DIR/BarFlow.app" -o -d "$ROOT_WORKSPACE_DIR/Sources" ]; then
     rm -rf "$ROOT_APP_BUNDLE"
-    ditto --noextattr "$STAGE_APP" "$ROOT_APP_BUNDLE"
+    ditto --norsrc --noextattr "$STAGE_APP" "$ROOT_APP_BUNDLE"
+    xattr -d com.apple.FinderInfo "$ROOT_APP_BUNDLE" 2>/dev/null || true
+    xattr -d com.apple.ResourceFork "$ROOT_APP_BUNDLE" 2>/dev/null || true
 fi
 
 echo "==> Hoàn tất!"

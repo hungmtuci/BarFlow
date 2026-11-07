@@ -615,6 +615,11 @@ final class AXStatusMenuBridge: @unchecked Sendable {
         return unsafeBitCast(ref, to: AXUIElement.self)
     }
 
+    private func asAXValue(_ ref: CFTypeRef?) -> AXValue? {
+        guard let ref, CFGetTypeID(ref) == AXValueGetTypeID() else { return nil }
+        return unsafeBitCast(ref, to: AXValue.self)
+    }
+
     private func decodeAXBool(_ val: CFTypeRef, defaultValue: Bool) -> Bool {
         if CFGetTypeID(val) == CFBooleanGetTypeID() {
             return CFBooleanGetValue(unsafeBitCast(val, to: CFBoolean.self))

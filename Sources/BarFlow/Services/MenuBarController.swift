@@ -1738,13 +1738,27 @@ final class MenuBarController: ObservableObject {
                 try? xattrProc.run()
                 xattrProc.waitUntilExit()
 
+                let ownPID = ProcessInfo.processInfo.processIdentifier
+                let relaunchScript = """
+                OLD_PID="$1"
+                DST_APP="$2"
+                i=0
+                while kill -0 "$OLD_PID" 2>/dev/null && [ "$i" -lt 50 ]; do
+                    sleep 0.1
+                    i=$((i + 1))
+                done
+                /usr/bin/open "$DST_APP"
+                """
+                let relaunchProc = Process()
+                relaunchProc.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+                relaunchProc.arguments = ["/bin/sh", "-c", relaunchScript, "barflow-relaunch", "\(ownPID)", dstPath]
+                relaunchProc.standardOutput = FileHandle.nullDevice
+                relaunchProc.standardError = FileHandle.nullDevice
+                try relaunchProc.run()
+
                 await MainActor.run {
-                    NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: dstPath), configuration: NSWorkspace.OpenConfiguration()) { _, _ in
-                        Task { @MainActor in
-                            MenuBarController.shared.prepareForTermination()
-                            NSApp.terminate(nil)
-                        }
-                    }
+                    MenuBarController.shared.prepareForTermination()
+                    NSApp.terminate(nil)
                 }
             } catch {
                 let errDesc = error.localizedDescription
