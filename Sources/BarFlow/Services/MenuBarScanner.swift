@@ -44,6 +44,14 @@ private enum ExtrasProbeResult {
     case timedOutOrBusy
 }
 
+/// Outcome of probing a single newly launched process on demand.
+enum SingleProcessProbeOutcome: Sendable {
+    case found([MenuBarAppItem])
+    case empty
+    case timedOutOrBusy
+    case processGone
+}
+
 /// Diagnostic metrics captured during a single background scan pass.
 struct ScanDiagnostics: Sendable {
     let durationMs: Double
@@ -66,8 +74,10 @@ final class MenuBarScanner: @unchecked Sendable {
 
     /// Known PIDs that exposed at least one Menu Bar item.
     private var knownMenuBarPIDs = Set<pid_t>()
-    /// PIDs that definitively returned no `AXExtrasMenuBar` (never populated on IPC timeout!).
+    /// PIDs that definitively returned no `AXExtrasMenuBar` (never populated on IPC timeout or during staged launch probes!).
     private var negativePIDCache: [pid_t: CFAbsoluteTime] = [:]
+    /// Newly launched PIDs currently in their +1s/+3s/+6s/+10s staged probe window (never negative-cached).
+    private var stagedProbePIDs = Set<pid_t>()
     private let negativeCacheTTL: CFAbsoluteTime = 15.0
 
     /// MainActor-owned pre-rendered `32x32` (@2x) icon cache keyed by stable bundleID/execPath or symbol key.
@@ -112,7 +122,22 @@ final class MenuBarScanner: @unchecked Sendable {
         }
     }
 
-    // MARK: - Cache Invalidation
+    // MARK: - Cache Invalidation & Staged Launch Probe Window
+
+    func beginStagedProbeWindow(for pid: pid_t) {
+        guard pid > 0 else { return }
+        cacheLock.lock()
+        stagedProbePIDs.insert(pid)
+        negativePIDCache.removeValue(forKey: pid)
+        cacheLock.unlock()
+    }
+
+    func endStagedProbeWindow(for pid: pid_t) {
+        guard pid > 0 else { return }
+        cacheLock.lock()
+        stagedProbePIDs.remove(pid)
+        cacheLock.unlock()
+    }
 
     @MainActor
     func handleAppLaunched() {
@@ -135,10 +160,190 @@ final class MenuBarScanner: @unchecked Sendable {
         if pid > 0 {
             knownMenuBarPIDs.remove(pid)
             negativePIDCache.removeValue(forKey: pid)
+            stagedProbePIDs.remove(pid)
         } else {
             negativePIDCache.removeAll()
+            stagedProbePIDs.removeAll()
         }
         cacheLock.unlock()
+    }
+
+    @MainActor
+    private func makeOrCachedCandidate(for app: NSRunningApplication) -> CandidateProcess? {
+        let pid = app.processIdentifier
+        guard pid > 0 else { return nil }
+        if skippedDaemonPIDs.contains(pid) {
+            return nil
+        }
+        if let cachedCandidate = candidateProcessCache[pid],
+           cachedCandidate.bundleID == app.bundleIdentifier {
+            return cachedCandidate
+        }
+
+        let bundleID = app.bundleIdentifier
+        let name = app.localizedName
+        if Self.isKnownNonMenuBarAppleDaemon(bundleID: bundleID, name: name) {
+            skippedDaemonPIDs.insert(pid)
+            return nil
+        }
+
+        let isContainer = bundleID.map { systemExtrasContainerBundleIDs.contains($0) } ?? false
+        let cacheKey = bundleID ?? app.executableURL?.path ?? "pid:\(pid)"
+        let icon: NSImage
+        if let cached = scaledIconCache[cacheKey] {
+            icon = cached
+        } else {
+            let rendered = preScaleIcon(bestRawIcon(for: app), pointSize: 32)
+            if scaledIconCache.count > 320 {
+                scaledIconCache = scaledIconCache.filter { $0.key.hasPrefix("sym:") }
+            }
+            scaledIconCache[cacheKey] = rendered
+            icon = rendered
+        }
+
+        let isSystem = isContainer || (bundleID.map { systemAppBundleIDs.contains($0) || $0.hasPrefix("com.apple.") } ?? false)
+        let candidate = CandidateProcess(
+            pid: pid,
+            bundleID: bundleID,
+            localizedName: name,
+            icon: icon,
+            isSystem: isSystem,
+            isMovable: true,
+            isSystemExtrasContainer: isContainer
+        )
+        candidateProcessCache[pid] = candidate
+        return candidate
+    }
+
+    // MARK: - Targeted Single-Process Probe (Staged Newly-Launched App Detection)
+
+    /// Probes a single newly launched PID off the main thread reusing `probeExtrasMenuBar` + `buildItems`.
+    @MainActor
+    func probeSingleProcessAsync(pid: pid_t) async -> SingleProcessProbeOutcome {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard pid > 0, pid != ownPID else { return .processGone }
+        guard AXIsProcessTrusted() else { return .empty }
+
+        let displays = Self.captureDisplayGeometries()
+        let symbolIcons = prepareSystemSymbolIconMap()
+        let fallbackDefaultIcon = symbolIcons["default"] ?? NSImage()
+
+        let candidate: CandidateProcess
+        if let wsApp = NSRunningApplication(processIdentifier: pid) {
+            if wsApp.isTerminated {
+                return .processGone
+            }
+            guard let builtCandidate = makeOrCachedCandidate(for: wsApp) else {
+                return .empty
+            }
+            candidate = builtCandidate
+        } else {
+            guard kill(pid, 0) == 0 || errno == EPERM else {
+                return .processGone
+            }
+            candidate = CandidateProcess(
+                pid: pid,
+                bundleID: nil,
+                localizedName: Self.bsdProcessName(for: pid),
+                icon: fallbackDefaultIcon,
+                isSystem: false,
+                isMovable: true,
+                isSystemExtrasContainer: false
+            )
+        }
+
+        return await withCheckedContinuation { continuation in
+            workerQueue.async { [weak self] in
+                guard let self = self else {
+                    continuation.resume(returning: .empty)
+                    return
+                }
+                let result = self.performSingleProcessProbe(
+                    candidate: candidate,
+                    ownPID: ownPID,
+                    displays: displays,
+                    symbolIcons: symbolIcons
+                )
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func performSingleProcessProbe(
+        candidate: CandidateProcess,
+        ownPID: pid_t,
+        displays: [DisplayGeometry],
+        symbolIcons: [String: NSImage]
+    ) -> SingleProcessProbeOutcome {
+        let pid = candidate.pid
+        guard kill(pid, 0) == 0 || errno == EPERM else {
+            return .processGone
+        }
+
+        let agentSlotElementsByPID = readMenuBarAgentSlotElementsByPID(ownPID: ownPID)
+
+        var outcome = probeExtrasMenuBar(for: pid, timeout: 0.55, isFirstAttempt: true)
+        if case .timedOutOrBusy = outcome {
+            outcome = probeExtrasMenuBar(for: pid, timeout: 1.0, isFirstAttempt: false)
+        }
+
+        let builtItems: [MenuBarAppItem]
+        switch outcome {
+        case .found(let rawChildren):
+            builtItems = buildItems(
+                for: candidate,
+                rawChildren: rawChildren,
+                displays: displays,
+                symbolIcons: symbolIcons,
+                agentSlotElementsByPID: agentSlotElementsByPID
+            )
+        case .definitelyEmpty:
+            if let fallbackElements = agentSlotElementsByPID[pid], !fallbackElements.isEmpty {
+                builtItems = buildItems(
+                    for: candidate,
+                    rawChildren: fallbackElements,
+                    displays: displays,
+                    symbolIcons: symbolIcons,
+                    agentSlotElementsByPID: agentSlotElementsByPID
+                )
+            } else {
+                return (kill(pid, 0) == 0 || errno == EPERM) ? .empty : .processGone
+            }
+        case .timedOutOrBusy:
+            if let fallbackElements = agentSlotElementsByPID[pid], !fallbackElements.isEmpty {
+                let fallbackBuilt = buildItems(
+                    for: candidate,
+                    rawChildren: fallbackElements,
+                    displays: displays,
+                    symbolIcons: symbolIcons,
+                    agentSlotElementsByPID: agentSlotElementsByPID
+                )
+                if !fallbackBuilt.isEmpty {
+                    builtItems = fallbackBuilt
+                } else {
+                    return .timedOutOrBusy
+                }
+            } else {
+                return (kill(pid, 0) == 0 || errno == EPERM) ? .timedOutOrBusy : .processGone
+            }
+        }
+
+        guard !builtItems.isEmpty else {
+            return .empty
+        }
+
+        cacheLock.lock()
+        knownMenuBarPIDs.insert(pid)
+        negativePIDCache.removeValue(forKey: pid)
+        cacheLock.unlock()
+
+        var uniqueByID = Set<String>()
+        var deduplicated: [MenuBarAppItem] = []
+        deduplicated.reserveCapacity(builtItems.count)
+        for item in builtItems where uniqueByID.insert(item.id).inserted {
+            deduplicated.append(item)
+        }
+        return .found(deduplicated)
     }
 
     // MARK: - Non-Blocking Comprehensive Menu Bar Scan
@@ -180,50 +385,9 @@ final class MenuBarScanner: @unchecked Sendable {
             let pid = app.processIdentifier
             guard pid > 0, pid != ownPID else { continue }
             livePIDs.insert(pid)
-
-            if skippedDaemonPIDs.contains(pid) {
-                continue
+            if let candidate = makeOrCachedCandidate(for: app) {
+                candidatesByPID[pid] = candidate
             }
-            if let cachedCandidate = candidateProcessCache[pid],
-               cachedCandidate.bundleID == app.bundleIdentifier {
-                candidatesByPID[pid] = cachedCandidate
-                continue
-            }
-
-            let bundleID = app.bundleIdentifier
-            let name = app.localizedName
-            if Self.isKnownNonMenuBarAppleDaemon(bundleID: bundleID, name: name) {
-                skippedDaemonPIDs.insert(pid)
-                continue
-            }
-
-            let isContainer = bundleID.map { systemExtrasContainerBundleIDs.contains($0) } ?? false
-            let cacheKey = bundleID ?? app.executableURL?.path ?? "pid:\(pid)"
-            let icon: NSImage
-            if let cached = scaledIconCache[cacheKey] {
-                icon = cached
-            } else {
-                let rendered = preScaleIcon(bestRawIcon(for: app), pointSize: 32)
-                if scaledIconCache.count > 320 {
-                    scaledIconCache = scaledIconCache.filter { $0.key.hasPrefix("sym:") }
-                }
-                scaledIconCache[cacheKey] = rendered
-                icon = rendered
-            }
-
-            let isSystem = isContainer || (bundleID.map { systemAppBundleIDs.contains($0) || $0.hasPrefix("com.apple.") } ?? false)
-
-            let candidate = CandidateProcess(
-                pid: pid,
-                bundleID: bundleID,
-                localizedName: name,
-                icon: icon,
-                isSystem: isSystem,
-                isMovable: true,
-                isSystemExtrasContainer: isContainer
-            )
-            candidateProcessCache[pid] = candidate
-            candidatesByPID[pid] = candidate
         }
 
         // Prune dead transient XPC / helper PIDs so caches stay bounded and immune to PID wrap-around reuse!
@@ -306,15 +470,19 @@ final class MenuBarScanner: @unchecked Sendable {
         cacheLock.lock()
         let knownSnapshot = knownMenuBarPIDs
         let negativeSnapshot = negativePIDCache
+        let stagedSnapshot = stagedProbePIDs
         cacheLock.unlock()
 
-        // Always include PIDs currently seen in MenuBarAgent slots, known PIDs, system containers, and non-negatively-cached PIDs
+        // Always include PIDs currently seen in MenuBarAgent slots, known PIDs, staged launch PIDs, system containers, and non-negatively-cached PIDs
         let toProbe: [CandidateProcess]
         if forceFullScan {
             toProbe = allCandidates
         } else {
             toProbe = allCandidates.filter { proc in
-                if proc.isSystemExtrasContainer || knownSnapshot.contains(proc.pid) || agentSlotElementsByPID[proc.pid] != nil {
+                if proc.isSystemExtrasContainer ||
+                    knownSnapshot.contains(proc.pid) ||
+                    stagedSnapshot.contains(proc.pid) ||
+                    agentSlotElementsByPID[proc.pid] != nil {
                     return true
                 }
                 if let checkedAt = negativeSnapshot[proc.pid], (now - checkedAt) < negativeCacheTTL {
@@ -343,7 +511,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 }
                 semaphore.wait()
 
-                let outcome = self.probeExtrasMenuBar(for: proc.pid, timeout: 0.55)
+                let outcome = self.probeExtrasMenuBar(for: proc.pid, timeout: 0.55, isFirstAttempt: true)
                 switch outcome {
                 case .found(let rawChildren):
                     let built = self.buildItems(
@@ -393,7 +561,7 @@ final class MenuBarScanner: @unchecked Sendable {
         // Calm retry pass (1.0s timeout) for any app whose runloop was momentarily busy
         var finalTimedOutPIDs: [pid_t] = []
         for proc in retryCandidates {
-            switch probeExtrasMenuBar(for: proc.pid, timeout: 1.0) {
+            switch probeExtrasMenuBar(for: proc.pid, timeout: 1.0, isFirstAttempt: false) {
             case .found(let rawChildren):
                 let built = buildItems(
                     for: proc,
@@ -481,7 +649,7 @@ final class MenuBarScanner: @unchecked Sendable {
             negativePIDCache.removeValue(forKey: pid)
         }
         var recordedNegativePIDs: [pid_t] = []
-        for pid in newlyDefiniteNegativePIDs where !newlyPositivePIDs.contains(pid) {
+        for pid in newlyDefiniteNegativePIDs where !newlyPositivePIDs.contains(pid) && !stagedProbePIDs.contains(pid) {
             knownMenuBarPIDs.remove(pid)
             negativePIDCache[pid] = now
             recordedNegativePIDs.append(pid)
@@ -650,7 +818,7 @@ final class MenuBarScanner: @unchecked Sendable {
 
     // MARK: - AXExtrasMenuBar & MenuBarAgent Readers
 
-    private func probeExtrasMenuBar(for pid: pid_t, timeout: Float) -> ExtrasProbeResult {
+    private func probeExtrasMenuBar(for pid: pid_t, timeout: Float, isFirstAttempt: Bool = true) -> ExtrasProbeResult {
         guard AXIsProcessTrusted() else { return .definitelyEmpty }
         let axApp = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(axApp, timeout)
@@ -663,15 +831,27 @@ final class MenuBarScanner: @unchecked Sendable {
             AXUIElementSetMessagingTimeout(barEl, timeout)
             var childrenRef: CFTypeRef?
             let chErr = AXUIElementCopyAttributeValue(barEl, kAXChildrenAttribute as CFString, &childrenRef)
-            if chErr == .cannotComplete {
+            switch chErr {
+            case .success:
+                guard let children = childrenRef as? [AXUIElement], !children.isEmpty else {
+                    return .definitelyEmpty
+                }
+                return .found(children)
+            case .cannotComplete:
                 return .timedOutOrBusy
-            }
-            guard chErr == .success, let children = childrenRef as? [AXUIElement], !children.isEmpty else {
+            case .failure, .notImplemented:
+                return isFirstAttempt ? .timedOutOrBusy : .definitelyEmpty
+            case .attributeUnsupported, .noValue:
+                return .definitelyEmpty
+            default:
                 return .definitelyEmpty
             }
-            return .found(children)
         case .cannotComplete:
             return .timedOutOrBusy
+        case .failure, .notImplemented:
+            return isFirstAttempt ? .timedOutOrBusy : .definitelyEmpty
+        case .attributeUnsupported, .noValue:
+            return .definitelyEmpty
         default:
             return .definitelyEmpty
         }
@@ -845,7 +1025,7 @@ final class MenuBarScanner: @unchecked Sendable {
     }
 
     func readExtrasMenuBarChildren(for pid: pid_t, timeout: Float = 0.20) -> [AXUIElement] {
-        guard case .found(let children) = probeExtrasMenuBar(for: pid, timeout: timeout) else {
+        guard case .found(let children) = probeExtrasMenuBar(for: pid, timeout: timeout, isFirstAttempt: false) else {
             return []
         }
         return children

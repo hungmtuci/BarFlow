@@ -230,6 +230,7 @@ final class MenuBarController: ObservableObject {
     private(set) var agentReloadQuietUntil: CFAbsoluteTime = 0
     private var agentQuietWindowEndTimer: Timer?
     private var pendingScan: PendingScanState?
+    private var stagedLaunchProbeTasks: [pid_t: (id: UUID, task: Task<Void, Never>)] = [:]
     private var lastObservedMenuBarAgentPID: pid_t = 0
     private var lastAutoAgentReloadTime: CFAbsoluteTime = 0
     private let autoAgentReloadMinInterval: TimeInterval = 15.0
@@ -460,6 +461,11 @@ final class MenuBarController: ObservableObject {
         agentQuietWindowEndTimer?.invalidate()
         agentQuietWindowEndTimer = nil
         resumeAndClearPendingScan()
+        for (pid, entry) in stagedLaunchProbeTasks {
+            entry.task.cancel()
+            MenuBarScanner.shared.endStagedProbeWindow(for: pid)
+        }
+        stagedLaunchProbeTasks.removeAll()
         trailingAutoSyncTimer?.invalidate()
         trailingAutoSyncTimer = nil
         pendingSaveWorkItem?.cancel()
@@ -1571,6 +1577,149 @@ final class MenuBarController: ObservableObject {
         }
 
         return merged
+    }
+
+    private func scheduleStagedLaunchProbes(for launchedPID: pid_t) {
+        guard !hasPreparedForTermination else { return }
+        guard launchedPID > 0 else {
+            refreshRunningAppsAsync(forceFullScan: true, reason: .appLaunched(launchedPID))
+            return
+        }
+
+        if let existing = stagedLaunchProbeTasks.removeValue(forKey: launchedPID) {
+            existing.task.cancel()
+        }
+        recentlyTerminatedPIDs.removeValue(forKey: launchedPID)
+        MenuBarScanner.shared.handleAppLaunched()
+        MenuBarScanner.shared.beginStagedProbeWindow(for: launchedPID)
+
+        let token = UUID()
+        let stageSchedule: [(deltaSec: TimeInterval, cumulativeSec: Int)] = [
+            (1.0, 1),
+            (2.0, 3),
+            (3.0, 6),
+            (4.0, 10)
+        ]
+
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if let self = self, self.stagedLaunchProbeTasks[launchedPID]?.id == token {
+                    self.stagedLaunchProbeTasks.removeValue(forKey: launchedPID)
+                    MenuBarScanner.shared.endStagedProbeWindow(for: launchedPID)
+                } else if self == nil {
+                    MenuBarScanner.shared.endStagedProbeWindow(for: launchedPID)
+                }
+            }
+
+            for stage in stageSchedule {
+                try? await Task.sleep(nanoseconds: UInt64(stage.deltaSec * 1_000_000_000))
+                guard !Task.isCancelled, let self = self, !self.hasPreparedForTermination else { return }
+                guard self.recentlyTerminatedPIDs[launchedPID] == nil else { return }
+
+                while self.isInAgentReloadQuietWindow {
+                    let waitSec = max(0.05, self.agentReloadQuietUntil - CFAbsoluteTimeGetCurrent() + 0.05)
+                    try? await Task.sleep(nanoseconds: UInt64(waitSec * 1_000_000_000))
+                    guard !Task.isCancelled, !self.hasPreparedForTermination, self.recentlyTerminatedPIDs[launchedPID] == nil else {
+                        return
+                    }
+                }
+
+                let trusted = AXIsProcessTrusted()
+                if self.isAccessibilityGranted != trusted {
+                    self.isAccessibilityGranted = trusted
+                }
+                guard trusted else { continue }
+
+                let probeStart = CFAbsoluteTimeGetCurrent()
+                let outcome = await MenuBarScanner.shared.probeSingleProcessAsync(pid: launchedPID)
+                let durStr = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - probeStart) * 1000.0)
+                guard !Task.isCancelled, !self.hasPreparedForTermination, self.recentlyTerminatedPIDs[launchedPID] == nil else {
+                    return
+                }
+
+                switch outcome {
+                case .found(let items) where !items.isEmpty:
+                    self.mergeSingleProcessItems(items, forPID: launchedPID, stageSeconds: stage.cumulativeSec, durationMs: durStr)
+                    return
+                case .processGone:
+                    BarFlowLog.scan.debug("staged probe pid=\(launchedPID, privacy: .public) at +\(stage.cumulativeSec, privacy: .public)s -> processGone")
+                    return
+                case .timedOutOrBusy:
+                    BarFlowLog.scan.debug("staged probe pid=\(launchedPID, privacy: .public) at +\(stage.cumulativeSec, privacy: .public)s (\(durStr, privacy: .public)ms) -> timedOutOrBusy")
+                case .empty, .found:
+                    BarFlowLog.scan.debug("staged probe pid=\(launchedPID, privacy: .public) at +\(stage.cumulativeSec, privacy: .public)s (\(durStr, privacy: .public)ms) -> empty")
+                }
+            }
+        }
+
+        stagedLaunchProbeTasks[launchedPID] = (id: token, task: task)
+    }
+
+    private func mergeSingleProcessItems(
+        _ items: [MenuBarAppItem],
+        forPID pid: pid_t,
+        stageSeconds: Int,
+        durationMs: String
+    ) {
+        guard !items.isEmpty, recentlyTerminatedPIDs[pid] == nil else { return }
+
+        let previousIDs = Set(allRunningApps.map(\.id))
+        let oldSecondaryCount = secondaryBarApps.count
+        let incomingIDs = Set(items.map(\.id))
+
+        var nextApps: [MenuBarAppItem] = []
+        nextApps.reserveCapacity(allRunningApps.count + items.count)
+        var seenIDs = Set<String>()
+
+        for item in items where seenIDs.insert(item.id).inserted {
+            missCountByID[item.id] = 0
+            nextApps.append(item)
+        }
+        for existing in allRunningApps {
+            if existing.pid == pid || incomingIDs.contains(existing.id) {
+                continue
+            }
+            if seenIDs.insert(existing.id).inserted {
+                nextApps.append(existing)
+            }
+        }
+
+        nextApps.sort { a, b in
+            if a.isCurrentlyOnBar != b.isCurrentlyOnBar {
+                return a.isCurrentlyOnBar && !b.isCurrentlyOnBar
+            }
+            if a.slotFrame != nil && b.slotFrame != nil && abs(a.sortX - b.sortX) > 1 {
+                return a.sortX < b.sortX
+            }
+            return a.appName.localizedCaseInsensitiveCompare(b.appName) == .orderedAscending
+        }
+
+        let mergedIDs = Set(nextApps.map(\.id))
+        let added = BarFlowLog.formatIDList(mergedIDs.subtracting(previousIDs))
+        BarFlowLog.scan.log(
+            "stagedProbe reason=appLaunched(\(pid, privacy: .public)) stage=+\(stageSeconds, privacy: .public)s durationMs=\(durationMs, privacy: .public) found=\(items.count, privacy: .public) totalItems=\(nextApps.count, privacy: .public) added=[\(added, privacy: .public)]"
+        )
+
+        let neverSeenBeforeIDs = mergedIDs.subtracting(everSeenIDs)
+        let newUnselectedLaunched = !everSeenIDs.isEmpty &&
+            neverSeenBeforeIDs.contains(where: { !selectedMainBarIDs.contains($0) })
+        everSeenIDs.formUnion(mergedIDs)
+        knownDiscoveredAppIDs = mergedIDs
+        allRunningApps = nextApps
+
+        rebuildDerivedLists()
+        if !hasPerformedStartupVisibilitySync && !nextApps.isEmpty {
+            hasPerformedStartupVisibilitySync = true
+            if isMainBarHidingEnabled {
+                requestAutoNativeMenuBarSync(delay: 0.30)
+            }
+        } else if newUnselectedLaunched && isMainBarHidingEnabled {
+            requestAutoNativeMenuBarSync(delay: 0.45)
+        }
+
+        if secondaryBarApps.count != oldSecondaryCount {
+            onSecondaryAppsChanged?()
+        }
     }
 
     private var isInAgentReloadQuietWindow: Bool {
@@ -3582,10 +3731,8 @@ final class MenuBarController: ObservableObject {
                 return
             }
             guard !ignoreBundles.contains(launchedBundle) else { return }
-            Task { @MainActor in
-                MenuBarScanner.shared.handleAppLaunched()
-                try? await Task.sleep(nanoseconds: 900_000_000)
-                self?.refreshRunningAppsAsync(forceFullScan: true, reason: .appLaunched(launchedPID))
+            MainActor.assumeIsolated {
+                self?.scheduleStagedLaunchProbes(for: launchedPID)
             }
         }
         ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
@@ -3593,6 +3740,9 @@ final class MenuBarController: ObservableObject {
             let bundle = app?.bundleIdentifier ?? ""
             let terminatedPID = app?.processIdentifier ?? 0
             MainActor.assumeIsolated {
+                if terminatedPID > 0, let staged = self?.stagedLaunchProbeTasks.removeValue(forKey: terminatedPID) {
+                    staged.task.cancel()
+                }
                 MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
                 guard bundle != "com.apple.MenuBarAgent", !ignoreBundles.contains(bundle) else { return }
