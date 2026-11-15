@@ -203,11 +203,33 @@ final class MenuBarController: ObservableObject {
     private var everSeenIDs = Set<String>()
     private var missCountByID: [String: Int] = [:]
     private var recentlyTerminatedPIDs: [pid_t: CFAbsoluteTime] = [:]
+    private struct PendingScanState {
+        var forceFullScan: Bool
+        var initializeDefaultsIfNeeded: Bool
+        var reasons: [ScanReason]
+        var continuations: [CheckedContinuation<Void, Never>]
+
+        mutating func merge(
+            forceFullScan: Bool,
+            initializeDefaultsIfNeeded: Bool,
+            reason: ScanReason,
+            continuation: CheckedContinuation<Void, Never>? = nil
+        ) {
+            self.forceFullScan = self.forceFullScan || forceFullScan
+            self.initializeDefaultsIfNeeded = self.initializeDefaultsIfNeeded || initializeDefaultsIfNeeded
+            if !self.reasons.contains(reason) {
+                self.reasons.append(reason)
+            }
+            if let continuation {
+                self.continuations.append(continuation)
+            }
+        }
+    }
+
     private var lastAgentReloadEnteredAt: CFAbsoluteTime = 0
     private(set) var agentReloadQuietUntil: CFAbsoluteTime = 0
     private var agentQuietWindowEndTimer: Timer?
-    private var quietWindowPendingForceFullScan: Bool = false
-    private var quietWindowPendingInitDefaults: Bool = false
+    private var pendingScan: PendingScanState?
     private var lastObservedMenuBarAgentPID: pid_t = 0
     private var lastAutoAgentReloadTime: CFAbsoluteTime = 0
     private let autoAgentReloadMinInterval: TimeInterval = 15.0
@@ -437,6 +459,7 @@ final class MenuBarController: ObservableObject {
         deferredReloadTimer = nil
         agentQuietWindowEndTimer?.invalidate()
         agentQuietWindowEndTimer = nil
+        resumeAndClearPendingScan()
         trailingAutoSyncTimer?.invalidate()
         trailingAutoSyncTimer = nil
         pendingSaveWorkItem?.cancel()
@@ -1348,7 +1371,7 @@ final class MenuBarController: ObservableObject {
     }
 
     private func logScanSummary(
-        reason: ScanReason,
+        reasons: [ScanReason],
         forceFullScan: Bool,
         previousIDs: Set<String>,
         newIDs: Set<String>,
@@ -1360,7 +1383,7 @@ final class MenuBarController: ObservableObject {
         let timedOut = BarFlowLog.formatPIDList(diagnostics.timedOutPIDs)
         let negCached = BarFlowLog.formatPIDList(diagnostics.negativeCachedPIDs)
         let durStr = String(format: "%.1f", diagnostics.durationMs)
-        let reasonStr = reason.description
+        let reasonStr = BarFlowLog.formatReasonList(reasons)
         BarFlowLog.scan.log(
             "scan reason=\(reasonStr, privacy: .public) forceFull=\(forceFullScan, privacy: .public) durationMs=\(durStr, privacy: .public) items=\(itemCount, privacy: .public) added=[\(added, privacy: .public)] removed=[\(removed, privacy: .public)] timedOutPIDs=[\(timedOut, privacy: .public)] negCachedPIDs=[\(negCached, privacy: .public)]"
         )
@@ -1592,14 +1615,11 @@ final class MenuBarController: ObservableObject {
                 if let currentAgentPID = MenuBarVisibilityEngine.shared.currentMenuBarAgentPIDSnapshot(), currentAgentPID > 0 {
                     self.lastObservedMenuBarAgentPID = currentAgentPID
                 }
-                let forceFull = self.quietWindowPendingForceFullScan
-                let initDefaults = self.quietWindowPendingInitDefaults
-                self.quietWindowPendingForceFullScan = false
-                self.quietWindowPendingInitDefaults = false
+                let forceFull = self.pendingScan?.forceFullScan ?? false
                 BarFlowLog.agent.log("Agent quiet window ended -> running postAgentReload scan (forceFull=\(forceFull, privacy: .public))")
                 self.refreshRunningAppsAsync(
-                    forceFullScan: forceFull,
-                    initializeDefaultsIfNeeded: initDefaults,
+                    forceFullScan: false,
+                    initializeDefaultsIfNeeded: false,
                     reason: .postAgentReload
                 )
                 if self.hasCoalescedAutoSyncRequest {
@@ -1609,37 +1629,177 @@ final class MenuBarController: ObservableObject {
         }
     }
 
+    private func recordPendingScan(
+        forceFullScan: Bool,
+        initializeDefaultsIfNeeded: Bool,
+        reason: ScanReason,
+        continuation: CheckedContinuation<Void, Never>? = nil
+    ) {
+        if pendingScan == nil {
+            pendingScan = PendingScanState(
+                forceFullScan: forceFullScan,
+                initializeDefaultsIfNeeded: initializeDefaultsIfNeeded,
+                reasons: [reason],
+                continuations: continuation.map { [$0] } ?? []
+            )
+        } else {
+            pendingScan?.merge(
+                forceFullScan: forceFullScan,
+                initializeDefaultsIfNeeded: initializeDefaultsIfNeeded,
+                reason: reason,
+                continuation: continuation
+            )
+        }
+    }
+
+    private func resumeAndClearPendingScan() {
+        guard let pending = pendingScan else { return }
+        pendingScan = nil
+        for cont in pending.continuations {
+            cont.resume()
+        }
+    }
+
     func refreshRunningAppsAsync(
         forceFullScan: Bool = false,
         initializeDefaultsIfNeeded: Bool = false,
         reason: ScanReason = .manual
     ) {
+        submitScanRequest(
+            forceFullScan: forceFullScan,
+            initializeDefaultsIfNeeded: initializeDefaultsIfNeeded,
+            reason: reason,
+            continuation: nil
+        )
+    }
+
+    private func awaitScan(
+        forceFullScan: Bool,
+        initializeDefaultsIfNeeded: Bool = false,
+        reason: ScanReason
+    ) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.submitScanRequest(
+                forceFullScan: forceFullScan,
+                initializeDefaultsIfNeeded: initializeDefaultsIfNeeded,
+                reason: reason,
+                continuation: continuation
+            )
+        }
+    }
+
+    private func submitScanRequest(
+        forceFullScan: Bool,
+        initializeDefaultsIfNeeded: Bool,
+        reason: ScanReason,
+        continuation: CheckedContinuation<Void, Never>?
+    ) {
+        guard !hasPreparedForTermination else {
+            continuation?.resume()
+            return
+        }
+
         let trusted = AXIsProcessTrusted()
         if isAccessibilityGranted != trusted {
             isAccessibilityGranted = trusted
         }
-        guard trusted else { return }
+        guard trusted else {
+            continuation?.resume()
+            return
+        }
+
+        // Background ticks respect the 4.0s user-interaction quiet guard, sleep, HID sequence, and agent quiet window without queuing stale ticks.
+        if reason.isBackgroundTick {
+            let now = CFAbsoluteTimeGetCurrent()
+            guard !isSystemSleeping,
+                  !isPerformingHIDSequence,
+                  !isInAgentReloadQuietWindow,
+                  (now - lastUserInteractionTime) >= 4.0 else {
+                continuation?.resume()
+                return
+            }
+        }
+
+        recordPendingScan(
+            forceFullScan: forceFullScan,
+            initializeDefaultsIfNeeded: initializeDefaultsIfNeeded,
+            reason: reason,
+            continuation: continuation
+        )
+
+        if isSystemSleeping {
+            let reasonStr = reason.description
+            BarFlowLog.scan.debug("scan queued while system sleeping (reason=\(reasonStr, privacy: .public))")
+            return
+        }
+
+        if isPerformingHIDSequence {
+            let reasonStr = reason.description
+            BarFlowLog.scan.debug("scan queued during HID sequence (reason=\(reasonStr, privacy: .public))")
+            return
+        }
 
         if isInAgentReloadQuietWindow {
-            quietWindowPendingForceFullScan = quietWindowPendingForceFullScan || forceFullScan
-            quietWindowPendingInitDefaults = quietWindowPendingInitDefaults || initializeDefaultsIfNeeded
             if agentQuietWindowEndTimer == nil {
                 scheduleQuietWindowEndTimer(after: max(0.05, agentReloadQuietUntil - CFAbsoluteTimeGetCurrent() + 0.02))
             }
             let reasonStr = reason.description
-            BarFlowLog.scan.debug("scan suppressed during agent quiet window (reason=\(reasonStr, privacy: .public))")
+            BarFlowLog.scan.debug("scan suppressed & queued during agent quiet window (reason=\(reasonStr, privacy: .public))")
             return
         }
 
-        guard !isScanningInBackground else { return }
+        if isScanningInBackground {
+            let reasonStr = reason.description
+            let mergedForce = pendingScan?.forceFullScan ?? forceFullScan
+            BarFlowLog.scan.debug("scan queued while scan in flight (reason=\(reasonStr, privacy: .public) pendingForceFull=\(mergedForce, privacy: .public))")
+            return
+        }
+
+        drainPendingScanIfPossible()
+    }
+
+    private func drainPendingScanIfPossible() {
+        guard !hasPreparedForTermination else {
+            resumeAndClearPendingScan()
+            return
+        }
+
+        let trusted = AXIsProcessTrusted()
+        if isAccessibilityGranted != trusted {
+            isAccessibilityGranted = trusted
+        }
+        guard trusted else {
+            resumeAndClearPendingScan()
+            return
+        }
+
+        guard !isSystemSleeping, !isPerformingHIDSequence else { return }
+
+        if isInAgentReloadQuietWindow {
+            if pendingScan != nil && agentQuietWindowEndTimer == nil {
+                scheduleQuietWindowEndTimer(after: max(0.05, agentReloadQuietUntil - CFAbsoluteTimeGetCurrent() + 0.02))
+            }
+            return
+        }
+
+        guard !isScanningInBackground, let request = pendingScan else { return }
+        pendingScan = nil
 
         let scanStartedAt = CFAbsoluteTimeGetCurrent()
         isScanningInBackground = true
         lastBackgroundScanTime = scanStartedAt
 
         Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            let (scannedApps, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(forceFullScan: forceFullScan)
+            guard let self = self else {
+                for cont in request.continuations {
+                    cont.resume()
+                }
+                return
+            }
+
+            let (scannedApps, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(
+                forceFullScan: request.forceFullScan
+            )
             self.isScanningInBackground = false
 
             let previousIDs = Set(self.allRunningApps.map(\.id))
@@ -1647,8 +1807,8 @@ final class MenuBarController: ObservableObject {
             let mergedApps = self.mergeScannedApps(scannedApps, diagnostics: diagnostics, scanStartedAt: scanStartedAt)
             let mergedIDs = Set(mergedApps.map(\.id))
             self.logScanSummary(
-                reason: reason,
-                forceFullScan: forceFullScan,
+                reasons: request.reasons,
+                forceFullScan: request.forceFullScan,
                 previousIDs: previousIDs,
                 newIDs: mergedIDs,
                 itemCount: mergedApps.count,
@@ -1663,7 +1823,8 @@ final class MenuBarController: ObservableObject {
 
             self.allRunningApps = mergedApps
 
-            if initializeDefaultsIfNeeded && !self.hasInitializedSelectionFlag && !mergedApps.isEmpty {
+            let hasManualCallerAwaiting = !request.continuations.isEmpty
+            if request.initializeDefaultsIfNeeded && !self.hasInitializedSelectionFlag && !mergedApps.isEmpty {
                 var initialIDs = Set<String>()
                 var initialMainOrder: [String] = []
                 var initialSecOrder: [String] = []
@@ -1687,17 +1848,17 @@ final class MenuBarController: ObservableObject {
                 self.selectedMainBarIDs = initialIDs
                 self.rebuildDerivedLists()
                 self.scheduleSaveState()
-                if self.isMainBarHidingEnabled {
+                if self.isMainBarHidingEnabled && !hasManualCallerAwaiting {
                     self.requestAutoNativeMenuBarSync(delay: 0.25)
                 }
             } else {
                 self.rebuildDerivedLists()
                 if !self.hasPerformedStartupVisibilitySync && !mergedApps.isEmpty {
                     self.hasPerformedStartupVisibilitySync = true
-                    if self.isMainBarHidingEnabled {
+                    if self.isMainBarHidingEnabled && !hasManualCallerAwaiting {
                         self.requestAutoNativeMenuBarSync(delay: 0.30)
                     }
-                } else if newUnselectedLaunched && self.isMainBarHidingEnabled {
+                } else if newUnselectedLaunched && self.isMainBarHidingEnabled && !hasManualCallerAwaiting {
                     self.requestAutoNativeMenuBarSync(delay: 0.45)
                 }
             }
@@ -1705,6 +1866,12 @@ final class MenuBarController: ObservableObject {
             if self.secondaryBarApps.count != oldSecondaryCount {
                 self.onSecondaryAppsChanged?()
             }
+
+            for cont in request.continuations {
+                cont.resume()
+            }
+
+            self.drainPendingScanIfPossible()
         }
     }
 
@@ -2107,28 +2274,15 @@ final class MenuBarController: ObservableObject {
         }
         setStatusMessage("Đang quét lại toàn bộ ứng dụng trên Menu Bar...")
         Task { @MainActor in
-            let scanStartedAt = CFAbsoluteTimeGetCurrent()
-            let (scanned, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(forceFullScan: true)
-            let previousIDs = Set(self.allRunningApps.map(\.id))
-            let mergedApps = self.mergeScannedApps(scanned, diagnostics: diagnostics, scanStartedAt: scanStartedAt)
-            let mergedIDs = Set(mergedApps.map(\.id))
-            self.logScanSummary(
-                reason: .manual,
-                forceFullScan: true,
-                previousIDs: previousIDs,
-                newIDs: mergedIDs,
-                itemCount: mergedApps.count,
-                diagnostics: diagnostics
-            )
-            self.lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
-            self.everSeenIDs.formUnion(mergedIDs)
-            self.knownDiscoveredAppIDs = mergedIDs
-            self.allRunningApps = mergedApps
-            self.rebuildDerivedLists()
-            self.onSecondaryAppsChanged?()
+            let oldSecondaryCount = self.secondaryBarApps.count
+            await self.awaitScan(forceFullScan: true, initializeDefaultsIfNeeded: false, reason: .manual)
+            if self.secondaryBarApps.count == oldSecondaryCount {
+                self.onSecondaryAppsChanged?()
+            }
 
+            let countNow = self.allRunningApps.count
             if self.requiresFullDiskAccess && !self.isFullDiskAccessGranted {
-                self.setStatusMessage("Đã quét \(mergedApps.count) biểu tượng. Hãy cấp thêm quyền Full Disk Access ở khung phía trên để ẩn khỏi Menu Bar chính.")
+                self.setStatusMessage("Đã quét \(countNow) biểu tượng. Hãy cấp thêm quyền Full Disk Access ở khung phía trên để ẩn khỏi Menu Bar chính.")
                 return
             }
 
@@ -2139,7 +2293,7 @@ final class MenuBarController: ObservableObject {
                     return
                 }
             }
-            self.setStatusMessage("Đã làm mới danh sách (\(mergedApps.count) biểu tượng đang chạy).")
+            self.setStatusMessage("Đã làm mới danh sách (\(countNow) biểu tượng đang chạy).")
         }
     }
 
@@ -2827,6 +2981,7 @@ final class MenuBarController: ObservableObject {
 
         // Release probe guard BEFORE modal NSMenu tracking so clicking another icon immediately after menu dismissal works 100%!
         isPerformingHIDSequence = false
+        drainPendingScanIfPossible()
 
         // STEP 5: Finalize presentation on MainActor
         switch interactionResult {

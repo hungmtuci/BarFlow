@@ -34,6 +34,17 @@ enum BarFlowLog {
     static func formatPIDList(_ pids: some Sequence<pid_t>) -> String {
         pids.sorted().map(String.init).joined(separator: ",")
     }
+
+    static func formatReasonList(_ reasons: [ScanReason]) -> String {
+        guard !reasons.isEmpty else { return "manual" }
+        var seen = Set<ScanReason>()
+        var ordered: [String] = []
+        ordered.reserveCapacity(reasons.count)
+        for reason in reasons where seen.insert(reason).inserted {
+            ordered.append(reason.description)
+        }
+        return ordered.joined(separator: "+")
+    }
 }
 
 /// Trigger source for a menu bar scan.
@@ -46,6 +57,11 @@ enum ScanReason: Equatable, Hashable, Sendable, CustomStringConvertible {
     case manual
     case postAgentReload
     case postInteraction
+
+    var isBackgroundTick: Bool {
+        if case .backgroundTick = self { return true }
+        return false
+    }
 
     var description: String {
         switch self {
