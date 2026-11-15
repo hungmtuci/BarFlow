@@ -250,4 +250,13 @@ struct MenuBarItemIdentityTests {
         )
         #expect(selectedMulti == [2, 3, 4])
     }
+
+    @Test("Semantic version comparison compares numeric components correctly")
+    func semanticVersionComparison() {
+        #expect(UpdateCheckerService.isVersion("1.10.0", newerThan: "1.9.3") == true)
+        #expect(UpdateCheckerService.isVersion("1.9.3", newerThan: "1.10.0") == false)
+        #expect(UpdateCheckerService.isVersion("1.9.10", newerThan: "1.9.3") == true)
+        #expect(UpdateCheckerService.isVersion("1.10.0", newerThan: "1.10.0") == false)
+        #expect(UpdateCheckerService.isVersion("v1.10.0", newerThan: "v1.10.0") == false)
+    }
 }

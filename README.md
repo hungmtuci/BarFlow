@@ -12,6 +12,14 @@
   <img src="docs/images/selection-dashboard.png" alt="Bảng điều khiển chọn lọc ứng dụng Menu Bar của BarFlow" width="760" />
 </p>
 
+## 🆕 Có gì mới trong phiên bản 1.10.0
+
+- **Nhận diện biểu tượng ổn định & chống nhấp nháy**: Triệt tiêu vòng lặp tự nạp lại `MenuBarAgent` nhờ cửa sổ yên lặng sau mỗi lần reload, bổ sung chu kỳ ân hạn 3 lần quét liên tiếp cho tiến trình còn sống (tránh rớt biểu tượng khi ứng dụng tạm bận AX) và xếp hàng tuần tự mọi yêu cầu quét chồng lấp thay vì huỷ bỏ.
+- **Phát hiện nhanh ứng dụng khay vừa khởi chạy**: Dò đơn tiến trình theo giai đoạn (`+1s`, `+3s`, `+6s`, `+10s`) kết hợp theo dõi KVO `runningApplications`, nhận diện các ứng dụng khay khởi tạo trễ (Electron, `LSUIElement`) chỉ trong vài giây sau khi mở và gỡ tức thì (`< 1s`) khi ứng dụng thoát.
+- **Định danh ổn định cho ứng dụng đa biểu tượng & tự động di trú**: Chuẩn hoá định danh cho ứng dụng có nhiều biểu tượng hoặc tiêu đề đổi liên tục (như phần trăm CPU/RAM của iStat Menus, Stats), khử trùng lặp tất định và tự động chuyển đổi cấu hình đã lưu từ phiên bản cũ mà không mất lựa chọn hay thứ tự sắp xếp.
+- **Hỗ trợ đầy đủ bản đồ slot đa màn hình**: Quét toàn bộ cửa sổ `MenuBarAgent` trên mọi màn hình đang kết nối và tự động cập nhật khi cắm/rút màn hình rời.
+- **Giảm thiểu khởi động lại `cfprefsd`**: Đồng bộ và làm mới bộ đệm `cfprefsd` đúng thứ tự trước khi nạp lại `MenuBarAgent`, giảm số lần khởi động lại tiến trình hệ thống và loại bỏ hiện tượng đọc nhầm cache cũ.
+
 ## ✨ Tính năng nổi bật
 
 - **Chọn lọc & Ẩn thực sự khỏi Menu Bar chính**:
@@ -48,8 +56,8 @@
 ## 📥 Tải về & Cài đặt nhanh (macOS 14.0+ Universal: Apple Silicon & Intel)
 
 1. Tải bộ cài mới nhất tại trang **[Releases](https://github.com/hungmtuci/BarFlow/releases/latest)**:
-   - **`BarFlow-Installer-v1.8.1.dmg`** *(Khuyên dùng)*
-   - Hoặc **`BarFlow-v1.8.1-macOS.zip`**
+   - **`BarFlow-Installer-v1.10.0.dmg`** *(Khuyên dùng)*
+   - Hoặc **`BarFlow-v1.10.0-macOS.zip`**
 2. Mở file `.dmg`:
    - Kéo `BarFlow.app` thả vào thư mục **`Applications`**, **HOẶC** nhấp chuột phải vào `Cai_Dat_BarFlow.command` → chọn **Open** để tự động cài đặt vào `/Applications` và gỡ cờ cách ly Gatekeeper.
 3. Nếu macOS báo ứng dụng chưa công chứng Apple Developer ID khi mở lần đầu trên máy mới, chạy lệnh sau trong Terminal:

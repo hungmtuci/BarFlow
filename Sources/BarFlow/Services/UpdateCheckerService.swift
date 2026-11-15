@@ -37,7 +37,7 @@ final class UpdateCheckerService: ObservableObject {
     private let releasesPageFallback = URL(string: "https://github.com/hungmtuci/BarFlow/releases/latest")!
 
     private init() {
-        self.currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.9.3"
+        self.currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.10.0"
     }
 
     /// Performs a quiet background check at most once every 6 hours without disturbing the user on network errors.
