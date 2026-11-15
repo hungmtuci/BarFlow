@@ -205,4 +205,49 @@ struct MenuBarItemIdentityTests {
         #expect(dedupA.first?.pid == 450)
         #expect(dedupB.first?.pid == 450)
     }
+
+    @Test("Multi-display MenuBarAgent slot helpers deduplicate frames and select display with complete slot set")
+    func multiDisplaySlotHelpers() {
+        let builtIn = DisplayGeometry(
+            displayID: 1,
+            appKitFrame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            cgFrame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            menuBarThickness: 38
+        )
+        let external = DisplayGeometry(
+            displayID: 2,
+            appKitFrame: CGRect(x: 1512, y: 0, width: 2560, height: 1440),
+            cgFrame: CGRect(x: 1512, y: -458, width: 2560, height: 1440),
+            menuBarThickness: 24
+        )
+        let displays = [builtIn, external]
+
+        let slotOnBuiltIn = CGRect(x: 1120, y: 4, width: 28, height: 24)
+        let slotOnExternal = CGRect(x: 3600, y: -456, width: 28, height: 24)
+        #expect(MenuBarScanner.isFrameVisiblyOnMenuBar(slotOnBuiltIn, displays: displays) == true)
+        #expect(MenuBarScanner.isFrameVisiblyOnMenuBar(slotOnExternal, displays: displays) == true)
+        #expect(MenuBarScanner.containsMatchingSlotFrame([slotOnBuiltIn], candidate: CGRect(x: 1120.4, y: 4.2, width: 28, height: 24)) == true)
+        #expect(MenuBarScanner.containsMatchingSlotFrame([slotOnBuiltIn], candidate: slotOnExternal) == false)
+
+        // Single-icon app mirrored across both displays -> selects 1 slot (not 2 duplicates)
+        let mirroredSingle = MenuBarScanner.selectBestDisplaySlotIndices(
+            slotFrames: [slotOnBuiltIn, slotOnExternal],
+            displays: displays
+        )
+        #expect(mirroredSingle.count == 1)
+
+        // 3-icon app clipped to 2 icons on notched built-in display, all 3 visible on external monitor -> selects all 3
+        let multiIconFrames: [CGRect?] = [
+            CGRect(x: 1100, y: 4, width: 28, height: 24),
+            CGRect(x: 1132, y: 4, width: 28, height: 24),
+            CGRect(x: 3500, y: -456, width: 28, height: 24),
+            CGRect(x: 3532, y: -456, width: 28, height: 24),
+            CGRect(x: 3564, y: -456, width: 28, height: 24)
+        ]
+        let selectedMulti = MenuBarScanner.selectBestDisplaySlotIndices(
+            slotFrames: multiIconFrames,
+            displays: displays
+        )
+        #expect(selectedMulti == [2, 3, 4])
+    }
 }

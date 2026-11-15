@@ -242,6 +242,7 @@ final class MenuBarController: ObservableObject {
     private var lastBackgroundScanTime: CFAbsoluteTime = 0
     private var lastUserInteractionTime: CFAbsoluteTime = 0
     private var pendingSaveWorkItem: DispatchWorkItem?
+    private var screenChangeDebounceWorkItem: DispatchWorkItem?
     private var dragEndWatchdogTimer: Timer?
     private var needsNativeSyncAfterDragEnd: Bool = false
     private var isUpdatingLaunchAtLoginInternally: Bool = false
@@ -473,6 +474,8 @@ final class MenuBarController: ObservableObject {
         trailingAutoSyncTimer = nil
         pendingSaveWorkItem?.cancel()
         pendingSaveWorkItem = nil
+        screenChangeDebounceWorkItem?.cancel()
+        screenChangeDebounceWorkItem = nil
         if let mon = statusItemScrollMonitor {
             NSEvent.removeMonitor(mon)
             statusItemScrollMonitor = nil
@@ -3816,6 +3819,26 @@ final class MenuBarController: ObservableObject {
                     self.scheduleBackgroundMonitorTimer()
                     self.refreshRunningAppsAsync(forceFullScan: false, reason: .wake)
                 }
+            }
+        }
+
+        // Rescan cleanly after external display plug/unplug or resolution/arrangement change
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, !self.hasPreparedForTermination else { return }
+                self.screenChangeDebounceWorkItem?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self = self, !self.hasPreparedForTermination, !self.isSystemSleeping else { return }
+                        self.refreshRunningAppsAsync(forceFullScan: false, reason: .wake)
+                    }
+                }
+                self.screenChangeDebounceWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.60, execute: work)
             }
         }
     }

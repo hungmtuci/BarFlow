@@ -308,7 +308,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 agentSlotElementsByPID: agentSlotElementsByPID
             )
         case .definitelyEmpty:
-            if let fallbackElements = agentSlotElementsByPID[pid], !fallbackElements.isEmpty {
+            let fallbackElements = fallbackElementsForPID(pid, from: agentSlotElementsByPID, displays: displays)
+            if !fallbackElements.isEmpty {
                 builtItems = buildItems(
                     for: candidate,
                     rawChildren: fallbackElements,
@@ -320,7 +321,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 return (kill(pid, 0) == 0 || errno == EPERM) ? .empty : .processGone
             }
         case .timedOutOrBusy:
-            if let fallbackElements = agentSlotElementsByPID[pid], !fallbackElements.isEmpty {
+            let fallbackElements = fallbackElementsForPID(pid, from: agentSlotElementsByPID, displays: displays)
+            if !fallbackElements.isEmpty {
                 let fallbackBuilt = buildItems(
                     for: candidate,
                     rawChildren: fallbackElements,
@@ -532,8 +534,9 @@ final class MenuBarScanner: @unchecked Sendable {
                     resultLock.unlock()
 
                 case .definitelyEmpty:
-                    // Check if MenuBarAgent still has a live slot element for this PID
-                    if let fallbackElements = agentSlotElementsByPID[proc.pid], !fallbackElements.isEmpty {
+                    // Check if MenuBarAgent still has live slot element(s) for this PID across any connected display
+                    let fallbackElements = self.fallbackElementsForPID(proc.pid, from: agentSlotElementsByPID, displays: displays)
+                    if !fallbackElements.isEmpty {
                         let built = self.buildItems(
                             for: proc,
                             rawChildren: fallbackElements,
@@ -578,7 +581,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 newlyPositivePIDs.insert(proc.pid)
                 discovered.append(contentsOf: built)
             case .definitelyEmpty:
-                if let fallbackElements = agentSlotElementsByPID[proc.pid], !fallbackElements.isEmpty {
+                let fallbackElements = fallbackElementsForPID(proc.pid, from: agentSlotElementsByPID, displays: displays)
+                if !fallbackElements.isEmpty {
                     let built = buildItems(
                         for: proc,
                         rawChildren: fallbackElements,
@@ -595,7 +599,8 @@ final class MenuBarScanner: @unchecked Sendable {
                 newlyDefiniteNegativePIDs.append(proc.pid)
             case .timedOutOrBusy:
                 finalTimedOutPIDs.append(proc.pid)
-                if let fallbackElements = agentSlotElementsByPID[proc.pid], !fallbackElements.isEmpty {
+                let fallbackElements = fallbackElementsForPID(proc.pid, from: agentSlotElementsByPID, displays: displays)
+                if !fallbackElements.isEmpty {
                     let built = buildItems(
                         for: proc,
                         rawChildren: fallbackElements,
@@ -789,7 +794,19 @@ final class MenuBarScanner: @unchecked Sendable {
         // Case B: Standard, Helper, or `.prohibited` Tray Application (1 or MULTIPLE Menu Bar icons!)
         let baseID = proc.bundleID ?? "exec:\(proc.localizedName ?? "App")"
         let hasMenuBarAgentSlots = !agentSlotElementsByPID.isEmpty
-        let isPIDHostedInAgent = !hasMenuBarAgentSlots || (agentSlotElementsByPID[proc.pid] != nil)
+        let hostedElementsForPID = agentSlotElementsByPID[proc.pid] ?? []
+        let allHostedFramesForPID: [CGRect] = hostedElementsForPID.compactMap { readAXFrame($0) }
+        let hostedVisibleFramesForPID: [CGRect] = allHostedFramesForPID.filter {
+            Self.isFrameVisiblyOnMenuBar($0, displays: displays)
+        }
+        let isPIDHostedInAgent: Bool = {
+            guard hasMenuBarAgentSlots else { return true }
+            guard !hostedElementsForPID.isEmpty else { return false }
+            if !allHostedFramesForPID.isEmpty {
+                return !hostedVisibleFramesForPID.isEmpty
+            }
+            return true
+        }()
 
         struct RawAppIcon {
             let playable: AXUIElement
@@ -850,7 +867,16 @@ final class MenuBarScanner: @unchecked Sendable {
         items.reserveCapacity(rawIcons.count)
 
         for (pos, raw) in rawIcons.enumerated() {
-            let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(raw.axFrame, displays: displays)
+            let rawVisibleOnDisplay = Self.isFrameVisiblyOnMenuBar(raw.axFrame, displays: displays)
+            let effectiveFrame: CGRect?
+            if rawVisibleOnDisplay {
+                effectiveFrame = raw.axFrame
+            } else if rawIcons.count == 1, let hostedFrame = hostedVisibleFramesForPID.first {
+                effectiveFrame = hostedFrame
+            } else {
+                effectiveFrame = raw.axFrame
+            }
+            let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(effectiveFrame, displays: displays)
             let baseAppName = Self.friendlyAppName(
                 bundleID: proc.bundleID,
                 localizedName: proc.localizedName,
@@ -883,7 +909,7 @@ final class MenuBarScanner: @unchecked Sendable {
                     appIcon: proc.icon,
                     statusTitle: raw.axTitle,
                     statusDescription: raw.axDesc,
-                    slotFrame: raw.axFrame,
+                    slotFrame: effectiveFrame,
                     isCurrentlyOnBar: isOnBar,
                     axElement: raw.playable,
                     isSystemItem: proc.isSystem,
@@ -936,7 +962,8 @@ final class MenuBarScanner: @unchecked Sendable {
         }
     }
 
-    /// Reads hosted slot PIDs and fallback `AXMenuBarItem` elements from `MenuBarAgent` (macOS 26/27).
+    /// Reads hosted slot PIDs and fallback `AXMenuBarItem` elements across **all** `MenuBarAgent` windows (one per display),
+    /// appending every content element per PID deduplicated by frame.
     private func readMenuBarAgentSlotElementsByPID(ownPID: pid_t) -> [pid_t: [AXUIElement]] {
         guard AXIsProcessTrusted(),
               let agent = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.MenuBarAgent").first else {
@@ -953,26 +980,102 @@ final class MenuBarScanner: @unchecked Sendable {
         }
 
         var byPID: [pid_t: [AXUIElement]] = [:]
-        for win in windows.prefix(2) {
+        var framesByPID: [pid_t: [CGRect]] = [:]
+
+        for win in windows {
+            AXUIElementSetMessagingTimeout(win, 0.25)
             var slotsRef: CFTypeRef?
             guard AXUIElementCopyAttributeValue(win, kAXChildrenAttribute as CFString, &slotsRef) == .success,
                   let slots = slotsRef as? [AXUIElement] else { continue }
             for slot in slots {
+                AXUIElementSetMessagingTimeout(slot, 0.15)
                 var contentRef: CFTypeRef?
                 guard AXUIElementCopyAttributeValue(slot, kAXChildrenAttribute as CFString, &contentRef) == .success,
-                      let content = (contentRef as? [AXUIElement])?.first else { continue }
-                var spid: pid_t = 0
-                AXUIElementGetPid(content, &spid)
-                guard spid > 0, spid != ownPID, spid != agentPID else { continue }
-                if byPID[spid] == nil {
-                    byPID[spid] = [content]
+                      let contents = contentRef as? [AXUIElement],
+                      !contents.isEmpty else { continue }
+
+                let slotFrame = readAXFrame(slot)
+                for content in contents {
+                    var spid: pid_t = 0
+                    AXUIElementGetPid(content, &spid)
+                    guard spid > 0, spid != ownPID, spid != agentPID else { continue }
+
+                    AXUIElementSetMessagingTimeout(content, 0.15)
+                    let resolvedFrame = readAXFrame(content) ?? slotFrame
+                    if let rect = resolvedFrame, rect.width > 0, rect.height > 0 {
+                        if Self.containsMatchingSlotFrame(framesByPID[spid] ?? [], candidate: rect) {
+                            continue
+                        }
+                        framesByPID[spid, default: []].append(rect)
+                        byPID[spid, default: []].append(content)
+                    } else {
+                        let alreadyAdded = byPID[spid]?.contains(where: { CFEqual($0, content) }) ?? false
+                        if !alreadyAdded {
+                            byPID[spid, default: []].append(content)
+                        }
+                    }
                 }
-            }
-            if !byPID.isEmpty {
-                break
             }
         }
         return byPID
+    }
+
+    static func containsMatchingSlotFrame(_ existingFrames: [CGRect], candidate: CGRect, tolerance: CGFloat = 1.0) -> Bool {
+        existingFrames.contains { f in
+            abs(f.minX - candidate.minX) <= tolerance &&
+            abs(f.minY - candidate.minY) <= tolerance &&
+            abs(f.width - candidate.width) <= tolerance &&
+            abs(f.height - candidate.height) <= tolerance
+        }
+    }
+
+    /// Selects the single display's hosted slots that expose the most items for a PID so cross-display mirrors
+    /// never duplicate items on fallback while still capturing icons clipped by a narrower display's notch.
+    static func selectBestDisplaySlotIndices(slotFrames: [CGRect?], displays: [DisplayGeometry]) -> [Int] {
+        guard slotFrames.count > 1, displays.count > 1 else {
+            return Array(slotFrames.indices)
+        }
+
+        var bucketsByDisplayIdx: [Int: [Int]] = [:]
+        for (slotIdx, maybeFrame) in slotFrames.enumerated() {
+            guard let frame = maybeFrame else { continue }
+            if let dispIdx = displays.firstIndex(where: { isFrameVisiblyOnDisplayMenuBar(frame, display: $0) }) {
+                bucketsByDisplayIdx[dispIdx, default: []].append(slotIdx)
+            }
+        }
+
+        guard !bucketsByDisplayIdx.isEmpty else {
+            return Array(slotFrames.indices)
+        }
+
+        let bestEntry = bucketsByDisplayIdx.max { a, b in
+            if a.value.count != b.value.count {
+                return a.value.count < b.value.count
+            }
+            let widthA = displays[a.key].cgFrame.width
+            let widthB = displays[b.key].cgFrame.width
+            if abs(widthA - widthB) > 1.0 {
+                return widthA < widthB
+            }
+            return a.key > b.key
+        }
+        return bestEntry?.value ?? Array(slotFrames.indices)
+    }
+
+    private func fallbackElementsForPID(
+        _ pid: pid_t,
+        from agentSlotElementsByPID: [pid_t: [AXUIElement]],
+        displays: [DisplayGeometry]
+    ) -> [AXUIElement] {
+        guard let elements = agentSlotElementsByPID[pid], !elements.isEmpty else {
+            return []
+        }
+        guard elements.count > 1, displays.count > 1 else {
+            return elements
+        }
+        let slotFrames = elements.map { readAXFrame($0) }
+        let selectedIndices = Self.selectBestDisplaySlotIndices(slotFrames: slotFrames, displays: displays)
+        return selectedIndices.map { elements[$0] }
     }
 
     /// Unwraps container groups (`AXHostingView` in `MenuBarAgent` or `AXApplication` -> `AXMenuBar` -> `AXMenuBarItem`)
