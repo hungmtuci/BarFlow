@@ -233,6 +233,8 @@ final class MenuBarController: ObservableObject {
     private var agentQuietWindowEndTimer: Timer?
     private var pendingScan: PendingScanState?
     private var stagedLaunchProbeTasks: [pid_t: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var runningAppsObservation: NSKeyValueObservation?
+    private var recentlyObservedLaunchPIDs: [pid_t: CFAbsoluteTime] = [:]
     private var lastObservedMenuBarAgentPID: pid_t = 0
     private var lastAutoAgentReloadTime: CFAbsoluteTime = 0
     private let autoAgentReloadMinInterval: TimeInterval = 15.0
@@ -470,6 +472,8 @@ final class MenuBarController: ObservableObject {
             MenuBarScanner.shared.endStagedProbeWindow(for: pid)
         }
         stagedLaunchProbeTasks.removeAll()
+        runningAppsObservation?.invalidate()
+        runningAppsObservation = nil
         trailingAutoSyncTimer?.invalidate()
         trailingAutoSyncTimer = nil
         pendingSaveWorkItem?.cancel()
@@ -1484,8 +1488,9 @@ final class MenuBarController: ObservableObject {
         return kill(item.pid, 0) == 0 || errno == EPERM
     }
 
-    private func removeItemsForTerminatedPID(_ pid: pid_t) {
-        guard pid > 0 else { return }
+    @discardableResult
+    private func removeItemsForTerminatedPID(_ pid: pid_t) -> Bool {
+        guard pid > 0 else { return false }
         let now = CFAbsoluteTimeGetCurrent()
         recentlyTerminatedPIDs[pid] = now
         if recentlyTerminatedPIDs.count > 64 {
@@ -1493,7 +1498,7 @@ final class MenuBarController: ObservableObject {
         }
 
         let removedIDs = allRunningApps.filter { $0.pid == pid }.map(\.id)
-        guard !removedIDs.isEmpty else { return }
+        guard !removedIDs.isEmpty else { return false }
 
         let oldSecondaryCount = secondaryBarApps.count
         allRunningApps.removeAll { $0.pid == pid }
@@ -1507,6 +1512,7 @@ final class MenuBarController: ObservableObject {
         }
         let formatted = BarFlowLog.formatIDList(removedIDs)
         BarFlowLog.scan.log("removed terminated app immediately pid=\(pid, privacy: .public) removed=[\(formatted, privacy: .public)]")
+        return true
     }
 
     /// Merges freshly scanned items with `allRunningApps` using a 3-scan grace period for live processes,
@@ -3757,47 +3763,112 @@ final class MenuBarController: ObservableObject {
         }
     }
 
+    private static let ignoredWorkspaceBundles: Set<String> = [
+        "com.apple.TextInputMenuAgent",
+        "com.apple.campo",
+        "com.apple.controlcenter"
+    ]
+
+    private func handleObservedWorkspaceLaunch(_ launchedApp: NSRunningApplication) {
+        guard !hasPreparedForTermination else { return }
+        let launchedPID = launchedApp.processIdentifier
+        guard launchedPID > 0 else { return }
+        let launchedBundle = launchedApp.bundleIdentifier ?? ""
+
+        let now = CFAbsoluteTimeGetCurrent()
+        if let prevLaunch = recentlyObservedLaunchPIDs[launchedPID], (now - prevLaunch) < 5.0 {
+            return
+        }
+        recentlyObservedLaunchPIDs[launchedPID] = now
+        if recentlyObservedLaunchPIDs.count > 96 {
+            recentlyObservedLaunchPIDs = recentlyObservedLaunchPIDs.filter { (now - $0.value) < 15.0 }
+        }
+
+        if launchedBundle == "com.apple.MenuBarAgent" {
+            let prevPID = lastObservedMenuBarAgentPID
+            lastObservedMenuBarAgentPID = launchedPID
+            BarFlowLog.agent.log("MenuBarAgent launch observed (oldPID=\(prevPID, privacy: .public) newPID=\(launchedPID, privacy: .public)) -> entering 3.0s quiet window")
+            enterAgentReloadQuietWindow(duration: 3.0, source: "agentLaunch(\(launchedPID))")
+            return
+        }
+
+        guard !Self.ignoredWorkspaceBundles.contains(launchedBundle),
+              MenuBarScanner.shared.shouldScheduleLaunchProbe(for: launchedApp) else {
+            return
+        }
+        scheduleStagedLaunchProbes(for: launchedPID)
+    }
+
+    private func handleObservedWorkspaceTermination(
+        pid terminatedPID: pid_t,
+        bundleID bundle: String,
+        activationPolicy: NSApplication.ActivationPolicy
+    ) {
+        guard !hasPreparedForTermination, terminatedPID > 0 else { return }
+        recentlyObservedLaunchPIDs.removeValue(forKey: terminatedPID)
+
+        if let staged = stagedLaunchProbeTasks.removeValue(forKey: terminatedPID) {
+            staged.task.cancel()
+            MenuBarScanner.shared.endStagedProbeWindow(for: terminatedPID)
+        }
+        MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
+        MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
+
+        guard bundle != "com.apple.MenuBarAgent", !Self.ignoredWorkspaceBundles.contains(bundle) else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let alreadyHandled = recentlyTerminatedPIDs[terminatedPID].map { (now - $0) < 5.0 } ?? false
+        let didRemove = removeItemsForTerminatedPID(terminatedPID)
+        if !alreadyHandled && (didRemove || activationPolicy == .regular) {
+            refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
+        }
+    }
+
     private func observeWorkspaceNotifications() {
-        let ignoreBundles: Set<String> = [
-            "com.apple.TextInputMenuAgent",
-            "com.apple.campo",
-            "com.apple.controlcenter"
-        ]
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            let launchedApp = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            let launchedBundle = launchedApp?.bundleIdentifier ?? ""
-            let launchedPID = launchedApp?.processIdentifier ?? 0
-            if launchedBundle == "com.apple.MenuBarAgent" {
-                MainActor.assumeIsolated {
-                    guard let self = self else { return }
-                    let prevPID = self.lastObservedMenuBarAgentPID
-                    if launchedPID > 0 {
-                        self.lastObservedMenuBarAgentPID = launchedPID
-                    }
-                    BarFlowLog.agent.log("MenuBarAgent didLaunch observed (oldPID=\(prevPID, privacy: .public) newPID=\(launchedPID, privacy: .public)) -> entering 3.0s quiet window")
-                    self.enterAgentReloadQuietWindow(duration: 3.0, source: "agentLaunch(\(launchedPID))")
-                }
-                return
-            }
-            guard !ignoreBundles.contains(launchedBundle) else { return }
+            guard let launchedApp = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             MainActor.assumeIsolated {
-                self?.scheduleStagedLaunchProbes(for: launchedPID)
+                self?.handleObservedWorkspaceLaunch(launchedApp)
             }
         }
         ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-            let bundle = app?.bundleIdentifier ?? ""
-            let terminatedPID = app?.processIdentifier ?? 0
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let pid = app.processIdentifier
+            let bundle = app.bundleIdentifier ?? ""
+            let policy = app.activationPolicy
             MainActor.assumeIsolated {
-                if terminatedPID > 0, let staged = self?.stagedLaunchProbeTasks.removeValue(forKey: terminatedPID) {
-                    staged.task.cancel()
+                self?.handleObservedWorkspaceTermination(pid: pid, bundleID: bundle, activationPolicy: policy)
+            }
+        }
+
+        // Also observe KVO on `NSWorkspace.shared.runningApplications` because macOS does NOT post
+        // `didLaunchApplicationNotification` / `didTerminateApplicationNotification` for `LSUIElement = true`
+        // (`.accessory`) or `.prohibited` menu bar tray utilities (e.g. OneDrive, Dropbox, Docker helpers, MenuBarAgent).
+        runningAppsObservation?.invalidate()
+        runningAppsObservation = NSWorkspace.shared.observe(\.runningApplications, options: [.old, .new]) { [weak self] _, change in
+            let oldApps = change.oldValue ?? []
+            let newApps = change.newValue ?? []
+            let oldPIDs = Set(oldApps.map(\.processIdentifier))
+            let newPIDs = Set(newApps.map(\.processIdentifier))
+            let launched = newApps.filter { $0.processIdentifier > 0 && !oldPIDs.contains($0.processIdentifier) }
+            let terminated = oldApps.filter { $0.processIdentifier > 0 && !newPIDs.contains($0.processIdentifier) }
+            guard !launched.isEmpty || !terminated.isEmpty else { return }
+
+            let terminatedSnapshots: [(pid: pid_t, bundle: String, policy: NSApplication.ActivationPolicy)] = terminated.map {
+                ($0.processIdentifier, $0.bundleIdentifier ?? "", $0.activationPolicy)
+            }
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                for app in launched {
+                    self.handleObservedWorkspaceLaunch(app)
                 }
-                MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
-                MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
-                guard bundle != "com.apple.MenuBarAgent", !ignoreBundles.contains(bundle) else { return }
-                self?.removeItemsForTerminatedPID(terminatedPID)
-                self?.refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
+                for snap in terminatedSnapshots {
+                    self.handleObservedWorkspaceTermination(
+                        pid: snap.pid,
+                        bundleID: snap.bundle,
+                        activationPolicy: snap.policy
+                    )
+                }
             }
         }
 

@@ -179,6 +179,17 @@ final class MenuBarScanner: @unchecked Sendable {
     }
 
     @MainActor
+    func shouldScheduleLaunchProbe(for app: NSRunningApplication) -> Bool {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard app.processIdentifier > 0,
+              app.processIdentifier != ownPID,
+              !app.isTerminated else {
+            return false
+        }
+        return makeOrCachedCandidate(for: app) != nil
+    }
+
+    @MainActor
     private func makeOrCachedCandidate(for app: NSRunningApplication) -> CandidateProcess? {
         let pid = app.processIdentifier
         guard pid > 0 else { return nil }
