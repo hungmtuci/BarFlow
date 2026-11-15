@@ -1,5 +1,11 @@
 // swift-tools-version: 5.10
 import PackageDescription
+import Foundation
+
+let cltTestingPluginDir = "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing"
+let extraTestSwiftSettings: [SwiftSetting] = FileManager.default.fileExists(atPath: cltTestingPluginDir)
+    ? [.unsafeFlags(["-plugin-path", cltTestingPluginDir])]
+    : []
 
 let package = Package(
     name: "BarFlow",
@@ -22,6 +28,12 @@ let package = Package(
                 .linkedFramework("ServiceManagement"),
                 .unsafeFlags(["-Xlinker", "-dead_strip", "-Xlinker", "-dead_strip_dylibs"])
             ]
+        ),
+        .testTarget(
+            name: "BarFlowTests",
+            dependencies: ["BarFlow"],
+            path: "Tests/BarFlowTests",
+            swiftSettings: extraTestSwiftSettings
         )
     ]
 )

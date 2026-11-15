@@ -21,6 +21,7 @@ private struct PersistedLayoutState: Codable, Sendable {
     var hotKeyBinding: HotKeyBinding? = nil
     var hoverToOpenEnabled: Bool? = nil
     var launchAtLogin: Bool? = nil
+    var migratedMultiIconBaseIDs: [String]? = nil
 }
 
 @MainActor
@@ -51,6 +52,7 @@ final class MenuBarController: ObservableObject {
     private(set) var mainBarOrderIDs: [String] = []
     private(set) var secondaryBarOrderIDs: [String] = []
     private var allAppsOrderIDs: [String] = []
+    private var migratedMultiIconBaseIDs = Set<String>()
 
     /// Active item ID currently being dragged during Drag & Drop reordering (avoids @State macro).
     @Published var draggingItemID: String? = nil
@@ -280,6 +282,7 @@ final class MenuBarController: ObservableObject {
             self.hotKeyBinding = decoded.hotKeyBinding ?? .defaultCtrlB
             self.hoverToOpenEnabled = decoded.hoverToOpenEnabled ?? false
             self.launchAtLogin = systemLaunchEnabled || (decoded.launchAtLogin ?? false)
+            self.migratedMultiIconBaseIDs = Set(decoded.migratedMultiIconBaseIDs ?? [])
         } else {
             // Seamless migration from v1.0–v1.4 UserDefaults
             let savedArray = UserDefaults.standard.stringArray(forKey: Keys.selectedIDs) ?? []
@@ -1264,8 +1267,48 @@ final class MenuBarController: ObservableObject {
             hideFromDock: hideFromDock,
             hotKeyBinding: hotKeyBinding,
             hoverToOpenEnabled: hoverToOpenEnabled,
-            launchAtLogin: launchAtLogin
+            launchAtLogin: launchAtLogin,
+            migratedMultiIconBaseIDs: migratedMultiIconBaseIDs.sorted()
         )
+    }
+
+    private func migrateSavedMultiIconIDsIfNeeded(for apps: [MenuBarAppItem]) {
+        guard !apps.isEmpty else { return }
+        let candidates: [ScannedMultiIconCandidate] = apps.compactMap { item in
+            guard let baseID = MenuBarIdentity.baseID(for: item) else { return nil }
+            return ScannedMultiIconCandidate(
+                id: item.id,
+                baseID: baseID,
+                minX: item.slotFrame?.minX,
+                axChildIndex: item.axChildIndex
+            )
+        }
+        guard !candidates.isEmpty else { return }
+
+        var snapshot = MultiIconLayoutSnapshot(
+            selectedMainBarIDs: selectedMainBarIDs,
+            mainBarOrderIDs: mainBarOrderIDs,
+            secondaryBarOrderIDs: secondaryBarOrderIDs,
+            allAppsOrderIDs: allAppsOrderIDs,
+            migratedBaseIDs: migratedMultiIconBaseIDs
+        )
+        let prevMigrated = migratedMultiIconBaseIDs
+        let mapping = MenuBarIdentity.migrateMultiIconIDs(in: &snapshot, scannedCandidates: candidates)
+
+        guard !mapping.isEmpty || snapshot.migratedBaseIDs != prevMigrated else { return }
+        migratedMultiIconBaseIDs = snapshot.migratedBaseIDs
+        if !mapping.isEmpty {
+            selectedMainBarIDs = snapshot.selectedMainBarIDs
+            mainBarOrderIDs = snapshot.mainBarOrderIDs
+            secondaryBarOrderIDs = snapshot.secondaryBarOrderIDs
+            allAppsOrderIDs = snapshot.allAppsOrderIDs
+            let mappedPairs = mapping
+                .sorted { $0.key < $1.key }
+                .map { "\(BarFlowLog.sanitizeID($0.key))->\(BarFlowLog.sanitizeID($0.value))" }
+                .joined(separator: ",")
+            BarFlowLog.sync.log("Migrated multi-icon layout IDs: [\(mappedPairs, privacy: .public)]")
+        }
+        scheduleSaveState()
     }
 
     private func scheduleSaveState() {
@@ -1700,6 +1743,8 @@ final class MenuBarController: ObservableObject {
             "stagedProbe reason=appLaunched(\(pid, privacy: .public)) stage=+\(stageSeconds, privacy: .public)s durationMs=\(durationMs, privacy: .public) found=\(items.count, privacy: .public) totalItems=\(nextApps.count, privacy: .public) added=[\(added, privacy: .public)]"
         )
 
+        self.migrateSavedMultiIconIDsIfNeeded(for: nextApps)
+
         let neverSeenBeforeIDs = mergedIDs.subtracting(everSeenIDs)
         let newUnselectedLaunched = !everSeenIDs.isEmpty &&
             neverSeenBeforeIDs.contains(where: { !selectedMainBarIDs.contains($0) })
@@ -1963,6 +2008,8 @@ final class MenuBarController: ObservableObject {
                 itemCount: mergedApps.count,
                 diagnostics: diagnostics
             )
+
+            self.migrateSavedMultiIconIDsIfNeeded(for: mergedApps)
 
             let neverSeenBeforeIDs = mergedIDs.subtracting(self.everSeenIDs)
             let newUnselectedLaunched = !self.everSeenIDs.isEmpty &&

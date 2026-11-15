@@ -78,6 +78,8 @@ final class MenuBarScanner: @unchecked Sendable {
     private var negativePIDCache: [pid_t: CFAbsoluteTime] = [:]
     /// Newly launched PIDs currently in their +1s/+3s/+6s/+10s staged probe window (never negative-cached).
     private var stagedProbePIDs = Set<pid_t>()
+    /// Session-scoped natural key anchor for apps observed with 1 icon so `1 -> 2` mid-session transitions keep `baseID` on the original icon.
+    private var singleIconAnchorByBaseID: [String: String] = [:]
     private let negativeCacheTTL: CFAbsoluteTime = 15.0
 
     /// MainActor-owned pre-rendered `32x32` (@2x) icon cache keyed by stable bundleID/execPath or symbol key.
@@ -148,7 +150,11 @@ final class MenuBarScanner: @unchecked Sendable {
 
     @MainActor
     func handleAppTerminated(pid: pid_t) {
+        var terminatedBaseID: String?
         if pid > 0 {
+            if let cached = candidateProcessCache[pid] {
+                terminatedBaseID = cached.bundleID ?? cached.localizedName.map { "exec:\($0)" }
+            }
             scaledIconCache.removeValue(forKey: "pid:\(pid)")
             candidateProcessCache.removeValue(forKey: pid)
             skippedDaemonPIDs.remove(pid)
@@ -161,9 +167,13 @@ final class MenuBarScanner: @unchecked Sendable {
             knownMenuBarPIDs.remove(pid)
             negativePIDCache.removeValue(forKey: pid)
             stagedProbePIDs.remove(pid)
+            if let baseID = terminatedBaseID {
+                singleIconAnchorByBaseID.removeValue(forKey: baseID)
+            }
         } else {
             negativePIDCache.removeAll()
             stagedProbePIDs.removeAll()
+            singleIconAnchorByBaseID.removeAll()
         }
         cacheLock.unlock()
     }
@@ -337,12 +347,7 @@ final class MenuBarScanner: @unchecked Sendable {
         negativePIDCache.removeValue(forKey: pid)
         cacheLock.unlock()
 
-        var uniqueByID = Set<String>()
-        var deduplicated: [MenuBarAppItem] = []
-        deduplicated.reserveCapacity(builtItems.count)
-        for item in builtItems where uniqueByID.insert(item.id).inserted {
-            deduplicated.append(item)
-        }
+        let deduplicated = MenuBarIdentity.deduplicateItemsDeterministically(builtItems)
         return .found(deduplicated)
     }
 
@@ -610,10 +615,15 @@ final class MenuBarScanner: @unchecked Sendable {
         let persistedHiddenSys = MenuBarVisibilityEngine.shared.persistedHiddenSystemItems()
         for persisted in persistedHiddenSys {
             let alreadyPresent = discovered.contains { existing in
-                if existing.id == persisted.id { return true }
-                if let pa = persisted.axIdentifier, !pa.isEmpty, existing.axIdentifier == pa { return true }
-                if existing.appName == persisted.appName && existing.isSystemItem { return true }
-                return false
+                MenuBarIdentity.matchesPersistedHiddenSystemItem(
+                    existingID: existing.id,
+                    existingAXIdentifier: existing.axIdentifier,
+                    existingAppName: existing.appName,
+                    existingIsSystemItem: existing.isSystemItem,
+                    persistedID: persisted.id,
+                    persistedAXIdentifier: persisted.axIdentifier,
+                    persistedAppName: persisted.appName
+                )
             }
             if !alreadyPresent {
                 let icon = symbolIcons[persisted.symbolKey] ?? symbolIcons["default"] ?? fallbackDefaultIcon
@@ -656,15 +666,8 @@ final class MenuBarScanner: @unchecked Sendable {
         }
         cacheLock.unlock()
 
-        // Deduplicate by stable ID while preserving the most informative entry
-        var uniqueByID = Set<String>()
-        var deduplicated: [MenuBarAppItem] = []
-        deduplicated.reserveCapacity(discovered.count)
-        for item in discovered {
-            if uniqueByID.insert(item.id).inserted {
-                deduplicated.append(item)
-            }
-        }
+        // Deterministic dedup: sort by (isCurrentlyOnBar desc, slotFrame != nil desc, pid asc, axChildIndex asc) before keeping first per ID
+        var deduplicated = MenuBarIdentity.deduplicateItemsDeterministically(discovered)
 
         // Sort naturally Left -> Right (smallest X first = leftmost on Menu Bar) for items on bar, then alphabetically
         deduplicated.sort { a, b in
@@ -705,7 +708,19 @@ final class MenuBarScanner: @unchecked Sendable {
 
         // Case A: System Extras Container (`MenuBarAgent`, `ControlCenter`, `SystemUIServer`)
         if proc.isSystemExtrasContainer {
-            var extras: [MenuBarAppItem] = []
+            struct RawSystemExtra {
+                let playable: AXUIElement
+                let title: String
+                let desc: String
+                let frame: CGRect?
+                let axID: String?
+                let idx: Int
+                let extraName: String
+                let symbolKey: String
+            }
+
+            var rawExtras: [RawSystemExtra] = []
+            rawExtras.reserveCapacity(rawChildren.count)
             for (idx, rawChild) in rawChildren.enumerated() {
                 let playable = unwrapPlayableMenuBarElement(rawChild, timeout: 0.25)
                 let (title, desc, innerFrame, innerID) = readAXMetadataAndIdentifier(playable, timeout: 0.25)
@@ -718,30 +733,51 @@ final class MenuBarScanner: @unchecked Sendable {
                 }
 
                 let (extraName, symbolKey) = Self.systemExtraPresentation(axID: axID, title: title, desc: desc)
-                let icon = symbolIcons[symbolKey] ?? symbolIcons["default"] ?? proc.icon
-                let stableID: String
-                if let axID, !axID.isEmpty {
-                    stableID = axID
-                } else {
-                    let cleanKey = !desc.isEmpty ? desc : "item-\(idx)"
-                    stableID = "systemextra:\(proc.bundleID ?? "macos"):\(cleanKey)"
-                }
+                rawExtras.append(
+                    RawSystemExtra(
+                        playable: playable,
+                        title: title,
+                        desc: desc,
+                        frame: frame,
+                        axID: axID,
+                        idx: idx,
+                        extraName: extraName,
+                        symbolKey: symbolKey
+                    )
+                )
+            }
 
-                let isOnBar = Self.isFrameVisiblyOnMenuBar(frame, displays: displays)
+            let descriptors = rawExtras.map {
+                SystemExtraDescriptor(
+                    containerBundleID: proc.bundleID,
+                    axIdentifier: $0.axID,
+                    title: $0.title,
+                    statusDescription: $0.desc,
+                    minX: $0.frame?.minX,
+                    axChildIndex: $0.idx
+                )
+            }
+            let stableIDs = MenuBarIdentity.makeSystemExtraItemIDs(descriptors: descriptors)
+
+            var extras: [MenuBarAppItem] = []
+            extras.reserveCapacity(rawExtras.count)
+            for (pos, raw) in rawExtras.enumerated() {
+                let icon = symbolIcons[raw.symbolKey] ?? symbolIcons["default"] ?? proc.icon
+                let isOnBar = Self.isFrameVisiblyOnMenuBar(raw.frame, displays: displays)
                 extras.append(
                     MenuBarAppItem(
-                        id: stableID,
+                        id: stableIDs[pos],
                         pid: proc.pid,
-                        appName: extraName,
-                        bundleIdentifier: axID ?? proc.bundleID,
-                        axIdentifier: axID,
-                        axChildIndex: idx,
+                        appName: raw.extraName,
+                        bundleIdentifier: raw.axID ?? proc.bundleID,
+                        axIdentifier: raw.axID,
+                        axChildIndex: raw.idx,
                         appIcon: icon,
-                        statusTitle: title,
-                        statusDescription: desc,
-                        slotFrame: frame,
+                        statusTitle: raw.title,
+                        statusDescription: raw.desc,
+                        slotFrame: raw.frame,
                         isCurrentlyOnBar: isOnBar,
-                        axElement: playable,
+                        axElement: raw.playable,
                         isSystemItem: true,
                         isMovable: true
                     )
@@ -752,42 +788,85 @@ final class MenuBarScanner: @unchecked Sendable {
 
         // Case B: Standard, Helper, or `.prohibited` Tray Application (1 or MULTIPLE Menu Bar icons!)
         let baseID = proc.bundleID ?? "exec:\(proc.localizedName ?? "App")"
-        var items: [MenuBarAppItem] = []
-        items.reserveCapacity(rawChildren.count)
-
         let hasMenuBarAgentSlots = !agentSlotElementsByPID.isEmpty
         let isPIDHostedInAgent = !hasMenuBarAgentSlots || (agentSlotElementsByPID[proc.pid] != nil)
 
+        struct RawAppIcon {
+            let playable: AXUIElement
+            let axTitle: String
+            let axDesc: String
+            let axFrame: CGRect?
+            let axID: String?
+            let idx: Int
+        }
+
+        var rawIcons: [RawAppIcon] = []
+        rawIcons.reserveCapacity(rawChildren.count)
         for (idx, rawChild) in rawChildren.enumerated() {
             let playable = unwrapPlayableMenuBarElement(rawChild, timeout: 0.25)
-            let (axTitle, axDesc, innerFrame, axID) = readAXMetadataAndIdentifier(playable, timeout: 0.25)
+            let (axTitle, axDesc, innerFrame, innerID) = readAXMetadataAndIdentifier(playable, timeout: 0.25)
             let axFrame = innerFrame ?? readAXFrame(rawChild)
-            let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(axFrame, displays: displays)
+            let axID = innerID ?? readAXString(rawChild, kAXIdentifierAttribute as CFString)
+            rawIcons.append(
+                RawAppIcon(
+                    playable: playable,
+                    axTitle: axTitle,
+                    axDesc: axDesc,
+                    axFrame: axFrame,
+                    axID: axID,
+                    idx: idx
+                )
+            )
+        }
 
+        let descriptors = rawIcons.map {
+            CaseBIconDescriptor(
+                axIdentifier: $0.axID,
+                statusDescription: $0.axDesc,
+                minX: $0.axFrame?.minX,
+                axChildIndex: $0.idx
+            )
+        }
+
+        cacheLock.lock()
+        let existingAnchor = singleIconAnchorByBaseID[baseID]
+        cacheLock.unlock()
+
+        let (finalIDs, updatedAnchor) = MenuBarIdentity.makeCaseBItemIDs(
+            baseID: baseID,
+            descriptors: descriptors,
+            singleIconAnchorKey: existingAnchor
+        )
+
+        cacheLock.lock()
+        if let updatedAnchor {
+            singleIconAnchorByBaseID[baseID] = updatedAnchor
+        } else {
+            singleIconAnchorByBaseID.removeValue(forKey: baseID)
+        }
+        cacheLock.unlock()
+
+        var items: [MenuBarAppItem] = []
+        items.reserveCapacity(rawIcons.count)
+
+        for (pos, raw) in rawIcons.enumerated() {
+            let isOnBar = isPIDHostedInAgent && Self.isFrameVisiblyOnMenuBar(raw.axFrame, displays: displays)
             let baseAppName = Self.friendlyAppName(
                 bundleID: proc.bundleID,
                 localizedName: proc.localizedName,
                 pid: proc.pid,
-                fallbackDesc: axDesc,
-                fallbackTitle: axTitle
+                fallbackDesc: raw.axDesc,
+                fallbackTitle: raw.axTitle
             )
 
-            let finalID: String
             let finalName: String
-            if rawChildren.count == 1 {
-                finalID = baseID
+            if rawIcons.count == 1 {
                 finalName = baseAppName
             } else {
-                // Never include live `axTitle` (e.g. "CPU 14%" -> "CPU 19%") in `finalID` so IDs stay 100% stable across scans!
-                let stableDescKey: String? = {
-                    guard !axDesc.isEmpty, axDesc.rangeOfCharacter(from: .decimalDigits) == nil else { return nil }
-                    return axDesc
-                }()
-                let disambiguator = (axID?.isEmpty == false ? axID! : nil)
-                    ?? stableDescKey
-                    ?? "item-\(idx)"
-                finalID = (idx == 0) ? baseID : "\(baseID)#\(disambiguator)"
-                let labelSuffix = !axDesc.isEmpty ? axDesc : (!axTitle.isEmpty ? axTitle : "#\(idx + 1)")
+                let normLabel = MenuBarIdentity.normalizeStatusDescriptor(raw.axDesc)
+                let labelSuffix = !raw.axDesc.isEmpty
+                    ? raw.axDesc
+                    : (!raw.axTitle.isEmpty ? raw.axTitle : (normLabel ?? "#\(raw.idx + 1)"))
                 finalName = (labelSuffix.localizedCaseInsensitiveContains(baseAppName))
                     ? labelSuffix
                     : "\(baseAppName) — \(labelSuffix)"
@@ -795,18 +874,18 @@ final class MenuBarScanner: @unchecked Sendable {
 
             items.append(
                 MenuBarAppItem(
-                    id: finalID,
+                    id: finalIDs[pos],
                     pid: proc.pid,
                     appName: finalName,
                     bundleIdentifier: proc.bundleID,
-                    axIdentifier: axID,
-                    axChildIndex: idx,
+                    axIdentifier: raw.axID,
+                    axChildIndex: raw.idx,
                     appIcon: proc.icon,
-                    statusTitle: axTitle,
-                    statusDescription: axDesc,
-                    slotFrame: axFrame,
+                    statusTitle: raw.axTitle,
+                    statusDescription: raw.axDesc,
+                    slotFrame: raw.axFrame,
                     isCurrentlyOnBar: isOnBar,
-                    axElement: playable,
+                    axElement: raw.playable,
                     isSystemItem: proc.isSystem,
                     isMovable: proc.isMovable
                 )
@@ -951,6 +1030,20 @@ final class MenuBarScanner: @unchecked Sendable {
                 let candidateID = readAXString(playable, kAXIdentifierAttribute as CFString)
                     ?? readAXString(raw, kAXIdentifierAttribute as CFString)
                 if candidateID == targetID {
+                    return (playable, readAXFrame(playable) ?? readAXFrame(raw))
+                }
+            }
+        }
+
+        // 1b. For multi-icon apps without AXIdentifier, match by normalized status description before index fallback
+        if children.count > 1,
+           let targetNormDesc = MenuBarIdentity.normalizeStatusDescriptor(item.statusDescription) {
+            for raw in children {
+                let playable = unwrapPlayableMenuBarElement(raw, timeout: timeout)
+                let candidateDesc = readAXString(playable, kAXDescriptionAttribute as CFString)
+                    ?? readAXString(raw, kAXDescriptionAttribute as CFString)
+                    ?? ""
+                if MenuBarIdentity.normalizeStatusDescriptor(candidateDesc) == targetNormDesc {
                     return (playable, readAXFrame(playable) ?? readAXFrame(raw))
                 }
             }
@@ -1292,7 +1385,7 @@ final class MenuBarScanner: @unchecked Sendable {
         return false
     }
 
-    private static func systemExtraPresentation(axID: String?, title: String, desc: String) -> (name: String, symbolKey: String) {
+    static func systemExtraPresentation(axID: String?, title: String, desc: String) -> (name: String, symbolKey: String) {
         let key = (axID ?? "").lowercased() + " " + desc.lowercased() + " " + title.lowercased()
         if key.contains("wifi") || key.contains("wi-fi") || key.contains("wi‑fi") {
             return ("Wi-Fi", "wifi")
