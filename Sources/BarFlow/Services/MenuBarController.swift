@@ -201,6 +201,9 @@ final class MenuBarController: ObservableObject {
     private var hasInitializedSelectionFlag: Bool = false
     private var knownDiscoveredAppIDs = Set<String>()
     private var everSeenIDs = Set<String>()
+    private var missCountByID: [String: Int] = [:]
+    private var recentlyTerminatedPIDs: [pid_t: CFAbsoluteTime] = [:]
+    private var lastAgentReloadEnteredAt: CFAbsoluteTime = 0
     private(set) var agentReloadQuietUntil: CFAbsoluteTime = 0
     private var agentQuietWindowEndTimer: Timer?
     private var quietWindowPendingForceFullScan: Bool = false
@@ -1363,6 +1366,190 @@ final class MenuBarController: ObservableObject {
         )
     }
 
+    private static let systemContainerBundles: Set<String> = [
+        "com.apple.MenuBarAgent",
+        "com.apple.controlcenter",
+        "com.apple.systemuiserver"
+    ]
+
+    private func isItemOwnerAlive(
+        _ item: MenuBarAppItem,
+        workspaceAppsByPID: [pid_t: NSRunningApplication],
+        runningBundleIDs: Set<String>,
+        persistedHiddenSystemIDs: Set<String>
+    ) -> Bool {
+        if item.pid <= 0 {
+            return item.isSystemItem && persistedHiddenSystemIDs.contains(item.id)
+        }
+        if recentlyTerminatedPIDs[item.pid] != nil {
+            return false
+        }
+        if item.isSystemItem {
+            if let wsApp = workspaceAppsByPID[item.pid], !wsApp.isTerminated {
+                return true
+            }
+            if let bid = item.bundleIdentifier {
+                if runningBundleIDs.contains(bid) { return true }
+                if bid.hasPrefix("com.apple.menuextra.") && !runningBundleIDs.isDisjoint(with: Self.systemContainerBundles) {
+                    return true
+                }
+            }
+            if item.id.hasPrefix("com.apple.menuextra.") || item.id.hasPrefix("systemextra:") {
+                if !runningBundleIDs.isDisjoint(with: Self.systemContainerBundles) {
+                    return true
+                }
+            }
+        }
+        if item.bundleIdentifier != nil {
+            guard let wsApp = workspaceAppsByPID[item.pid], !wsApp.isTerminated else {
+                return false
+            }
+            return kill(item.pid, 0) == 0 || errno == EPERM
+        }
+        return kill(item.pid, 0) == 0 || errno == EPERM
+    }
+
+    private func removeItemsForTerminatedPID(_ pid: pid_t) {
+        guard pid > 0 else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        recentlyTerminatedPIDs[pid] = now
+        if recentlyTerminatedPIDs.count > 64 {
+            recentlyTerminatedPIDs = recentlyTerminatedPIDs.filter { (now - $0.value) < 15.0 }
+        }
+
+        let removedIDs = allRunningApps.filter { $0.pid == pid }.map(\.id)
+        guard !removedIDs.isEmpty else { return }
+
+        let oldSecondaryCount = secondaryBarApps.count
+        allRunningApps.removeAll { $0.pid == pid }
+        for id in removedIDs {
+            missCountByID.removeValue(forKey: id)
+        }
+        knownDiscoveredAppIDs.subtract(removedIDs)
+        rebuildDerivedLists()
+        if secondaryBarApps.count != oldSecondaryCount {
+            onSecondaryAppsChanged?()
+        }
+        let formatted = BarFlowLog.formatIDList(removedIDs)
+        BarFlowLog.scan.log("removed terminated app immediately pid=\(pid, privacy: .public) removed=[\(formatted, privacy: .public)]")
+    }
+
+    /// Merges freshly scanned items with `allRunningApps` using a 3-scan grace period for live processes,
+    /// immediate removal for dead/terminated PIDs, and additions-only merging when a scan is unreliable.
+    private func mergeScannedApps(
+        _ scannedApps: [MenuBarAppItem],
+        diagnostics: ScanDiagnostics,
+        scanStartedAt: CFAbsoluteTime
+    ) -> [MenuBarAppItem] {
+        let now = CFAbsoluteTimeGetCurrent()
+        recentlyTerminatedPIDs = recentlyTerminatedPIDs.filter { (now - $0.value) < 15.0 }
+
+        let runningApps = NSWorkspace.shared.runningApplications
+        var workspaceAppsByPID: [pid_t: NSRunningApplication] = [:]
+        workspaceAppsByPID.reserveCapacity(runningApps.count)
+        var runningBundleIDs = Set<String>()
+        for app in runningApps where !app.isTerminated {
+            workspaceAppsByPID[app.processIdentifier] = app
+            if let bid = app.bundleIdentifier {
+                runningBundleIDs.insert(bid)
+            }
+        }
+        let persistedHiddenSystemIDs = Set(MenuBarVisibilityEngine.shared.persistedHiddenSystemItems().map(\.id))
+
+        let scanOverlappedQuietWindow =
+            scanStartedAt < agentReloadQuietUntil ||
+            now < agentReloadQuietUntil ||
+            lastAgentReloadEnteredAt >= scanStartedAt
+
+        let previousLiveItems = allRunningApps.filter { $0.pid > 0 }
+        let timedOutPrevCount = previousLiveItems.filter { diagnostics.timedOutPIDSet.contains($0.pid) }.count
+        let majorityTimedOut = !previousLiveItems.isEmpty &&
+            (Double(timedOutPrevCount) / Double(previousLiveItems.count) > 0.50)
+
+        let isUnreliable = scanOverlappedQuietWindow || majorityTimedOut
+        if isUnreliable {
+            BarFlowLog.scan.log(
+                "scan marked unreliable (quietOverlap=\(scanOverlappedQuietWindow, privacy: .public) timedOutPrev=\(timedOutPrevCount, privacy: .public)/\(previousLiveItems.count, privacy: .public)) -> merging additions only"
+            )
+        }
+
+        // Exclude any item whose PID terminated while the background scan was in flight
+        let validScanned = scannedApps.filter { item in
+            if item.pid > 0 && recentlyTerminatedPIDs[item.pid] != nil {
+                return false
+            }
+            return true
+        }
+
+        var merged: [MenuBarAppItem] = []
+        merged.reserveCapacity(max(validScanned.count, allRunningApps.count))
+        var seenIDs = Set<String>()
+        seenIDs.reserveCapacity(validScanned.count)
+
+        for item in validScanned {
+            if seenIDs.insert(item.id).inserted {
+                missCountByID[item.id] = 0
+                merged.append(item)
+            }
+        }
+
+        for prev in allRunningApps where !seenIDs.contains(prev.id) {
+            if prev.pid > 0 && recentlyTerminatedPIDs[prev.pid] != nil {
+                missCountByID.removeValue(forKey: prev.id)
+                continue
+            }
+
+            let alive = isItemOwnerAlive(
+                prev,
+                workspaceAppsByPID: workspaceAppsByPID,
+                runningBundleIDs: runningBundleIDs,
+                persistedHiddenSystemIDs: persistedHiddenSystemIDs
+            )
+
+            if isUnreliable {
+                if alive || prev.isSystemItem {
+                    seenIDs.insert(prev.id)
+                    merged.append(prev)
+                } else {
+                    missCountByID.removeValue(forKey: prev.id)
+                }
+                continue
+            }
+
+            guard alive else {
+                missCountByID.removeValue(forKey: prev.id)
+                continue
+            }
+
+            let misses = (missCountByID[prev.id] ?? 0) + 1
+            if misses < 3 {
+                missCountByID[prev.id] = misses
+                seenIDs.insert(prev.id)
+                merged.append(prev)
+                let safeID = BarFlowLog.sanitizeID(prev.id)
+                BarFlowLog.scan.debug("grace-keeping missing item id=\(safeID, privacy: .public) miss=\(misses, privacy: .public)/3")
+            } else {
+                missCountByID.removeValue(forKey: prev.id)
+            }
+        }
+
+        if missCountByID.count > seenIDs.count {
+            missCountByID = missCountByID.filter { seenIDs.contains($0.key) }
+        }
+
+        merged.sort { a, b in
+            if a.isCurrentlyOnBar != b.isCurrentlyOnBar {
+                return a.isCurrentlyOnBar && !b.isCurrentlyOnBar
+            }
+            if a.slotFrame != nil && b.slotFrame != nil && abs(a.sortX - b.sortX) > 1 {
+                return a.sortX < b.sortX
+            }
+            return a.appName.localizedCaseInsensitiveCompare(b.appName) == .orderedAscending
+        }
+
+        return merged
+    }
+
     private var isInAgentReloadQuietWindow: Bool {
         CFAbsoluteTimeGetCurrent() < agentReloadQuietUntil
     }
@@ -1370,6 +1557,7 @@ final class MenuBarController: ObservableObject {
     private func enterAgentReloadQuietWindow(duration: TimeInterval = 3.0, source: String) {
         guard !hasPreparedForTermination else { return }
         let now = CFAbsoluteTimeGetCurrent()
+        lastAgentReloadEnteredAt = now
         let targetUntil = now + duration
         if targetUntil > agentReloadQuietUntil {
             agentReloadQuietUntil = targetUntil
@@ -1445,8 +1633,9 @@ final class MenuBarController: ObservableObject {
 
         guard !isScanningInBackground else { return }
 
+        let scanStartedAt = CFAbsoluteTimeGetCurrent()
         isScanningInBackground = true
-        lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
+        lastBackgroundScanTime = scanStartedAt
 
         Task { @MainActor [weak self] in
             guard let self = self else { return }
@@ -1455,31 +1644,31 @@ final class MenuBarController: ObservableObject {
 
             let previousIDs = Set(self.allRunningApps.map(\.id))
             let oldSecondaryCount = self.secondaryBarApps.count
-            let discoveredIDs = Set(scannedApps.map(\.id))
+            let mergedApps = self.mergeScannedApps(scannedApps, diagnostics: diagnostics, scanStartedAt: scanStartedAt)
+            let mergedIDs = Set(mergedApps.map(\.id))
             self.logScanSummary(
                 reason: reason,
                 forceFullScan: forceFullScan,
                 previousIDs: previousIDs,
-                newIDs: discoveredIDs,
-                itemCount: scannedApps.count,
+                newIDs: mergedIDs,
+                itemCount: mergedApps.count,
                 diagnostics: diagnostics
             )
 
-            let neverSeenBeforeIDs = discoveredIDs.subtracting(self.everSeenIDs)
+            let neverSeenBeforeIDs = mergedIDs.subtracting(self.everSeenIDs)
             let newUnselectedLaunched = !self.everSeenIDs.isEmpty &&
                 neverSeenBeforeIDs.contains(where: { !self.selectedMainBarIDs.contains($0) })
-            self.everSeenIDs.formUnion(discoveredIDs)
-            self.knownDiscoveredAppIDs = discoveredIDs
+            self.everSeenIDs.formUnion(mergedIDs)
+            self.knownDiscoveredAppIDs = mergedIDs
 
-            // Always update `allRunningApps` unconditionally so `slotFrame` & `axElement` stay 100% fresh!
-            self.allRunningApps = scannedApps
+            self.allRunningApps = mergedApps
 
-            if initializeDefaultsIfNeeded && !self.hasInitializedSelectionFlag && !scannedApps.isEmpty {
+            if initializeDefaultsIfNeeded && !self.hasInitializedSelectionFlag && !mergedApps.isEmpty {
                 var initialIDs = Set<String>()
                 var initialMainOrder: [String] = []
                 var initialSecOrder: [String] = []
                 var nonSystemCount = 0
-                for app in scannedApps {
+                for app in mergedApps {
                     if app.isSystemItem {
                         initialIDs.insert(app.id)
                         initialMainOrder.append(app.id)
@@ -1503,7 +1692,7 @@ final class MenuBarController: ObservableObject {
                 }
             } else {
                 self.rebuildDerivedLists()
-                if !self.hasPerformedStartupVisibilitySync && !scannedApps.isEmpty {
+                if !self.hasPerformedStartupVisibilitySync && !mergedApps.isEmpty {
                     self.hasPerformedStartupVisibilitySync = true
                     if self.isMainBarHidingEnabled {
                         self.requestAutoNativeMenuBarSync(delay: 0.30)
@@ -1918,26 +2107,28 @@ final class MenuBarController: ObservableObject {
         }
         setStatusMessage("Đang quét lại toàn bộ ứng dụng trên Menu Bar...")
         Task { @MainActor in
+            let scanStartedAt = CFAbsoluteTimeGetCurrent()
             let (scanned, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(forceFullScan: true)
             let previousIDs = Set(self.allRunningApps.map(\.id))
-            let discoveredIDs = Set(scanned.map(\.id))
+            let mergedApps = self.mergeScannedApps(scanned, diagnostics: diagnostics, scanStartedAt: scanStartedAt)
+            let mergedIDs = Set(mergedApps.map(\.id))
             self.logScanSummary(
                 reason: .manual,
                 forceFullScan: true,
                 previousIDs: previousIDs,
-                newIDs: discoveredIDs,
-                itemCount: scanned.count,
+                newIDs: mergedIDs,
+                itemCount: mergedApps.count,
                 diagnostics: diagnostics
             )
             self.lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
-            self.everSeenIDs.formUnion(discoveredIDs)
-            self.knownDiscoveredAppIDs = discoveredIDs
-            self.allRunningApps = scanned
+            self.everSeenIDs.formUnion(mergedIDs)
+            self.knownDiscoveredAppIDs = mergedIDs
+            self.allRunningApps = mergedApps
             self.rebuildDerivedLists()
             self.onSecondaryAppsChanged?()
 
             if self.requiresFullDiskAccess && !self.isFullDiskAccessGranted {
-                self.setStatusMessage("Đã quét \(scanned.count) biểu tượng. Hãy cấp thêm quyền Full Disk Access ở khung phía trên để ẩn khỏi Menu Bar chính.")
+                self.setStatusMessage("Đã quét \(mergedApps.count) biểu tượng. Hãy cấp thêm quyền Full Disk Access ở khung phía trên để ẩn khỏi Menu Bar chính.")
                 return
             }
 
@@ -1948,7 +2139,7 @@ final class MenuBarController: ObservableObject {
                     return
                 }
             }
-            self.setStatusMessage("Đã làm mới danh sách (\(scanned.count) biểu tượng đang chạy).")
+            self.setStatusMessage("Đã làm mới danh sách (\(mergedApps.count) biểu tượng đang chạy).")
         }
     }
 
@@ -3250,6 +3441,7 @@ final class MenuBarController: ObservableObject {
                 MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
                 guard bundle != "com.apple.MenuBarAgent", !ignoreBundles.contains(bundle) else { return }
+                self?.removeItemsForTerminatedPID(terminatedPID)
                 self?.refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
             }
         }
