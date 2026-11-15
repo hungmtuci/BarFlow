@@ -274,16 +274,51 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             let changedCC = self.restoreTrackedAppsAndSpotlightOnDisk()
             let changedSys = self.restoreSystemExtrasOnDisk()
             if changedCC || changedSys {
-                // Only reload MenuBarAgent immediately on quit if safe from launchd throttle;
-                // even if within throttle window, flushing cfprefsd once ensures preferences are clean on disk.
+                let ccURL = URL(fileURLWithPath: self.ccGroupPlistPath)
+                let menuBarURL = URL(fileURLWithPath: self.menuBarGroupPlistPath)
+                let savedCCData = try? Data(contentsOf: ccURL)
+                let savedMenuBarData = try? Data(contentsOf: menuBarURL)
+
                 self.synchronizeMenuBarPreferenceDomains()
+                // Flush cfprefsd before killing MenuBarAgent so the respawned agent never reads stale cached values.
+                var flushCount = 1
+                var signaledCount = self.flushUserCfprefsd()
+                usleep(20_000)
+
                 if self.remainingSecondsBeforeSafeReload() <= 0.1 {
-                    let oldPID = self.currentMenuBarAgentPID() ?? 0
-                    BarFlowLog.agent.log("Reloading MenuBarAgent reason=quitRestore oldPID=\(oldPID, privacy: .public)")
-                    self.terminateMenuBarAgent()
-                    usleep(10_000)
+                    let oldAgentPID = self.currentMenuBarAgentPID()
+                    if let pid = oldAgentPID {
+                        _ = kill(pid, SIGTERM)
+                        for _ in 0..<40 {
+                            if kill(pid, 0) != 0 {
+                                break
+                            }
+                            usleep(2_000)
+                        }
+                        var overwrittenByExitingAgent = false
+                        if let expectedCC = savedCCData,
+                           let afterExitCC = try? Data(contentsOf: ccURL),
+                           afterExitCC != expectedCC {
+                            try? expectedCC.write(to: ccURL, options: .atomic)
+                            overwrittenByExitingAgent = true
+                        }
+                        if let expectedMenuBar = savedMenuBarData,
+                           let afterExitMenuBar = try? Data(contentsOf: menuBarURL),
+                           afterExitMenuBar != expectedMenuBar {
+                            try? expectedMenuBar.write(to: menuBarURL, options: .atomic)
+                            overwrittenByExitingAgent = true
+                        }
+                        if overwrittenByExitingAgent {
+                            signaledCount += self.flushUserCfprefsd()
+                            flushCount += 1
+                        }
+                    } else {
+                        self.terminateMenuBarAgent()
+                    }
+                    BarFlowLog.agent.log(
+                        "Reloading MenuBarAgent reason=quitRestore oldPID=\(oldAgentPID ?? 0, privacy: .public) cfprefsdFlushes=\(flushCount, privacy: .public) signaledPIDs=\(signaledCount, privacy: .public)"
+                    )
                 }
-                _ = self.flushUserCfprefsd()
             }
         }
     }
@@ -571,6 +606,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         if remainingWait > 0.05 {
             BarFlowLog.sync.log("sync deferred reload reason=\(reloadReason, privacy: .public) changed=\(anyChanged, privacy: .public) waitSec=\(String(format: "%.2f", remainingWait), privacy: .public) visible=\(visibleItems.count, privacy: .public) hidden=\(hiddenItems.count, privacy: .public)")
             synchronizeMenuBarPreferenceDomains()
+            if anyChanged {
+                // Flush cfprefsd when preferences changed on disk so the running MenuBarAgent cannot flush
+                // stale cached values back over BarFlow's writes during the deferred reload wait.
+                _ = flushUserCfprefsd()
+            }
             return SyncOutcome(
                 didModifyPreferences: anyChanged,
                 didReloadAgent: false,
@@ -1549,33 +1589,44 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         synchronizeMenuBarPreferenceDomains()
         onAgentReloadTriggered?(reason)
 
+        // Flush user cfprefsd BEFORE sending SIGTERM to MenuBarAgent: launchd respawns MenuBarAgent almost
+        // immediately on exit, so flushing cfprefsd first ensures the respawned agent never reads stale
+        // in-memory group-container preferences from the old cfprefsd process.
+        var flushCount = 1
+        var signaledCount = flushUserCfprefsd()
+        usleep(20_000)
+
         if let pid = oldAgentPID {
             _ = kill(pid, SIGTERM)
-            // Wait briefly (typically < 10ms, capped at 80ms) for old MenuBarAgent to exit so any stale
-            // in-memory TrailingItemPreferredPositions / trackedApplications write happens BEFORE our single cfprefsd flush.
             for _ in 0..<40 {
                 if kill(pid, 0) != 0 {
                     break
                 }
                 usleep(2_000)
             }
+            var overwrittenByExitingAgent = false
             if let expectedCC = savedCCData,
                let afterExitCC = try? Data(contentsOf: ccURL),
                afterExitCC != expectedCC {
                 try? expectedCC.write(to: ccURL, options: .atomic)
+                overwrittenByExitingAgent = true
             }
             if let expectedMenuBar = savedMenuBarData,
                let afterExitMenuBar = try? Data(contentsOf: menuBarURL),
                afterExitMenuBar != expectedMenuBar {
                 try? expectedMenuBar.write(to: menuBarURL, options: .atomic)
+                overwrittenByExitingAgent = true
+            }
+            if overwrittenByExitingAgent {
+                signaledCount += flushUserCfprefsd()
+                flushCount += 1
             }
         } else {
             terminateMenuBarAgent()
         }
 
-        let signaledCount = flushUserCfprefsd()
         BarFlowLog.agent.log(
-            "Reloading MenuBarAgent reason=\(reason, privacy: .public) oldPID=\(oldAgentPID ?? 0, privacy: .public) cfprefsdFlushes=1 signaledPIDs=\(signaledCount, privacy: .public)"
+            "Reloading MenuBarAgent reason=\(reason, privacy: .public) oldPID=\(oldAgentPID ?? 0, privacy: .public) cfprefsdFlushes=\(flushCount, privacy: .public) signaledPIDs=\(signaledCount, privacy: .public)"
         )
     }
 }
