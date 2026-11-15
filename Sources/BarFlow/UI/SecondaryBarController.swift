@@ -164,7 +164,7 @@ final class SecondaryBarController: ObservableObject {
         let now = CFAbsoluteTimeGetCurrent()
         if (now - lastWarmScanTimestamp) >= 8.0 {
             lastWarmScanTimestamp = now
-            MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false)
+            MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false, reason: .postInteraction)
         }
     }
 

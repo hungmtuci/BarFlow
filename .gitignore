@@ -7,3 +7,66 @@ entitlements.plist
 *.xcodeproj
 *.xcworkspace
 xcuserdata/
+
+# ==== SPMPH source-only policy (managed) ====
+# Dependencies / build output
+node_modules/
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+dist/
+build/
+target/
+.next/
+.cache/
+coverage/
+*.log
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ed25519*
+credentials*.json
+service_account*.json
+token.json
+# Data, documents, media, archives (not source)
+*.xlsx
+*.xls
+*.xlsm
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.pdf
+*.csv
+!**/security/*.csv
+*.zip
+*.tar
+*.gz
+*.tgz
+*.7z
+*.rar
+*.dump
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.mp4
+*.mov
+*.avi
+*.mp3
+*.wav
+*.whl
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+# ==== end SPMPH policy ====

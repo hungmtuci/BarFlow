@@ -44,6 +44,19 @@ private enum ExtrasProbeResult {
     case timedOutOrBusy
 }
 
+/// Diagnostic metrics captured during a single background scan pass.
+struct ScanDiagnostics: Sendable {
+    let durationMs: Double
+    let candidateCount: Int
+    let probedCount: Int
+    let timedOutPIDs: [pid_t]
+    let negativeCachedPIDs: [pid_t]
+
+    var timedOutPIDSet: Set<pid_t> {
+        Set(timedOutPIDs)
+    }
+}
+
 final class MenuBarScanner: @unchecked Sendable {
     static let shared = MenuBarScanner()
 
@@ -133,7 +146,23 @@ final class MenuBarScanner: @unchecked Sendable {
     /// Scans 100% of running Menu Bar apps & movable system extras concurrently on a background queue.
     @MainActor
     func scanMenuBarAsync(forceFullScan: Bool = false) async -> [MenuBarAppItem] {
-        guard AXIsProcessTrusted() else { return [] }
+        await scanMenuBarWithDiagnosticsAsync(forceFullScan: forceFullScan).items
+    }
+
+    /// Scans running Menu Bar apps & movable system extras and returns both discovered items and scan diagnostics.
+    @MainActor
+    func scanMenuBarWithDiagnosticsAsync(forceFullScan: Bool = false) async -> (items: [MenuBarAppItem], diagnostics: ScanDiagnostics) {
+        let startWall = CFAbsoluteTimeGetCurrent()
+        guard AXIsProcessTrusted() else {
+            let emptyDiag = ScanDiagnostics(
+                durationMs: 0,
+                candidateCount: 0,
+                probedCount: 0,
+                timedOutPIDs: [],
+                negativeCachedPIDs: []
+            )
+            return ([], emptyDiag)
+        }
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let displays = Self.captureDisplayGeometries()
@@ -209,19 +238,27 @@ final class MenuBarScanner: @unchecked Sendable {
         return await withCheckedContinuation { continuation in
             scanQueue.async { [weak self] in
                 guard let self = self else {
-                    continuation.resume(returning: [])
+                    let emptyDiag = ScanDiagnostics(
+                        durationMs: (CFAbsoluteTimeGetCurrent() - startWall) * 1000.0,
+                        candidateCount: 0,
+                        probedCount: 0,
+                        timedOutPIDs: [],
+                        negativeCachedPIDs: []
+                    )
+                    continuation.resume(returning: ([], emptyDiag))
                     return
                 }
-                let items = self.performBackgroundScan(
+                let result = self.performBackgroundScan(
                     ownPID: ownPID,
                     livePIDs: livePIDSnapshot,
                     initialCandidatesByPID: candidatesByPID,
                     displays: displays,
                     symbolIcons: symbolIcons,
                     fallbackDefaultIcon: fallbackDefaultIcon,
-                    forceFullScan: forceFullScan
+                    forceFullScan: forceFullScan,
+                    startWall: startWall
                 )
-                continuation.resume(returning: items)
+                continuation.resume(returning: result)
             }
         }
     }
@@ -233,8 +270,9 @@ final class MenuBarScanner: @unchecked Sendable {
         displays: [DisplayGeometry],
         symbolIcons: [String: NSImage],
         fallbackDefaultIcon: NSImage,
-        forceFullScan: Bool
-    ) -> [MenuBarAppItem] {
+        forceFullScan: Bool,
+        startWall: CFAbsoluteTime
+    ) -> (items: [MenuBarAppItem], diagnostics: ScanDiagnostics) {
         var candidatesByPID = initialCandidatesByPID
 
         // 1. Discover any additional PIDs (e.g. raw BSD/Go/Rust binaries not in NSWorkspace) directly from MenuBarAgent slots!
@@ -253,7 +291,16 @@ final class MenuBarScanner: @unchecked Sendable {
         }
 
         let allCandidates = Array(candidatesByPID.values)
-        guard !allCandidates.isEmpty else { return [] }
+        guard !allCandidates.isEmpty else {
+            let emptyDiag = ScanDiagnostics(
+                durationMs: (CFAbsoluteTimeGetCurrent() - startWall) * 1000.0,
+                candidateCount: 0,
+                probedCount: 0,
+                timedOutPIDs: [],
+                negativeCachedPIDs: []
+            )
+            return ([], emptyDiag)
+        }
 
         let now = CFAbsoluteTimeGetCurrent()
         cacheLock.lock()
@@ -344,6 +391,7 @@ final class MenuBarScanner: @unchecked Sendable {
         group.wait()
 
         // Calm retry pass (1.0s timeout) for any app whose runloop was momentarily busy
+        var finalTimedOutPIDs: [pid_t] = []
         for proc in retryCandidates {
             switch probeExtrasMenuBar(for: proc.pid, timeout: 1.0) {
             case .found(let rawChildren):
@@ -373,6 +421,7 @@ final class MenuBarScanner: @unchecked Sendable {
                 }
                 newlyDefiniteNegativePIDs.append(proc.pid)
             case .timedOutOrBusy:
+                finalTimedOutPIDs.append(proc.pid)
                 if let fallbackElements = agentSlotElementsByPID[proc.pid], !fallbackElements.isEmpty {
                     let built = buildItems(
                         for: proc,
@@ -431,9 +480,11 @@ final class MenuBarScanner: @unchecked Sendable {
             knownMenuBarPIDs.insert(pid)
             negativePIDCache.removeValue(forKey: pid)
         }
+        var recordedNegativePIDs: [pid_t] = []
         for pid in newlyDefiniteNegativePIDs where !newlyPositivePIDs.contains(pid) {
             knownMenuBarPIDs.remove(pid)
             negativePIDCache[pid] = now
+            recordedNegativePIDs.append(pid)
         }
         cacheLock.unlock()
 
@@ -458,7 +509,19 @@ final class MenuBarScanner: @unchecked Sendable {
             return a.appName.localizedCaseInsensitiveCompare(b.appName) == .orderedAscending
         }
 
-        return deduplicated
+        for item in deduplicated {
+            let safeID = BarFlowLog.sanitizeID(item.id)
+            BarFlowLog.scan.debug("item id=\(safeID, privacy: .public) pid=\(item.pid, privacy: .public) onBar=\(item.isCurrentlyOnBar, privacy: .public) childIdx=\(item.axChildIndex, privacy: .public)")
+        }
+
+        let diagnostics = ScanDiagnostics(
+            durationMs: (CFAbsoluteTimeGetCurrent() - startWall) * 1000.0,
+            candidateCount: allCandidates.count,
+            probedCount: toProbe.count,
+            timedOutPIDs: finalTimedOutPIDs.sorted(),
+            negativeCachedPIDs: recordedNegativePIDs.sorted()
+        )
+        return (deduplicated, diagnostics)
     }
 
     // MARK: - Item Construction (Supports Multi-Icon Apps & System Menu Extras)

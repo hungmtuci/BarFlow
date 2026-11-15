@@ -198,7 +198,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         selectedMainBarIDs: Set<String>,
         orderedMainBarIDs: [String] = [],
         hidingEnabled: Bool,
-        forceReload: Bool = false
+        forceReload: Bool = false,
+        reloadReason: String = "sync"
     ) async -> SyncOutcome {
         guard usesMenuBarAgentArchitecture else {
             return SyncOutcome(
@@ -214,6 +215,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         // Never partially modify system extras or restart MenuBarAgent (which causes a 1-2s blank Menu Bar flash)
         // when Full Disk Access hasn't been granted yet!
         guard hasFullDiskAccess else {
+            BarFlowLog.sync.log("sync skipped: missing Full Disk Access (reason=\(reloadReason, privacy: .public))")
             return SyncOutcome(
                 didModifyPreferences: false,
                 didReloadAgent: false,
@@ -239,7 +241,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                     orderedMainBarIDs: orderedMainBarIDs,
                     hidingEnabled: hidingEnabled,
                     processMeta: processMeta,
-                    forceReload: forceReload
+                    forceReload: forceReload,
+                    reloadReason: reloadReason
                 )
                 continuation.resume(returning: outcome)
             }
@@ -247,7 +250,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     }
 
     /// Executes a previously deferred `MenuBarAgent` reload once its uptime reaches `minimumAgentUptimeBeforeReload`.
-    func performDeferredReloadIfReady() async -> TimeInterval? {
+    func performDeferredReloadIfReady(reason: String = "deferredSync") async -> TimeInterval? {
         await withCheckedContinuation { continuation in
             engineQueue.async {
                 let remaining = self.remainingSecondsBeforeSafeReload()
@@ -255,7 +258,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                     continuation.resume(returning: remaining)
                     return
                 }
-                self.flushUserCfprefsdAndReloadMenuBarAgent()
+                self.flushUserCfprefsdAndReloadMenuBarAgent(reason: reason)
                 continuation.resume(returning: nil)
             }
         }
@@ -273,6 +276,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
                 self.flushUserCfprefsd()
                 usleep(40_000)
                 if self.remainingSecondsBeforeSafeReload() <= 0.1 {
+                    let oldPID = self.currentMenuBarAgentPID() ?? 0
+                    BarFlowLog.agent.log("Reloading MenuBarAgent reason=quitRestore oldPID=\(oldPID, privacy: .public)")
                     self.terminateMenuBarAgent()
                 }
             }
@@ -476,7 +481,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         orderedMainBarIDs: [String],
         hidingEnabled: Bool,
         processMeta: [pid_t: ProcessIdentity],
-        forceReload: Bool
+        forceReload: Bool,
+        reloadReason: String
     ) -> SyncOutcome {
         guard hasFullDiskAccess else {
             return SyncOutcome(
@@ -546,6 +552,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         let shouldReload = anyChanged || forceReload
 
         guard shouldReload else {
+            BarFlowLog.sync.debug("sync no-op reason=\(reloadReason, privacy: .public) visible=\(visibleItems.count, privacy: .public) hidden=\(hiddenItems.count, privacy: .public)")
             return SyncOutcome(
                 didModifyPreferences: false,
                 didReloadAgent: false,
@@ -558,6 +565,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
         let remainingWait = remainingSecondsBeforeSafeReload()
         if remainingWait > 0.05 {
+            BarFlowLog.sync.log("sync deferred reload reason=\(reloadReason, privacy: .public) changed=\(anyChanged, privacy: .public) waitSec=\(String(format: "%.2f", remainingWait), privacy: .public) visible=\(visibleItems.count, privacy: .public) hidden=\(hiddenItems.count, privacy: .public)")
             flushUserCfprefsd()
             return SyncOutcome(
                 didModifyPreferences: anyChanged,
@@ -569,7 +577,8 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
             )
         }
 
-        flushUserCfprefsdAndReloadMenuBarAgent()
+        BarFlowLog.sync.log("sync applying reload reason=\(reloadReason, privacy: .public) changed=\(anyChanged, privacy: .public) force=\(forceReload, privacy: .public) visible=\(visibleItems.count, privacy: .public) hidden=\(hiddenItems.count, privacy: .public)")
+        flushUserCfprefsdAndReloadMenuBarAgent(reason: reloadReason)
         return SyncOutcome(
             didModifyPreferences: anyChanged,
             didReloadAgent: true,
@@ -1504,10 +1513,11 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         }
     }
 
-    private func flushUserCfprefsdAndReloadMenuBarAgent() {
+    private func flushUserCfprefsdAndReloadMenuBarAgent(reason: String) {
         let menuBarURL = URL(fileURLWithPath: menuBarGroupPlistPath)
         let savedMenuBarData = try? Data(contentsOf: menuBarURL)
         let oldAgentPID = currentMenuBarAgentPID()
+        BarFlowLog.agent.log("Reloading MenuBarAgent reason=\(reason, privacy: .public) oldPID=\(oldAgentPID ?? 0, privacy: .public)")
 
         flushUserCfprefsd()
         usleep(20_000)

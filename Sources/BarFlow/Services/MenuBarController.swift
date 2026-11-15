@@ -299,7 +299,7 @@ final class MenuBarController: ObservableObject {
         observeWorkspaceNotifications()
 
         // Initial non-blocking background scan
-        refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
+        refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true, reason: .startup)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             self?.applySpacersVisibilityState()
@@ -363,7 +363,7 @@ final class MenuBarController: ObservableObject {
 
         if changedTrust && trusted {
             installMenuBarRightClickMonitorIfNeeded()
-            refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true)
+            refreshRunningAppsAsync(forceFullScan: true, initializeDefaultsIfNeeded: true, reason: .startup)
             return
         }
         if changedFDA && fda && trusted && isMainBarHidingEnabled {
@@ -377,7 +377,7 @@ final class MenuBarController: ObservableObject {
         // Never run background AX polling within 4s of user clicks/drags so UI stays 120fps smooth
         guard (now - lastUserInteractionTime) >= 4.0 else { return }
         if (now - lastBackgroundScanTime) >= 16.0 {
-            refreshRunningAppsAsync(forceFullScan: false, initializeDefaultsIfNeeded: false)
+            refreshRunningAppsAsync(forceFullScan: false, initializeDefaultsIfNeeded: false, reason: .backgroundTick)
         }
     }
 
@@ -1310,7 +1310,30 @@ final class MenuBarController: ObservableObject {
         }
     }
 
-    func refreshRunningAppsAsync(forceFullScan: Bool = false, initializeDefaultsIfNeeded: Bool = false) {
+    private func logScanSummary(
+        reason: ScanReason,
+        forceFullScan: Bool,
+        previousIDs: Set<String>,
+        newIDs: Set<String>,
+        itemCount: Int,
+        diagnostics: ScanDiagnostics
+    ) {
+        let added = BarFlowLog.formatIDList(newIDs.subtracting(previousIDs))
+        let removed = BarFlowLog.formatIDList(previousIDs.subtracting(newIDs))
+        let timedOut = BarFlowLog.formatPIDList(diagnostics.timedOutPIDs)
+        let negCached = BarFlowLog.formatPIDList(diagnostics.negativeCachedPIDs)
+        let durStr = String(format: "%.1f", diagnostics.durationMs)
+        let reasonStr = reason.description
+        BarFlowLog.scan.log(
+            "scan reason=\(reasonStr, privacy: .public) forceFull=\(forceFullScan, privacy: .public) durationMs=\(durStr, privacy: .public) items=\(itemCount, privacy: .public) added=[\(added, privacy: .public)] removed=[\(removed, privacy: .public)] timedOutPIDs=[\(timedOut, privacy: .public)] negCachedPIDs=[\(negCached, privacy: .public)]"
+        )
+    }
+
+    func refreshRunningAppsAsync(
+        forceFullScan: Bool = false,
+        initializeDefaultsIfNeeded: Bool = false,
+        reason: ScanReason = .manual
+    ) {
         let trusted = AXIsProcessTrusted()
         if isAccessibilityGranted != trusted {
             isAccessibilityGranted = trusted
@@ -1322,11 +1345,21 @@ final class MenuBarController: ObservableObject {
 
         Task { @MainActor [weak self] in
             guard let self = self else { return }
-            let scannedApps = await MenuBarScanner.shared.scanMenuBarAsync(forceFullScan: forceFullScan)
+            let (scannedApps, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(forceFullScan: forceFullScan)
             self.isScanningInBackground = false
 
+            let previousIDs = Set(self.allRunningApps.map(\.id))
             let oldSecondaryCount = self.secondaryBarApps.count
             let discoveredIDs = Set(scannedApps.map(\.id))
+            self.logScanSummary(
+                reason: reason,
+                forceFullScan: forceFullScan,
+                previousIDs: previousIDs,
+                newIDs: discoveredIDs,
+                itemCount: scannedApps.count,
+                diagnostics: diagnostics
+            )
+
             let newUnselectedLaunched = !self.knownDiscoveredAppIDs.isEmpty &&
                 discoveredIDs.subtracting(self.knownDiscoveredAppIDs).contains(where: { !self.selectedMainBarIDs.contains($0) })
             self.knownDiscoveredAppIDs = discoveredIDs
@@ -1778,9 +1811,19 @@ final class MenuBarController: ObservableObject {
         }
         setStatusMessage("Đang quét lại toàn bộ ứng dụng trên Menu Bar...")
         Task { @MainActor in
-            let scanned = await MenuBarScanner.shared.scanMenuBarAsync(forceFullScan: true)
+            let (scanned, diagnostics) = await MenuBarScanner.shared.scanMenuBarWithDiagnosticsAsync(forceFullScan: true)
+            let previousIDs = Set(self.allRunningApps.map(\.id))
+            let discoveredIDs = Set(scanned.map(\.id))
+            self.logScanSummary(
+                reason: .manual,
+                forceFullScan: true,
+                previousIDs: previousIDs,
+                newIDs: discoveredIDs,
+                itemCount: scanned.count,
+                diagnostics: diagnostics
+            )
             self.lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
-            self.knownDiscoveredAppIDs = Set(scanned.map(\.id))
+            self.knownDiscoveredAppIDs = discoveredIDs
             self.allRunningApps = scanned
             self.rebuildDerivedLists()
             self.onSecondaryAppsChanged?()
@@ -1880,12 +1923,14 @@ final class MenuBarController: ObservableObject {
         let orderedMainSnapshot = mainBarApps.map(\.id)
         let hidingSnapshot = isMainBarHidingEnabled
 
+        let syncReason = isManualTrigger ? "manualSync" : (forceReload ? "forcedSync" : "autoSync")
         let outcome = await MenuBarVisibilityEngine.shared.syncMenuBarState(
             allApps: appsSnapshot,
             selectedMainBarIDs: selectedSnapshot,
             orderedMainBarIDs: orderedMainSnapshot,
             hidingEnabled: hidingSnapshot,
-            forceReload: forceReload
+            forceReload: forceReload,
+            reloadReason: syncReason
         )
 
         isExecutingNativeSync = false
@@ -1947,7 +1992,7 @@ final class MenuBarController: ObservableObject {
         deferredReloadTimer = Timer.scheduledTimer(withTimeInterval: max(0.2, delay), repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
-                if let stillRemaining = await MenuBarVisibilityEngine.shared.performDeferredReloadIfReady() {
+                if let stillRemaining = await MenuBarVisibilityEngine.shared.performDeferredReloadIfReady(reason: "deferredSync") {
                     self.scheduleDeferredMenuBarAgentReload(after: stillRemaining + 0.12, hiddenCount: hiddenCount)
                     return
                 }
@@ -2001,7 +2046,7 @@ final class MenuBarController: ObservableObject {
             if isMainBarHidingEnabled {
                 setSpacersExpanded(true)
             }
-            refreshRunningAppsAsync(forceFullScan: true)
+            refreshRunningAppsAsync(forceFullScan: true, reason: .postInteraction)
         }
 
         let wasExpanded = areSpacersCurrentlyExpanded
@@ -2507,7 +2552,7 @@ final class MenuBarController: ObservableObject {
                             return
                         }
                     }
-                    self.refreshRunningAppsAsync(forceFullScan: false)
+                    self.refreshRunningAppsAsync(forceFullScan: false, reason: .postInteraction)
                 }
             } else {
                 // If clicking the menu item opened a new window in that app, bring it to front automatically
@@ -2580,11 +2625,11 @@ final class MenuBarController: ObservableObject {
                             return
                         }
                     }
-                    self.refreshRunningAppsAsync(forceFullScan: false)
+                    self.refreshRunningAppsAsync(forceFullScan: false, reason: .postInteraction)
                 }
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
-                    self?.refreshRunningAppsAsync(forceFullScan: false)
+                    self?.refreshRunningAppsAsync(forceFullScan: false, reason: .postInteraction)
                 }
             }
 
@@ -2772,7 +2817,7 @@ final class MenuBarController: ObservableObject {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
-            self?.refreshRunningAppsAsync(forceFullScan: false)
+            self?.refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
         }
     }
 
@@ -2975,12 +3020,14 @@ final class MenuBarController: ObservableObject {
         ]
         let ws = NSWorkspace.shared.notificationCenter
         ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            let launchedBundle = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier ?? ""
+            let launchedApp = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let launchedBundle = launchedApp?.bundleIdentifier ?? ""
+            let launchedPID = launchedApp?.processIdentifier ?? 0
             guard !ignoreBundles.contains(launchedBundle) else { return }
             Task { @MainActor in
                 MenuBarScanner.shared.handleAppLaunched()
                 try? await Task.sleep(nanoseconds: 900_000_000)
-                self?.refreshRunningAppsAsync(forceFullScan: true)
+                self?.refreshRunningAppsAsync(forceFullScan: true, reason: .appLaunched(launchedPID))
             }
         }
         ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
@@ -2991,7 +3038,7 @@ final class MenuBarController: ObservableObject {
                 MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
                 guard !ignoreBundles.contains(bundle) else { return }
-                self?.refreshRunningAppsAsync(forceFullScan: false)
+                self?.refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
             }
         }
 
@@ -3011,7 +3058,7 @@ final class MenuBarController: ObservableObject {
                     guard let self = self else { return }
                     self.isSystemSleeping = false
                     self.scheduleBackgroundMonitorTimer()
-                    self.refreshRunningAppsAsync(forceFullScan: false)
+                    self.refreshRunningAppsAsync(forceFullScan: false, reason: .wake)
                 }
             }
         }

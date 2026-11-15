@@ -168,7 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Selection Window Management
 
     func showSelectionWindow() {
-        MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false)
+        MenuBarController.shared.refreshRunningAppsAsync(forceFullScan: false, reason: .manual)
 
         if selectionWindow == nil {
             let rootView = AppSelectionView(
