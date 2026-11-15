@@ -63,7 +63,7 @@ final class MenuBarController: ObservableObject {
             scheduleSaveState()
             applySpacersVisibilityState()
             if !allRunningApps.isEmpty {
-                scheduleNativeMenuBarSync(delay: 0.16)
+                requestAutoNativeMenuBarSync(delay: 0.25)
             }
         }
     }
@@ -200,6 +200,17 @@ final class MenuBarController: ObservableObject {
     private var hasPerformedStartupVisibilitySync: Bool = false
     private var hasInitializedSelectionFlag: Bool = false
     private var knownDiscoveredAppIDs = Set<String>()
+    private var everSeenIDs = Set<String>()
+    private(set) var agentReloadQuietUntil: CFAbsoluteTime = 0
+    private var agentQuietWindowEndTimer: Timer?
+    private var quietWindowPendingForceFullScan: Bool = false
+    private var quietWindowPendingInitDefaults: Bool = false
+    private var lastObservedMenuBarAgentPID: pid_t = 0
+    private var lastAutoAgentReloadTime: CFAbsoluteTime = 0
+    private let autoAgentReloadMinInterval: TimeInterval = 15.0
+    private var trailingAutoSyncTimer: Timer?
+    private var hasCoalescedAutoSyncRequest: Bool = false
+    private var deferredReloadIsManual: Bool = false
     private var lastBackgroundScanTime: CFAbsoluteTime = 0
     private var lastUserInteractionTime: CFAbsoluteTime = 0
     private var pendingSaveWorkItem: DispatchWorkItem?
@@ -292,6 +303,12 @@ final class MenuBarController: ObservableObject {
     // MARK: - Lifecycle Setup
 
     func start() {
+        lastObservedMenuBarAgentPID = MenuBarVisibilityEngine.shared.currentMenuBarAgentPIDSnapshot() ?? 0
+        MenuBarVisibilityEngine.shared.onAgentReloadTriggered = { [weak self] reason in
+            Task { @MainActor in
+                self?.enterAgentReloadQuietWindow(duration: 3.0, source: reason)
+            }
+        }
         syncLaunchAtLoginStatusFromSystem()
         setupStatusItems()
         installMenuBarRightClickMonitorIfNeeded()
@@ -368,11 +385,24 @@ final class MenuBarController: ObservableObject {
         }
         if changedFDA && fda && trusted && isMainBarHidingEnabled {
             setStatusMessage("Đã nhận quyền Full Disk Access — đang tự động ẩn các ứng dụng không chọn...")
-            scheduleNativeMenuBarSync(delay: 0.25)
+            requestAutoNativeMenuBarSync(delay: 0.25)
             return
         }
 
-        guard trusted, !isPerformingHIDSequence, !isArrangingMenuBar, !isExecutingNativeSync else { return }
+        if MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture,
+           let currentAgentPID = MenuBarVisibilityEngine.shared.currentMenuBarAgentPIDSnapshot(),
+           currentAgentPID > 0,
+           currentAgentPID != lastObservedMenuBarAgentPID {
+            let previousPID = lastObservedMenuBarAgentPID
+            lastObservedMenuBarAgentPID = currentAgentPID
+            if previousPID > 0 {
+                BarFlowLog.agent.log("Detected respawned MenuBarAgent PID (oldPID=\(previousPID, privacy: .public) newPID=\(currentAgentPID, privacy: .public))")
+                enterAgentReloadQuietWindow(duration: 3.0, source: "agentPIDChanged(\(currentAgentPID))")
+                return
+            }
+        }
+
+        guard trusted, !isInAgentReloadQuietWindow, !isPerformingHIDSequence, !isArrangingMenuBar, !isExecutingNativeSync else { return }
         let now = CFAbsoluteTimeGetCurrent()
         // Never run background AX polling within 4s of user clicks/drags so UI stays 120fps smooth
         guard (now - lastUserInteractionTime) >= 4.0 else { return }
@@ -402,6 +432,10 @@ final class MenuBarController: ObservableObject {
         nativeSyncDebounceWorkItem = nil
         deferredReloadTimer?.invalidate()
         deferredReloadTimer = nil
+        agentQuietWindowEndTimer?.invalidate()
+        agentQuietWindowEndTimer = nil
+        trailingAutoSyncTimer?.invalidate()
+        trailingAutoSyncTimer = nil
         pendingSaveWorkItem?.cancel()
         pendingSaveWorkItem = nil
         if let mon = statusItemScrollMonitor {
@@ -1329,6 +1363,64 @@ final class MenuBarController: ObservableObject {
         )
     }
 
+    private var isInAgentReloadQuietWindow: Bool {
+        CFAbsoluteTimeGetCurrent() < agentReloadQuietUntil
+    }
+
+    private func enterAgentReloadQuietWindow(duration: TimeInterval = 3.0, source: String) {
+        guard !hasPreparedForTermination else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let targetUntil = now + duration
+        if targetUntil > agentReloadQuietUntil {
+            agentReloadQuietUntil = targetUntil
+        }
+
+        if let currentAgentPID = MenuBarVisibilityEngine.shared.currentMenuBarAgentPIDSnapshot(), currentAgentPID > 0 {
+            lastObservedMenuBarAgentPID = currentAgentPID
+        }
+
+        if nativeSyncDebounceWorkItem != nil {
+            nativeSyncDebounceWorkItem?.cancel()
+            nativeSyncDebounceWorkItem = nil
+            hasCoalescedAutoSyncRequest = true
+        }
+
+        let waitSec = max(0.05, agentReloadQuietUntil - now + 0.02)
+        BarFlowLog.agent.debug("Agent quiet window active for \(String(format: "%.2f", waitSec), privacy: .public)s (source=\(source, privacy: .public))")
+        scheduleQuietWindowEndTimer(after: waitSec)
+    }
+
+    private func scheduleQuietWindowEndTimer(after delay: TimeInterval) {
+        agentQuietWindowEndTimer?.invalidate()
+        agentQuietWindowEndTimer = Timer.scheduledTimer(withTimeInterval: max(0.05, delay), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, !self.hasPreparedForTermination else { return }
+                let now = CFAbsoluteTimeGetCurrent()
+                if now < self.agentReloadQuietUntil - 0.01 {
+                    self.scheduleQuietWindowEndTimer(after: self.agentReloadQuietUntil - now + 0.02)
+                    return
+                }
+                self.agentQuietWindowEndTimer = nil
+                if let currentAgentPID = MenuBarVisibilityEngine.shared.currentMenuBarAgentPIDSnapshot(), currentAgentPID > 0 {
+                    self.lastObservedMenuBarAgentPID = currentAgentPID
+                }
+                let forceFull = self.quietWindowPendingForceFullScan
+                let initDefaults = self.quietWindowPendingInitDefaults
+                self.quietWindowPendingForceFullScan = false
+                self.quietWindowPendingInitDefaults = false
+                BarFlowLog.agent.log("Agent quiet window ended -> running postAgentReload scan (forceFull=\(forceFull, privacy: .public))")
+                self.refreshRunningAppsAsync(
+                    forceFullScan: forceFull,
+                    initializeDefaultsIfNeeded: initDefaults,
+                    reason: .postAgentReload
+                )
+                if self.hasCoalescedAutoSyncRequest {
+                    self.scheduleCoalescedTrailingAutoSyncIfNeeded()
+                }
+            }
+        }
+    }
+
     func refreshRunningAppsAsync(
         forceFullScan: Bool = false,
         initializeDefaultsIfNeeded: Bool = false,
@@ -1338,7 +1430,20 @@ final class MenuBarController: ObservableObject {
         if isAccessibilityGranted != trusted {
             isAccessibilityGranted = trusted
         }
-        guard trusted, !isScanningInBackground else { return }
+        guard trusted else { return }
+
+        if isInAgentReloadQuietWindow {
+            quietWindowPendingForceFullScan = quietWindowPendingForceFullScan || forceFullScan
+            quietWindowPendingInitDefaults = quietWindowPendingInitDefaults || initializeDefaultsIfNeeded
+            if agentQuietWindowEndTimer == nil {
+                scheduleQuietWindowEndTimer(after: max(0.05, agentReloadQuietUntil - CFAbsoluteTimeGetCurrent() + 0.02))
+            }
+            let reasonStr = reason.description
+            BarFlowLog.scan.debug("scan suppressed during agent quiet window (reason=\(reasonStr, privacy: .public))")
+            return
+        }
+
+        guard !isScanningInBackground else { return }
 
         isScanningInBackground = true
         lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
@@ -1360,8 +1465,10 @@ final class MenuBarController: ObservableObject {
                 diagnostics: diagnostics
             )
 
-            let newUnselectedLaunched = !self.knownDiscoveredAppIDs.isEmpty &&
-                discoveredIDs.subtracting(self.knownDiscoveredAppIDs).contains(where: { !self.selectedMainBarIDs.contains($0) })
+            let neverSeenBeforeIDs = discoveredIDs.subtracting(self.everSeenIDs)
+            let newUnselectedLaunched = !self.everSeenIDs.isEmpty &&
+                neverSeenBeforeIDs.contains(where: { !self.selectedMainBarIDs.contains($0) })
+            self.everSeenIDs.formUnion(discoveredIDs)
             self.knownDiscoveredAppIDs = discoveredIDs
 
             // Always update `allRunningApps` unconditionally so `slotFrame` & `axElement` stay 100% fresh!
@@ -1392,17 +1499,17 @@ final class MenuBarController: ObservableObject {
                 self.rebuildDerivedLists()
                 self.scheduleSaveState()
                 if self.isMainBarHidingEnabled {
-                    self.scheduleNativeMenuBarSync(delay: 0.25)
+                    self.requestAutoNativeMenuBarSync(delay: 0.25)
                 }
             } else {
                 self.rebuildDerivedLists()
                 if !self.hasPerformedStartupVisibilitySync && !scannedApps.isEmpty {
                     self.hasPerformedStartupVisibilitySync = true
                     if self.isMainBarHidingEnabled {
-                        self.scheduleNativeMenuBarSync(delay: 0.30)
+                        self.requestAutoNativeMenuBarSync(delay: 0.30)
                     }
                 } else if newUnselectedLaunched && self.isMainBarHidingEnabled {
-                    self.scheduleNativeMenuBarSync(delay: 0.45)
+                    self.requestAutoNativeMenuBarSync(delay: 0.45)
                 }
             }
 
@@ -1443,7 +1550,7 @@ final class MenuBarController: ObservableObject {
         scheduleSaveState()
         onSecondaryAppsChanged?()
         if !allRunningApps.isEmpty {
-            scheduleNativeMenuBarSync(delay: 0.16)
+            requestAutoNativeMenuBarSync(delay: 0.55)
         }
     }
 
@@ -1459,7 +1566,7 @@ final class MenuBarController: ObservableObject {
         scheduleSaveState()
         onSecondaryAppsChanged?()
         if !allRunningApps.isEmpty {
-            scheduleNativeMenuBarSync(delay: 0.16)
+            requestAutoNativeMenuBarSync(delay: 0.55)
         }
     }
 
@@ -1475,7 +1582,7 @@ final class MenuBarController: ObservableObject {
         scheduleSaveState()
         onSecondaryAppsChanged?()
         if !allRunningApps.isEmpty {
-            scheduleNativeMenuBarSync(delay: 0.16)
+            requestAutoNativeMenuBarSync(delay: 0.55)
         }
     }
 
@@ -1510,7 +1617,7 @@ final class MenuBarController: ObservableObject {
         }
         if needsNativeSyncAfterDragEnd {
             needsNativeSyncAfterDragEnd = false
-            scheduleNativeMenuBarSync(delay: 0.08)
+            requestAutoNativeMenuBarSync(delay: 0.15)
         }
     }
 
@@ -1546,7 +1653,7 @@ final class MenuBarController: ObservableObject {
         if wasCrossZone {
             onSecondaryAppsChanged?()
         }
-        scheduleNativeMenuBarSync(delay: 0.22)
+        requestAutoNativeMenuBarSync(delay: 0.55)
     }
 
     /// Moves a Main Menu Bar item one step Left (`direction = -1`) or Right (`direction = +1`).
@@ -1563,7 +1670,7 @@ final class MenuBarController: ObservableObject {
         markUserInteraction()
         rebuildDerivedLists()
         scheduleSaveState()
-        scheduleNativeMenuBarSync(delay: 0.20)
+        requestAutoNativeMenuBarSync(delay: 0.55)
     }
 
     /// Moves a Main Menu Bar item to the far Left (`toStart = true`) or far Right (`toStart = false`).
@@ -1581,7 +1688,7 @@ final class MenuBarController: ObservableObject {
         markUserInteraction()
         rebuildDerivedLists()
         scheduleSaveState()
-        scheduleNativeMenuBarSync(delay: 0.20)
+        requestAutoNativeMenuBarSync(delay: 0.55)
     }
 
     /// Reorders an item in the `Ctrl + B` Secondary Bar (0ms instant update — zero MenuBarAgent reload unless cross-zone!).
@@ -1614,7 +1721,7 @@ final class MenuBarController: ObservableObject {
         scheduleSaveState()
         if wasCrossZone {
             onSecondaryAppsChanged?()
-            scheduleNativeMenuBarSync(delay: 0.18)
+            requestAutoNativeMenuBarSync(delay: 0.55)
         }
     }
 
@@ -1696,7 +1803,7 @@ final class MenuBarController: ObservableObject {
         rebuildDerivedLists()
         scheduleSaveState()
         if needsMainSync {
-            scheduleNativeMenuBarSync(delay: 0.22)
+            requestAutoNativeMenuBarSync(delay: 0.55)
         }
     }
 
@@ -1823,6 +1930,7 @@ final class MenuBarController: ObservableObject {
                 diagnostics: diagnostics
             )
             self.lastBackgroundScanTime = CFAbsoluteTimeGetCurrent()
+            self.everSeenIDs.formUnion(discoveredIDs)
             self.knownDiscoveredAppIDs = discoveredIDs
             self.allRunningApps = scanned
             self.rebuildDerivedLists()
@@ -1846,10 +1954,74 @@ final class MenuBarController: ObservableObject {
 
     // MARK: - Native MenuBarAgent Visibility & Order Sync (macOS 26/27+) & Legacy ⌘-Drag Fallback
 
+    /// Requests an automatic (non-manual) native MenuBarAgent sync while strictly respecting the agent quiet window
+    /// and the 15-second automatic reload rate limit (coalescing extra requests into a single trailing sync).
+    private func requestAutoNativeMenuBarSync(delay: TimeInterval) {
+        if draggingItemID != nil {
+            needsNativeSyncAfterDragEnd = true
+            return
+        }
+        guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
+        guard MenuBarVisibilityEngine.shared.hasFullDiskAccess else {
+            isFullDiskAccessGranted = false
+            return
+        }
+        if isInAgentReloadQuietWindow {
+            nativeSyncDebounceWorkItem?.cancel()
+            nativeSyncDebounceWorkItem = nil
+            hasCoalescedAutoSyncRequest = true
+            scheduleCoalescedTrailingAutoSyncIfNeeded()
+            BarFlowLog.sync.debug("auto native sync coalesced (in agent quiet window)")
+            return
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        if lastAutoAgentReloadTime > 0 && (now + delay - lastAutoAgentReloadTime) < autoAgentReloadMinInterval {
+            nativeSyncDebounceWorkItem?.cancel()
+            nativeSyncDebounceWorkItem = nil
+            hasCoalescedAutoSyncRequest = true
+            scheduleCoalescedTrailingAutoSyncIfNeeded()
+            BarFlowLog.sync.debug("auto native sync coalesced by 15s rate limit")
+            return
+        }
+        scheduleNativeMenuBarSync(delay: delay)
+    }
+
+    private func scheduleCoalescedTrailingAutoSyncIfNeeded() {
+        guard hasCoalescedAutoSyncRequest, !hasPreparedForTermination else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let quietReadyAt = agentReloadQuietUntil > now ? (agentReloadQuietUntil + 0.15) : now
+        let rateReadyAt = lastAutoAgentReloadTime > 0 ? (lastAutoAgentReloadTime + autoAgentReloadMinInterval) : now
+        let waitSec = max(0.25, max(quietReadyAt, rateReadyAt) - now)
+
+        trailingAutoSyncTimer?.invalidate()
+        trailingAutoSyncTimer = Timer.scheduledTimer(withTimeInterval: waitSec, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, !self.hasPreparedForTermination else { return }
+                self.trailingAutoSyncTimer = nil
+                guard self.hasCoalescedAutoSyncRequest else { return }
+                if self.isInAgentReloadQuietWindow ||
+                    (self.lastAutoAgentReloadTime > 0 && (CFAbsoluteTimeGetCurrent() - self.lastAutoAgentReloadTime) < self.autoAgentReloadMinInterval - 0.05) {
+                    self.scheduleCoalescedTrailingAutoSyncIfNeeded()
+                    return
+                }
+                self.hasCoalescedAutoSyncRequest = false
+                BarFlowLog.sync.log("Running coalesced trailing auto native sync")
+                Task { @MainActor in
+                    await self.executeNativeMenuBarSync(forceReload: false, isManualTrigger: false)
+                }
+            }
+        }
+    }
+
     private func scheduleNativeMenuBarSync(delay: TimeInterval) {
         nativeSyncDebounceWorkItem?.cancel()
         if draggingItemID != nil {
             needsNativeSyncAfterDragEnd = true
+            return
+        }
+        guard !isInAgentReloadQuietWindow else {
+            hasCoalescedAutoSyncRequest = true
+            scheduleCoalescedTrailingAutoSyncIfNeeded()
             return
         }
         guard MenuBarVisibilityEngine.shared.usesMenuBarAgentArchitecture else { return }
@@ -1904,6 +2076,21 @@ final class MenuBarController: ObservableObject {
         }
         guard !allRunningApps.isEmpty else { return }
 
+        if isManualTrigger {
+            nativeSyncDebounceWorkItem?.cancel()
+            nativeSyncDebounceWorkItem = nil
+            trailingAutoSyncTimer?.invalidate()
+            trailingAutoSyncTimer = nil
+            hasCoalescedAutoSyncRequest = false
+        } else {
+            let now = CFAbsoluteTimeGetCurrent()
+            if isInAgentReloadQuietWindow || (lastAutoAgentReloadTime > 0 && (now - lastAutoAgentReloadTime) < autoAgentReloadMinInterval) {
+                hasCoalescedAutoSyncRequest = true
+                scheduleCoalescedTrailingAutoSyncIfNeeded()
+                return
+            }
+        }
+
         if isExecutingNativeSync {
             hasQueuedFollowUpNativeSync = true
             queuedFollowUpForceReload = queuedFollowUpForceReload || forceReload
@@ -1933,6 +2120,14 @@ final class MenuBarController: ObservableObject {
             reloadReason: syncReason
         )
 
+        if outcome.didReloadAgent {
+            let reloadNow = CFAbsoluteTimeGetCurrent()
+            if !isManualTrigger {
+                lastAutoAgentReloadTime = reloadNow
+            }
+            enterAgentReloadQuietWindow(duration: 3.0, source: syncReason)
+        }
+
         isExecutingNativeSync = false
 
         if hasQueuedFollowUpNativeSync {
@@ -1959,6 +2154,7 @@ final class MenuBarController: ObservableObject {
 
         if let waitSec = outcome.deferredReloadDelay {
             if isArrangingMenuBar { isArrangingMenuBar = false }
+            deferredReloadIsManual = isManualTrigger
             let secs = max(1, Int(ceil(waitSec)))
             statusMessage = "Đã lưu thứ tự & chọn lọc — Menu Bar cập nhật sau ~\(secs)s (tránh trễ tiến trình hệ thống)..."
             scheduleDeferredMenuBarAgentReload(after: waitSec + 0.10, hiddenCount: outcome.hiddenCount)
@@ -1996,6 +2192,11 @@ final class MenuBarController: ObservableObject {
                     self.scheduleDeferredMenuBarAgentReload(after: stillRemaining + 0.12, hiddenCount: hiddenCount)
                     return
                 }
+                if !self.deferredReloadIsManual {
+                    self.lastAutoAgentReloadTime = CFAbsoluteTimeGetCurrent()
+                }
+                self.deferredReloadIsManual = false
+                self.enterAgentReloadQuietWindow(duration: 3.0, source: "deferredSync")
                 if self.isArrangingMenuBar {
                     self.isArrangingMenuBar = false
                 }
@@ -3013,7 +3214,6 @@ final class MenuBarController: ObservableObject {
 
     private func observeWorkspaceNotifications() {
         let ignoreBundles: Set<String> = [
-            "com.apple.MenuBarAgent",
             "com.apple.TextInputMenuAgent",
             "com.apple.campo",
             "com.apple.controlcenter"
@@ -3023,6 +3223,18 @@ final class MenuBarController: ObservableObject {
             let launchedApp = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             let launchedBundle = launchedApp?.bundleIdentifier ?? ""
             let launchedPID = launchedApp?.processIdentifier ?? 0
+            if launchedBundle == "com.apple.MenuBarAgent" {
+                MainActor.assumeIsolated {
+                    guard let self = self else { return }
+                    let prevPID = self.lastObservedMenuBarAgentPID
+                    if launchedPID > 0 {
+                        self.lastObservedMenuBarAgentPID = launchedPID
+                    }
+                    BarFlowLog.agent.log("MenuBarAgent didLaunch observed (oldPID=\(prevPID, privacy: .public) newPID=\(launchedPID, privacy: .public)) -> entering 3.0s quiet window")
+                    self.enterAgentReloadQuietWindow(duration: 3.0, source: "agentLaunch(\(launchedPID))")
+                }
+                return
+            }
             guard !ignoreBundles.contains(launchedBundle) else { return }
             Task { @MainActor in
                 MenuBarScanner.shared.handleAppLaunched()
@@ -3037,7 +3249,7 @@ final class MenuBarController: ObservableObject {
             MainActor.assumeIsolated {
                 MenuBarVisibilityEngine.shared.invalidateProcessCache(pid: terminatedPID)
                 MenuBarScanner.shared.handleAppTerminated(pid: terminatedPID)
-                guard !ignoreBundles.contains(bundle) else { return }
+                guard bundle != "com.apple.MenuBarAgent", !ignoreBundles.contains(bundle) else { return }
                 self?.refreshRunningAppsAsync(forceFullScan: false, reason: .appTerminated)
             }
         }

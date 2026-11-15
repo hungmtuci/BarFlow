@@ -63,7 +63,10 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
     private let ccGroupPlistPath: String
     private let menuBarGroupPlistPath: String
 
-    /// Cached once at startup (`true` on macOS 26/27+ where `MenuBarAgent` manages the Menu Bar).
+    /// Invoked whenever `MenuBarVisibilityEngine` reloads `MenuBarAgent` (immediate or deferred path).
+    var onAgentReloadTriggered: (@Sendable (String) -> Void)?
+
+    ///Cached once at startup (`true` on macOS 26/27+ where `MenuBarAgent` manages the Menu Bar).
     let usesMenuBarAgentArchitecture: Bool
 
     /// Returns `true` when `BarFlow` has TCC `Full Disk Access` (`kTCCServiceSystemPolicyAllFiles`) required by macOS
@@ -1402,6 +1405,10 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
 
     // MARK: - Zero-Fork Pure C Daemon Lookup & Reload Helpers (0.05ms via `proc_listpids` + `proc_pidinfo`)
 
+    func currentMenuBarAgentPIDSnapshot() -> pid_t? {
+        currentMenuBarAgentPID()
+    }
+
     private func currentMenuBarAgentPID() -> pid_t? {
         currentUserDaemonPIDs(named: "MenuBarAgent").first
     }
@@ -1518,6 +1525,7 @@ final class MenuBarVisibilityEngine: @unchecked Sendable {
         let savedMenuBarData = try? Data(contentsOf: menuBarURL)
         let oldAgentPID = currentMenuBarAgentPID()
         BarFlowLog.agent.log("Reloading MenuBarAgent reason=\(reason, privacy: .public) oldPID=\(oldAgentPID ?? 0, privacy: .public)")
+        onAgentReloadTriggered?(reason)
 
         flushUserCfprefsd()
         usleep(20_000)
